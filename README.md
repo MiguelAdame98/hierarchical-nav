@@ -1,3 +1,40 @@
+## La forma en la que lo hice funcionar
+Primero clone el github del proyecto y me puse adentro de la carpeta copiada
+
+Despues hice un virtual environment
+```
+python3.11 -m venv 11_venv         
+source 11_venv/bin/activate
+```
+
+Despues me cambie al folder de gym_minigrid
+```
+cd gym-minigrid_minimal-1
+```
+Y despues instale todo lo que estaba dentro
+```
+pip install .
+```
+
+Despues me salgo de esa carpeta y descargo otras librerias importantes
+```
+cd ..
+pip install matplotlib==3.9.0 
+pip install h5py==3.11.0
+pip install torch==2.3.1
+pip install PyYAML==6.0.1
+pip install tqdm==4.66.4
+pip install imageio==2.34.1 
+pip install pyquaternion==0.9.9
+pip install dill==0.3.8
+pip install gym==0.17.0
+pip install imageio-ffmpeg==0.5.1
+pip install --upgrade imageio imageio-ffmpeg
+```
+Y el unico script que necesitamos ahora para probar funcionalidad es este 
+```
+python run.py --env 4-tiles-ad-rooms --seed 218 --rooms_in_row 3 --rooms_in_col 4 --test exploration --video
+```
 ## Description
 
 This repository is the source code of the 3 layered hierarchical model.
