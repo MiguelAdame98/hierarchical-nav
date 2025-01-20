@@ -1,0 +1,73 @@
+device: cuda
+dataset:
+  remark: data rooms exploration, 4t aisles, door in middle, 6white Tiles in rand rooms see aisle_door_6wFloor_3x3rooms_100_400s
+  train_set_location: https://cloud.ilabt.imec.be/index.php/s/To58jREwsPYpaHr/download # /home/idlab332/workspace/hierarchical_st_nav_aif/data/train #corridor rooms
+  val_set_location: https://cloud.ilabt.imec.be/index.php/s/Ln2ednMfxg3biGB/download # /home/idlab332/workspace/hierarchical_st_nav_aif/data/val
+
+  # train_set_location: /home/idlab332/workspace/hierarchical_st_nav_aif/data/fake_AD_7t_train
+  # val_set_location: /home/idlab332/workspace/hierarchical_st_nav_aif/data/fake_AD_7t_train
+  keys: [image, action, pose]
+  type: FilePool
+  device: cpu
+  sequence_length: 20
+  sequence_stride: 20
+
+loss:
+  OZ_kl:
+    type: KL
+    key: posterior 
+    target: prior
+    weight: 1
+  OZ_reconstruct:
+    type: MSE
+    key: image_reconstructed
+    target: image
+  OZ_collision_detection:
+    type: BCE
+    key: collision_reconstructed
+    target: collision
+optimizer:
+  type: Adam
+  lr: 0.0001
+  amsgrad: True
+trainer:
+  batch_size: 32
+  log_epoch: 10
+  mixed_precision: true
+  num_epochs: 10000
+  num_workers: 0
+  save_epoch: 100
+  vis_batch_size: 2
+  vis_epoch:
+    after_rate: 100
+    before_rate: 1
+    n: 3
+  warmup: 10
+  # vis_args: 
+  #   keys:
+  #     - image
+  #     - image_reconstructed
+  # vis_mapping:
+  #     image: ["image_reconstructed"]
+   
+model:
+  type: Conv
+  num_states: 32
+  num_actions: 3
+  observations:
+    image: 
+      type: Conv
+      input_shape: [3, 56, 56]
+      channels: [8, 16,32]
+      
+    collision: 
+      type: Bool
+      input_shape: 1
+      hidden_layers: [16,8]
+      mlp_activation: Hardsigmoid
+      activation: Identity
+      #negative_slope: 1
+  lstm_cells: [256]
+  lstm_posterior: true
+  hidden_layers: [256]
+

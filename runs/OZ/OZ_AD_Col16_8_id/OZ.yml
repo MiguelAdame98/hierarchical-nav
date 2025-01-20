@@ -1,0 +1,81 @@
+config: experiments/OZ/OZ.yml
+params: '/Users/lab25/Documents/GitHub/hierarchical_spatial_temporal_nav_aif/runs/OZ/OZ_AD_Col16_8_id/models/model-1500.pt'
+model_epoch: 1500
+dataset:
+  device: cpu
+  keys:
+  - image
+  - action
+  # - pose
+  remark: data rooms exploration, 4t aisles, door in middle, 6white Tiles in rand
+    rooms see aisle_door_6wFloor_3x3rooms_100_400s
+  sequence_length: -1
+  sequence_stride: -1
+  train_set_location: https://cloud.ilabt.imec.be/index.php/s/To58jREwsPYpaHr/download
+  type: FilePool
+  val_set_location: https://cloud.ilabt.imec.be/index.php/s/Ln2ednMfxg3biGB/download
+  scenario: /home/idlab332/workspace/shortcuts_goal/data/tests/1r_exp_60s_ADwTiles/5t_1r_blue_seed4_wT
+device: cpu
+experiment_dir: /project_ghent/ddtinguy/shortcuts_goal/runs
+id: OZ_AD_Col16_8_id
+log_dir: runs/OZ/OZ_AD_Col16_8_id
+loss:
+  OZ_collision_detection:
+    key: collision_reconstructed
+    target: collision
+    type: BCE
+  OZ_kl:
+    key: posterior
+    target: prior
+    type: KL
+    weight: 1
+  OZ_reconstruct:
+    key: image_reconstructed
+    target: image
+    type: MSE
+model:
+  hidden_layers:
+  - 256
+  lstm_cells:
+  - 256
+  lstm_posterior: true
+  num_actions: 3
+  num_states: 32
+  observations:
+    collision:
+      activation: Identity
+      hidden_layers:
+      - 16
+      - 8
+      input_shape: 1
+      mlp_activation: Hardsigmoid
+      type: Bool
+    image:
+      channels:
+      - 8
+      - 16
+      - 32
+      input_shape:
+      - 3
+      - 56
+      - 56
+      type: Conv
+  type: Conv
+optimizer:
+  amsgrad: true
+  lr: 0.0004
+  type: Adam
+start_epoch: 0
+trainer:
+  batch_size: 32
+  log_epoch: 10
+  mixed_precision: true
+  num_epochs: 10000
+  num_workers: 0
+  save_epoch: 100
+  vis_batch_size: 2
+  vis_epoch:
+    after_rate: 100
+    before_rate: 1
+    n: 3
+  warmup: 10

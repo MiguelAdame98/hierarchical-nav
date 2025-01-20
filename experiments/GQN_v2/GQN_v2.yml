@@ -1,0 +1,85 @@
+
+device: cuda
+dataset:
+  train_set_location: /home/idlab332/workspace/hierarchical_st_nav_aif/data/rssm_40s_10env
+  val_set_location: /home/idlab332/workspace/hierarchical_st_nav_aif/data/rssm_40s_10env
+  
+  keys: [image, pose]
+  type: FilePool
+  device: cpu
+  sequence_length: 40
+  sequence_stride: 40
+
+loss:
+  kl:
+    type: KL
+    key: place 
+    target: std_normal
+    weight: 5
+  reconstruct:
+    type: MSE
+    key: image_query 
+    target: image_predicted 
+    weight: 5
+  pose_def:
+    type: L1 #MSE
+    key: pose_predicted
+    target: pose_query  
+optimizer:
+  type: Adam
+  lr: 0.0004
+  amsgrad: True
+trainer:
+  log_epoch: 10
+  save_epoch: 100
+  batch_size: 64
+  vis_batch_size: 3
+  vis_epoch: {"before_rate": 10, "n": 100, "after_rate": 5}
+  num_workers: 0
+  num_epochs: 20000
+  vis_args: 
+    keys:
+      - image_query
+      - image_predicted
+      - pose_query
+      - pose_predicted
+    vis_mapping:
+      vector: ["pose_query","pose_predicted"]
+
+model:
+  type: 'GQN'
+  observations: 
+    image: [3,56,56]
+    pose: 3
+    z_size: 32
+  min_context: 15
+  min_query : 5
+  max_query: 15
+
+  SceneEncoder:
+    expand: True
+    channels: [16,32,64,128]
+    #stride: 2
+    MLP_channels: []
+    activation: LeakyReLU
+    aggregate_factor: 1
+    clip_variance: 0.25
+    ConvFilm: True
+
+  SceneDecoder:
+    channels: [256,128,64,32,32]
+    interpolate_mode: 'bilinear'
+    MLP_channels: []
+    activation: LeakyReLU
+    ConvFilm: True
+
+  PositionalDecoder:
+    activation: LeakyReLU
+    activation_args:
+      negative_slope: 1
+    channels: [2048,512,128,64]
+    pose_encoded_dim: 9
+
+  #only 1 of the 2 can be used at once
+  RandomSeqQuery: False
+  RandomSelectQuery: True

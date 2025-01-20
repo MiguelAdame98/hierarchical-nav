@@ -1,0 +1,20 @@
+
+#rgb ob 10 states
+observation: "place"
+local_position: "pose"
+odom: "HEaction"
+
+
+#torched: True
+posecell_vtrans_scalling: 1
+dim_xy: 14
+dim_th: 10
+constant_adjust : False
+loops: 1
+
+#normal match: ~0.35, 0.1 means we don't want close loop based on visual but just based on distance
+match_threshold: 0.10 #cos sim and KL have a similar tendency, with KL~=*10cos_sim 
+delta_exp_threshold: 3
+delta_pc_threshold: 3
+
+ghost_node: False

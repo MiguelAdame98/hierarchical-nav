@@ -1,0 +1,106 @@
+config: experiments/GQN_v2/GQN_v2.yml
+dataset:
+  device: cpu
+  keys:
+  - image
+  - pose
+  sequence_length: -1
+  sequence_stride: -1
+  train_set_location: https://cloud.ilabt.imec.be/index.php/s/ejSdTFgGk32CsXG/download
+  type: FilePool
+  val_set_location: https://cloud.ilabt.imec.be/index.php/s/dF8NBETygrCxRq6/download
+  scenario: /home/idlab332/workspace/shortcuts_goal/data/tests/1r_exp_60s_ADwTiles/5t_1r_blue_seed4_wT
+device: cpu
+experiment_dir: /project_ghent/ddtinguy/shortcuts_goal/runs
+id: v2_GQN_AD_conv7x7_bi
+log_dir: runs/GQN_V2_AD/v2_GQN_AD_conv7x7_bi
+loss:
+  kl:
+    key: place
+    target: std_normal
+    type: KL
+    weight: 5
+  pose_def:
+    key: pose_query
+    target: pose_predicted
+    type: L1
+  reconstruct:
+    key: image_query
+    target: image_predicted
+    type: MSE
+    weight: 5
+model:
+  PositionalDecoder:
+    activation: LeakyReLU
+    activation_args:
+      negative_slope: 1
+    channels:
+    - 2048
+    - 512
+    - 128
+    - 64
+    pose_encoded_dim: 9
+  RandomSelectQuery: true
+  RandomSeqQuery: false
+  SceneDecoder:
+    ConvFilm: true
+    MLP_channels: []
+    activation: LeakyReLU
+    channels:
+    - 256
+    - 128
+    - 64
+    - 32
+    - 32
+    interpolate_mode: bilinear
+  SceneEncoder:
+    ConvFilm: true
+    MLP_channels: []
+    activation: LeakyReLU
+    aggregate_factor: 1
+    channels:
+    - 16
+    - 32
+    - 64
+    - 128
+    clip_variance: 0.25
+    expand: true
+  max_query: 15
+  min_context: 15
+  min_query: 5
+  observations:
+    image:
+    - 3
+    - 56
+    - 56
+    pose: 3
+    z_size: 32
+  type: GQN
+optimizer:
+  amsgrad: true
+  lr: 0.0004
+  type: Adam
+remark: GQN 1room exploration with 4t aisle doors OPEN & 6w tiles in rand rooms. bilinear
+  interpolation
+start_epoch: 0
+trainer:
+  batch_size: 64
+  log_epoch: 10
+  num_epochs: 20000
+  num_workers: 0
+  save_epoch: 100
+  vis_args:
+    keys:
+    - image_query
+    - image_predicted
+    - pose_query
+    - pose_predicted
+    vis_mapping:
+      vector:
+      - pose_query
+      - pose_predicted
+  vis_batch_size: 3
+  vis_epoch:
+    after_rate: 5
+    before_rate: 10
+    n: 100
