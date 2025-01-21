@@ -31,6 +31,31 @@ pip install gym==0.17.0
 pip install imageio-ffmpeg==0.5.1
 pip install --upgrade imageio imageio-ffmpeg
 ```
+Despues solo tienes que cambiar el documento "input_output.py" en la parte de 
+```
+
+#TODO:MAKE THIS MORE MODULAR
+def create_saving_directory(directory:str)-> str:
+    """NOTE TIS IS PARTICULAR TO ONE INDIVIDUAL"""
+    if os.path.exists('/Users/lab25'):
+        dir = '/Users/lab25/Documents/hierarchical_st_nav_aif/' 
+    else:
+        dir = '/Users/lab25/hierarchical_st_nav_aif/' 
+
+    home_dir = dir + directory 
+           
+    create_directory(home_dir)
+
+    return home_dir
+
+def create_directory(directory:str)->bool:
+    try:
+        os.makedirs(directory)
+        return True
+    except FileExistsError:
+        return False
+```
+A la direccion donde quieres que se guarden las cosas en tu equipo.
 Y el unico script que necesitamos ahora para probar funcionalidad es este 
 ```
 python run.py --env 4-tiles-ad-rooms --seed 218 --rooms_in_row 3 --rooms_in_col 4 --test exploration --video
