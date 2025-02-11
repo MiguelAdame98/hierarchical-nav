@@ -1,5 +1,5 @@
 config: experiments/OZ/OZ.yml
-params: '/Users/lab25/Documents/GitHub/hierarchical_spatial_temporal_nav_aif/runs/OZ/OZ_AD_Col16_8_id/models/model-1500.pt'
+params: '/app/runs/OZ/OZ_AD_Col16_8_id/models/model-1500.pt'
 model_epoch: 1500
 dataset:
   device: cpu

@@ -101,7 +101,7 @@ def record_video_frames(data:dict, env_definition:dict, agent_lost:bool, visited
     print(f"Canvas size: {canvas_width}x{canvas_height}")
     s, (width, height) = fig.canvas.print_to_buffer()
     print(f"Buffer size: {len(s)} Expected size: {width, height, 4}")
-    width, height = 2400,1200
+    width, height = 1200,600
     buf = np.frombuffer(s, np.uint8).reshape((height, width, 4))
     # we don't need the alpha channel
     buf = buf[:, :, 0:3]

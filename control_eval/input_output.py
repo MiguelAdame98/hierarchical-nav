@@ -68,10 +68,10 @@ def save_memory(models_manager:object, saving_directory:str)-> None:
 #TODO:MAKE THIS MORE MODULAR
 def create_saving_directory(directory:str)-> str:
     """NOTE TIS IS PARTICULAR TO ONE INDIVIDUAL"""
-    if os.path.exists('/Users/lab25'):
-        dir = '/Users/lab25/Documents/hierarchical_st_nav_aif/' 
+    if os.path.exists('/app/Summaries/'):
+        dir = '/app/Summaries/' 
     else:
-        dir = '/Users/lab25/hierarchical_st_nav_aif/' 
+        dir = '/app/Summaries/' 
 
     home_dir = dir + directory 
            
