@@ -68,12 +68,14 @@ class TorchedViewCell(object):
 
     @property
     def template(self):
-        return self.cells.templates[self.id, :].cpu().numpy()
+        #return self.cells.templates[self.id, :].cpu().numpy()
+        return self.cells.templates[self.id, :].detach().cpu().numpy()
 
     @property
     def score(self):
-        return self.cells.scores[self.id, :].cpu().numpy()
-    
+        #return self.cells.scores[self.id, :].cpu().numpy()
+        return self.cells.scores[self.id, :].detach().cpu().numpy()
+
     
 
 
@@ -198,7 +200,7 @@ class TorchedViewCells(object):
         print('show me the kl divergence',test_kl)
         return kl
 
-    def remove_views_without_exp(self):
+    #//def remove_views_without_exp(self):
         cells_no_exp = []
         print('How many view cells:', len(self.cells))
         for cell in self.cells:
@@ -216,7 +218,31 @@ class TorchedViewCells(object):
                 cell_template = self.templates[cell.id,:]
                 cell.id = id
                 self.templates[cell.id,:] = cell_template
-                
+    def remove_views_without_exp(self):
+        print('How many view cells:', len(self.cells))
+        
+        # Identify indices of view cells that have no experiences.
+        indices_to_remove = []
+        for i, cell in enumerate(self.cells):
+            if len(cell.exps) == 0:
+                print(f'{cell.id} has no exp')
+                indices_to_remove.append(i)
+        
+        # Remove cells in descending order to avoid index shifts.
+        if indices_to_remove:
+            for idx in sorted(indices_to_remove, reverse=True):
+                self.cells.pop(idx)
+                TorchedViewCell._ID -= 1
+            
+            # After removal, reassign IDs and update the templates accordingly.
+            for new_id, cell in enumerate(self.cells):
+                print(f'cell id {cell.id} will become {new_id}')
+                # Use clone() to create a copy of the tensor row.
+                cell_template = self.templates[cell.id, :].clone()
+                cell.id = new_id
+                self.templates[new_id, :] = cell_template
+
+            
                
     def get_closest_template(self,template):
         scores = self._score(template)

@@ -8,7 +8,8 @@ def calculate_FE_EFE(model: object, place:torch.Tensor, model_step_output:dict, 
     ''' check FE at each step and predict one step EFE
     with current :
     model (Class)
-    model one model_step_output output (TensorDict)
+    model one model_step_output output (TensorDict
+    )
     preferred_state we want to favorise (MultivariateNormal)
     '''
     KL,ambiguity= KL_and_ambiguity(model_step_output, preferred_state = preferred_state)

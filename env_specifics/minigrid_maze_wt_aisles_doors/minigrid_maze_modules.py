@@ -17,7 +17,67 @@ def set_door_view_observation(manager: object)-> None:
     door_view = torch_and_sample_observations(door_view, manager.get_observations_keys(), manager.get_manager_sampling())
    
     manager.set_env_relevant_ob(door_view)
+
+
+import datetime
+import matplotlib.pyplot as plt
+import torch
+
+def debug_and_save_images(door_image, predicted_image, filename_prefix="debug_image"):
+    # Helper function to print image statistics
+    def print_stats(img, label):
+        if torch.is_tensor(img):
+            img_np = img.detach().cpu().numpy()
+        else:
+            img_np = img
+        print(f"{label} - shape: {img_np.shape}, min: {img_np.min()}, max: {img_np.max()}, mean: {img_np.mean()}")
+
+    print_stats(door_image, "Door image")
+    print_stats(predicted_image, "Predicted image")
     
+    # Convert to numpy arrays if necessary
+    if torch.is_tensor(door_image):
+        door_np = door_image.detach().cpu().numpy()
+    else:
+        door_np = door_image
+        
+    if torch.is_tensor(predicted_image):
+        predicted_np = predicted_image.detach().cpu().numpy()
+    else:
+        predicted_np = predicted_image
+
+    # If the images have a batch dimension, select the first image.
+    if door_np.ndim == 4:
+        door_np = door_np[0]
+    if predicted_np.ndim == 4:
+        predicted_np = predicted_np[0]
+
+    # If the images are in (C, H, W) format, transpose them to (H, W, C)
+    if door_np.ndim == 3 and door_np.shape[0] in [1, 3]:
+        door_np = door_np.transpose(1, 2, 0)
+    if predicted_np.ndim == 3 and predicted_np.shape[0] in [1, 3]:
+        predicted_np = predicted_np.transpose(1, 2, 0)
+
+    # Create a figure with two subplots for side-by-side comparison
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    
+    axes[0].imshow(door_np)
+    axes[0].set_title("Door Image")
+    axes[0].axis('off')
+    
+    axes[1].imshow(predicted_np)
+    axes[1].set_title("Predicted Image")
+    axes[1].axis('off')
+    
+    # Append a timestamp to the filename to make it unique
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"{filename_prefix}_{timestamp}.png"
+    plt.savefig(filename, bbox_inches="tight")
+    print(f"Saved debug image to {filename}")
+    plt.close(fig)
+
+
+
 #NOTE: sensitivity 0.18 for minigrid_aisle_wt_doors and current allocentric model
 def is_agent_at_door(manager:object, sensitivity:float= 1) -> bool:
     '''
@@ -30,8 +90,11 @@ def is_agent_at_door(manager:object, sensitivity:float= 1) -> bool:
         if predicted_image.shape[0] > door_image.shape[0]:
             predicted_image = predicted_image[0]
         mse_door = mse_elements(predicted_image, door_image)
+        print("mse_under_th",mse_door, sensitivity,manager.mse_under_threshold(mse_door, sensitivity))
         if manager.mse_under_threshold(mse_door, sensitivity):
+            debug_and_save_images(door_image, predicted_image)
             pose = list(best_place_hypothesis['pose'])
+            print("save_pose_in_memory")
             manager.save_pose_in_memory(pose)
             return True
     return False
@@ -59,7 +122,7 @@ def minigrid_maze_aisles_doors_pose_range(env:str, reduction:int = 0)-> list :
         '''
         #Poses options in room (+ a bit of aisle)
         if '4' in env:
-            x_range = [0,8]
+            x_range = [0,7]
             y_range = [-3,3]
         elif '5' in env:
             x_range = [0,9]

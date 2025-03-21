@@ -122,6 +122,7 @@ class MemoryGraph(object):
 
         
         self.observation = observations[self.observation_key]
+        print("wtf is happening here",self.observation,observations[self.odometry_key])
         action_ob = observations[self.odometry_key]
         
         kwargs = {}
@@ -137,6 +138,7 @@ class MemoryGraph(object):
         # x_pc, y_pc, th_pc = self.pose_cells.active
         #TODO: clean later odom param (here we consider global odom directly from odom)
         x_pc, y_pc, th_pc = self.pose_cells.active
+        print(x_pc, y_pc, th_pc)
         
         #if no observation, we consider previous one
         # if self.observation is None:
@@ -144,6 +146,7 @@ class MemoryGraph(object):
         # get odom estimations
         vtrans, vrot = self.odom(action_ob, dt)
         x, y, th = self.odom.odometry
+        print(x, y, th)
 
         #TODO: TEMPO SIMPLIFICQTION
         #We want to create a view_cell ONLY if distance is far enough from prev one.
@@ -152,16 +155,16 @@ class MemoryGraph(object):
         if self.experience_map.current_exp is not None:
             delta_pc = self.experience_map.get_delta_exp(self.experience_map.current_exp.x_pc,self.experience_map.current_exp.y_pc, x_pc, y_pc)
             delta_pc_above_thresold = self.experience_map.delta_pc_above_thresold(delta_pc)
-            print("I dont understand the threshold",delta_pc_above_thresold, "and the delta_pc", delta_pc )
+            print("I dont understand the threshold",delta_pc_above_thresold, "and the delta_pc", delta_pc , "what is measuring",self.experience_map.current_exp.x_pc,self.experience_map.current_exp.y_pc, x_pc, y_pc)
             kwargs['current_exp_id'] = self.experience_map.current_exp.id
         else:
             delta_pc_above_thresold = 100
             print("This is supposed to be 100", delta_pc_above_thresold)
             kwargs['current_exp_id'] = None
-
+        print(delta_pc_above_thresold)
         kwargs['delta_exp_above_thresold'] = delta_pc_above_thresold
         
-        #print('global position considered for view_cell',  accum_delta_x, accum_delta_y, 'is delta_exp_above_thresold?', delta_exp, delta_exp_above_thresold)
+        #print('global position considered for view_cell',  ExperienceMap.accum_delta_x, ExperienceMap.accum_delta_y, 'is delta_exp_above_thresold?', delta_exp, delta_exp_above_thresold)
         view_cell, view_cell_copy = self.view_cells(self.observation, x_pc, y_pc, th_pc, **kwargs)
         #view_cell_copy: same as view cell but with a different id
        
@@ -182,23 +185,22 @@ class MemoryGraph(object):
                                   view_cell.th_pc)
 
        
-
+        print("this are the view_cell pre exp:",view_cell.exps,view_cell,view_cell.id)
         # update experience map
         self.experience_map(view_cell, vtrans, vrot,
                             x_pc, y_pc, th_pc, adjust_map, local_pose, view_cell_copy)
-        
         if self.experience_map.current_exp is not None:
             self.view_cells.update_prev_cell(self.experience_map.current_exp.view_cell)
         #TEST
-        # if self.experience_map.current_exp is not None:
-        #     pose = observations.get(self.local_position,None)
-        #     print('memory_graph pose', pose)
-        #     try:
-        #         pose_GP_facing = local_encoded_orientation_to_global_facing(pose[2], self.experience_map.current_exp.init_local_position[2], self.experience_map.current_exp.facing_rad)
-        #         test = encoded_orientation_given_facing(pose_GP_facing, self.experience_map.current_exp.init_local_position[2], self.experience_map.current_exp.facing_rad)
-        #         print('must be True', test == pose[2], test, pose[2])
-        #     except TypeError:
-        #         print('type error')
+        if self.experience_map.current_exp is not None:
+            pose = observations.get(self.local_position,None)
+            print('memory_graph pose', pose)
+            try:
+                pose_GP_facing = local_encoded_orientation_to_global_facing(pose[2], self.experience_map.current_exp.init_local_position[2], self.experience_map.current_exp.facing_rad)
+                test = encoded_orientation_given_facing(pose_GP_facing, self.experience_map.current_exp.init_local_position[2], self.experience_map.current_exp.facing_rad)
+                print('must be True', test == pose[2], test, pose[2])
+            except TypeError:
+                 print('type error')
 
         # for tracking and plotting
         self.odometry[0].append(x)
@@ -252,7 +254,7 @@ class MemoryGraph(object):
             exp = self.experience_map.get_exp(exp_id)
         if exp == None:
             return []
-        
+        print("relevant poses", len(exp.view_cell.relevant_poses.copy()))
         return exp.view_cell.relevant_poses.copy()
 
     def get_next_place_view_id(self, door_pose):

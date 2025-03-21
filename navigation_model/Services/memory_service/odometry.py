@@ -181,7 +181,7 @@ class PoseOdometry(object):
     def __call__(self, observations, dt=0.1):
         p = observations["pose"]
         if len(p) == 3: #(xyth)
-            print('pose', p)
+            print('we are inside the odometry pose', p)
             if 0 < p[2] < 4 and p[2].is_integer:
                 p[2] = np.pi * p[2]
             

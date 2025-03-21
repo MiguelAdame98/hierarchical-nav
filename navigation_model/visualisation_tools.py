@@ -67,10 +67,27 @@ def record_video_frames(data:dict, env_definition:dict, agent_lost:bool, visited
         ax3 = fig.add_subplot(s[:2, 3])
         ax3 = get_image_plot(ax3, data['image_predicted'], 'Predicted ob')
 
-    #-- INFO GAIN (NOT IMP) ---#
+   #-- INFO GAIN (NOT IMP) ---#
     ax2_bis = fig.add_subplot(s[1:2, 2:3])
-    if 'info_gain' in data:
-        plt.title('Place_info_gain')
+    if "info_gain" in data and data["info_gain"] is not None:
+        info_gain_value = data["info_gain"]
+        # Check if it's already a 3D array:
+        if hasattr(info_gain_value, "shape") and len(info_gain_value.shape) == 3:
+            img = vis_image(info_gain_value, show=False, fmt="numpy")
+            ax2_bis = get_image_plot(ax2_bis, img, "Place_info_gain")
+        else:
+            # info_gain is likely a float (or something not a 3D image),
+            # so either skip plotting or convert to a mock image, e.g.:
+            
+            # Skip plotting:
+            pass
+            
+            # OR turn it into a small image:
+            import numpy as np
+            mock_img = np.full((50, 50, 3), info_gain_value, dtype=np.float32)
+            img = vis_image(mock_img, show=False, fmt="numpy")
+            ax2_bis = get_image_plot(ax2_bis, img, "Place_info_gain")
+
 
     #-- MAPS OF VISITED ROOMS --#
     ax4 = fig.add_subplot(s[2:4, :2])
@@ -98,10 +115,10 @@ def record_video_frames(data:dict, env_definition:dict, agent_lost:bool, visited
 
     fig = plt.gcf()
     canvas_width, canvas_height = fig.canvas.get_width_height()
-    print(f"Canvas size: {canvas_width}x{canvas_height}")
+    #print(f"Canvas size: {canvas_width}x{canvas_height}")
     s, (width, height) = fig.canvas.print_to_buffer()
-    print(f"Buffer size: {len(s)} Expected size: {width, height, 4}")
-    width, height = 1200,600
+    #print(f"Buffer size: {len(s)} Expected size: {width, height, 4}")
+    width, height = 2400,1200
     buf = np.frombuffer(s, np.uint8).reshape((height, width, 4))
     # we don't need the alpha channel
     buf = buf[:, :, 0:3]

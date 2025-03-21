@@ -141,7 +141,7 @@ class Manager():
     
     def agent_lost(self) -> bool:
         ''' are we lost? '''
-        return self.allocentric_process.place_doubt_step_count() > 2
+        return self.allocentric_process.place_doubt_step_count() > 4
 
     def get_location_limits(self, exp_id:int=None)-> list:
         return self.memory_graph.get_exp_relevant_poses(exp_id)
@@ -203,12 +203,12 @@ class Manager():
         for new observations,
         update the egocentric model
         update the allocentric model --> implies possible change of state
-        update the memory graph --> implies possible change of location
+        update the memory graph --> implies possible change location
         '''
 
         #=====Observations treatment process======#
         torch_sensor_data = torch_observations(sensor_data, self.observations_keys)
-
+        print(torch_sensor_data["pose"])
         #=====ALLO+EGOCENTRIC MODELS process (update model with latest motion observations)======#
         self.egocentric_process.digest(torch_sensor_data, self.num_samples) #
         self.process_place_believes(torch_sensor_data)
@@ -272,7 +272,7 @@ class Manager():
         """
         #=== UPDATE MAP WITH CURRENT BELIEF ===#
         slam_obs = {"place": None, 'pose': None, "HEaction": observations['action'].cpu().detach().numpy()}
-        print("This is the place descriptor [0] that updates the memory graph", place_descriptor)
+        print("This is the place descriptor [0] that updates the memory graph", place_descriptor["pose"])
         print("this is the stable distribution in std place th compared to the place descriptor std ", self.std_place_th)
         #if we have only 1 place hypothesis and we have a stable distribution
         if (not self.agent_lost() and place_descriptor['std'] < self.std_place_th):
@@ -325,11 +325,14 @@ class Manager():
             print('exp', exp['id'], ' distance to current GP', exp['delta_goal'], 'MAX TH:', self.memory_graph.get_delta_exp_threshold() * 2)
             #If the exp is too far from last
             if exp['delta_goal'] > self.memory_graph.get_delta_exp_threshold() * 2: #NOTE:THIS NUMBER IS PURELY ARBITRARY
+                print("we got breaken")
                 break
             #we recall the experience entry positions
             #TODO:change this logic of door poses in memory graph exp as such
             entry_poses = copy.deepcopy(exp['observation_entry_poses'])
+            print("ENTRY_POSES", entry_poses)
             if len(entry_poses) == 0:
+                print("we continued")
                 continue
             entry_poses = call_env_entry_poses_assessment(self.env_specific, entry_poses)
             place = self.allocentric_process.place_as_sampled_Normal_dist(exp['observation'], self.num_samples)

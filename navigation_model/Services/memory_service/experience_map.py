@@ -165,7 +165,7 @@ class ExperienceMap(object):
         self.DIM_XY = dim_xy
         self.DIM_TH = dim_th
 
-        self.DELTA_EXP_THRESHOLD = delta_exp_threshold
+        self.DELTA_EXP_THRESHOLD = 3
         self.DELTA_PC_THRESHOLD = delta_pc_threshold
         self.CORRECTION = correction
         self.LOOPS = loops
@@ -262,6 +262,7 @@ class ExperienceMap(object):
 
         x_m = self.accum_delta_x
         y_m = self.accum_delta_y
+        
         facing_rad = clip_rad_180(self.accum_delta_facing)
 
         x_m += updated_exp.x_m
@@ -395,7 +396,7 @@ class ExperienceMap(object):
         accum_delta_facing = clip_rad_180(self.accum_delta_facing + vrot)
         accum_delta_x = self.accum_delta_x + vtrans * np.cos(self.accum_delta_facing)
         accum_delta_y = self.accum_delta_y + vtrans * np.sin(self.accum_delta_facing)
-
+        print("accum_deltax and y",accum_delta_x, accum_delta_y,"self",self.accum_delta_x, self.accum_delta_y)
         return accum_delta_facing, accum_delta_x, accum_delta_y
 
     def delta_exp_above_thresold(self, delta_exp:float)->bool:
@@ -410,9 +411,12 @@ class ExperienceMap(object):
         if self.current_exp is not None:
             current_x_m =  self.accum_delta_x + self.current_exp.x_m
             current_y_m =  self.accum_delta_y + self.current_exp.y_m
+            print("accum",self.accum_delta_x, self.accum_delta_y,self.accum_delta_facing, "m loc",self.current_exp.x_m,self.current_exp.y_m,self.current_exp.facing_rad)
+        
         else:
             current_x_m =  self.accum_delta_x
             current_y_m =  self.accum_delta_y
+        
         return [current_x_m, current_y_m, self.accum_delta_facing]
     
     def get_exp_global_position(self, exp:object=-1)->list:
@@ -452,17 +456,18 @@ class ExperienceMap(object):
             current_GP = self.get_global_position()
             
             print('CHECK CURRENT GP X,Y,TH', current_GP )
+            print("EXPS IN VIEW CELL", view_cell.exps, "CURRENT CELL", view_cell,self.current_exp )
         
             delta_exps = []
         
             for e in self.exps:
-                print("this are the experiences in self.exps",e)
+                print("this are the experiences in self.exps",e,e.x_m,e.y_m)
                 delta_exp = self.get_delta_exp(e.x_m,e.y_m, current_GP[0], current_GP[1])
                 delta_exps.append(delta_exp)
             
             min_delta_GP_id = np.argmin(delta_exps)
             min_delta_GP_val = delta_exps[min_delta_GP_id]
-            print('delta_exps',delta_exps)
+            print('delta_exps',delta_exps,min_delta_GP_val)
             delta_pc = np.sqrt(
                 min_delta(self.current_exp.x_pc, x_pc, self.DIM_XY)**2 +
                 min_delta(self.current_exp.y_pc, y_pc, self.DIM_XY)**2 
@@ -487,10 +492,10 @@ class ExperienceMap(object):
             delta_pc = np.inf
 
         print('accumulated dist in exp map', self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing,'is delta_exp_above_thresold?', min_delta_GP_val,self.DELTA_EXP_THRESHOLD, 'closest exp dist', min_delta_GP_val, min_delta_GP_id)
-        
+        print('len exps =' ,len(view_cell.exps))
         # if current exp is None, just select first matching?
         if self.current_exp is None and Experience._ID == 0 :
-            print('first experience created')
+            print('first experience created',local_pose)
             exp = self._create_exp(x_pc, y_pc, th_pc, view_cell, local_pose)
 
             self.current_exp = exp
@@ -511,15 +516,66 @@ class ExperienceMap(object):
         #We have a new view but it's close to a previous experience
         elif len(view_cell.exps) == 0 and min_delta_GP_val < self.DELTA_EXP_THRESHOLD:
             print('too close from exp ', min_delta_GP_id,', dist between exp and here', min_delta_GP_val)
-            # exp = self.get_exp(min_delta_GP_id)
-            # delta_exp_pc = np.sqrt(
-            #     min_delta(self.current_exp.x_pc, exp.x_pc, self.DIM_XY)**2 +
-            #     min_delta(self.current_exp.y_pc, exp.y_pc, self.DIM_XY)**2 
-            #     + min_delta(self.current_exp.th_pc, exp.th_pc, self.DIM_TH)**2
-            #     )
-            # print('checking motion between two considered experiences', delta_exp_pc)
+            print("current exp", self.current_exp)
+            exp = self.get_exp(min_delta_GP_id)
+            delta_exp_pc = np.sqrt(
+                 min_delta(self.current_exp.x_pc, exp.x_pc, self.DIM_XY)**2 +
+                 min_delta(self.current_exp.y_pc, exp.y_pc, self.DIM_XY)**2 
+                 #+ min_delta(self.current_exp.th_pc, exp.th_pc, self.DIM_TH)**2
+                 )
+            print('checking motion between two considered experiences', delta_exp_pc)
             if min_delta_GP_id != self.current_exp.id: #delta_exp_pc > self.DELTA_PC_THRESHOLD: #if we are not considering same exp
+                '''close_loop_exp = self.exps[min_delta_GP_id]
+                self.current_exp = close_loop_exp
+                # Create links between experiences but maintain current trajectory
+                link_exists = False
+                for linked_exp in [l.target for l in self.current_exp.links]:
+                    if linked_exp == close_loop_exp:
+                        link_exists = True
+
+                if not link_exists:
+                    # Create bidirectional links but don't switch experiences
+                    self.current_exp.link_to(
+                        close_loop_exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing, active_link=True)
+                    close_loop_exp.link_to(
+                        self.current_exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing, active_link=False)
+                    
+                # Update current experience with view_cell but don't switch experiences
+                self.update_exp_wt_view_cell(self.current_exp, x_pc, y_pc, th_pc, view_cell, local_pose)
+                self.accum_delta_x = 0
+                self.accum_delta_y = 0
+                self.accum_delta_facing = self.current_exp.facing_rad
+                
+                
+                print('Created link with nearby exp but maintained current trajectory')
+                print("Global Position:", self.get_global_position(), self.current_exp.x_m, self.current_exp.y_m)'''
+                print('too close from exp ', min_delta_GP_id,', dist between exp and here', min_delta_GP_val)
+            
                 print('we are close looping with exp', min_delta_GP_id,' discarding newly generated view_cell ',view_cell.id)
+                adjust_map = True
+                close_loop_exp = self.exps[min_delta_GP_id]
+                # see if the exp near by already has a link to the current exp
+                link_exists = False
+                for linked_exp in [l.target for l in self.current_exp.links]:
+                        if linked_exp == close_loop_exp:
+                            link_exists = True
+
+                if not link_exists:
+                    self.current_exp.link_to(
+                        close_loop_exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing, active_link=True)
+                    close_loop_exp.link_to(
+                        self.current_exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing, active_link=False)
+                        
+                
+                self.accum_delta_x =  (self.current_exp.x_m+self.accum_delta_x) - close_loop_exp.x_m
+                self.accum_delta_y =  (self.current_exp.y_m+self.accum_delta_y) - close_loop_exp.y_m 
+                self.accum_delta_facing = self.current_exp.facing_rad
+                self.current_exp = close_loop_exp
+                print("Global Position:", self.get_global_position(), self.current_exp.x_m, self.current_exp.y_m,self.current_exp.facing_rad)
+                print('We keep current GP facing rad, this might be an issue in real environment',self.accum_delta_x,self.accum_delta_y,self.accum_delta_facing)
+                '''#self.accum_delta_facing = self.current_exp.facing_rad
+                #print('new current exp id and its view cell id:', self.current_exp.id, self.current_exp.view_cell.id)
+                print('we are close looping with exp', min_delta_GP_id,' discarding newly generated view_cell ',view_cell.id,self.current_exp.x_m,self.current_exp.y_m )
                 adjust_map = True
                 close_loop_exp = self.exps[min_delta_GP_id]
                 # see if the exp near by already has a link to the current exp
@@ -534,12 +590,25 @@ class ExperienceMap(object):
                     close_loop_exp.link_to(
                         self.current_exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing, active_link=False)
                     
+                dtheta = clip_rad_180(close_loop_exp.facing_rad - self.current_exp.facing_rad)
+                # Transform the (x, y) accumulator from the old frame into the new frame
+                new_accum_delta_x = self.accum_delta_x * np.cos(dtheta) - self.accum_delta_y * np.sin(dtheta)
+                new_accum_delta_y = self.accum_delta_x * np.sin(dtheta) + self.accum_delta_y * np.cos(dtheta)
+                # Adjust the accumulated facing as well
+                new_accum_delta_facing = clip_rad_180(self.accum_delta_facing + dtheta)
+                
+                # Update current experience and carry over the transformed accumulator instead of zeroing it out
                 self.current_exp = close_loop_exp
-                self.accum_delta_x = 0
-                self.accum_delta_y = 0
-                print('We keep current GP facing rad, this might be an issue in real environment')
-                #self.accum_delta_facing = self.current_exp.facing_rad
-                #print('new current exp id and its view cell id:', self.current_exp.id, self.current_exp.view_cell.id)
+                self.accum_delta_x = new_accum_delta_x
+                self.accum_delta_y = new_accum_delta_y
+                self.accum_delta_facing = new_accum_delta_facing
+
+                print('Transformed accumulator:', self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing)
+                print('New current exp id and its view cell id:', self.current_exp.id, self.current_exp.view_cell.id)
+                print("Global Position:", self.get_global_position(), self.current_exp.x_m, self.current_exp.y_m)'''
+                
+                
+                
             else:
                 print('replacing previously generated view_cell', self.current_exp.view_cell.id,' of exp ',self.current_exp.id)
                 print('OLD current exp position x: ' + str(self.current_exp.x_m) + ' y: '+str(self.current_exp.y_m) , ' facing: '+str(self.current_exp.facing_rad) \
@@ -570,7 +639,7 @@ class ExperienceMap(object):
                 self.accum_delta_facing = self.current_exp.facing_rad
 
         # if the vt is new AND the global pose x,y,th is far enough from any prev experience create a new experience
-        elif len(view_cell.exps) == 0 :
+        elif len(view_cell.exps) == 0:
             #if current location is far enough from prev one, else, view cells are considered as in conflict
             print('no exp in view, len =' ,len(view_cell.exps), 'closest exp dist', min_delta_GP_val )
             exp = self._create_exp(x_pc, y_pc, th_pc, view_cell,local_pose)
@@ -598,7 +667,7 @@ class ExperienceMap(object):
             n_candidate_matches = 0
    
             for (i, e) in enumerate(view_cell.exps):
-                #print('exp ' + str(i) +' view position x: ' + str(e.x_m) + ' y: '+str(e.y_m) )
+                print('exp ' + str(i) +' view position x: ' + str(e.x_m) + ' y: '+str(e.y_m) )
                 
                 delta_view_exp = self.get_delta_exp(e.x_m,e.y_m,current_GP[0], current_GP[1])
                 delta_view_exps.append(delta_view_exp)
@@ -687,6 +756,9 @@ class ExperienceMap(object):
             print('OLD current exp position x: ' + str(self.current_exp.x_m) + ' y: '+str(self.current_exp.y_m) , ' facing: '+str(self.current_exp.facing_rad) \
                       , ' local pose: '+str(self.current_exp.init_local_position), 'view cell id', self.current_exp.view_cell.id ) 
             self.update_exp_wt_view_cell(self.current_exp, x_pc, y_pc, th_pc, new_view_cell= None, local_pose= local_pose)
+            self.accum_delta_x=0
+            self.accum_delta_y=0
+            #self.accum_delta_facing = self.current_exp.facing_rad
             print('NEW current exp position x: ' + str(self.current_exp.x_m) + ' y: '+str(self.current_exp.y_m) , ' facing: '+str(self.current_exp.facing_rad) \
                 , ' local pose: '+str(self.current_exp.init_local_position), 'view cell id', self.current_exp.view_cell.id) 
             self.current_exp.view_cell.to_update = False
@@ -708,7 +780,7 @@ class ExperienceMap(object):
       
         print('self.current_exp.init_local_position',  self.current_exp.init_local_position)
 
-        #print('adjust map?', self.constant_adjust, adjust, adjust_map)
+        print('adjust map?', self.constant_adjust, adjust, adjust_map)
         if not self.constant_adjust:
             if not adjust or not adjust_map:
                 return

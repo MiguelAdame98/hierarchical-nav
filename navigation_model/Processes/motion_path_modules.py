@@ -65,7 +65,7 @@ def create_policies(current_pose:list, goal_poses:list, exploration:bool=True)->
     policies_lists = []
     #get all the actions leading to the endpoints
     for endpoint in goal_poses:
-        #print('end point and current pose', endpoint, current_pose)
+        print('end point and current pose', endpoint, current_pose)
         action_seq_options = define_policies_to_goal(current_pose, endpoint, exploration)
         policies_lists.extend(action_seq_options)
 
@@ -166,7 +166,7 @@ def define_policies_to_goal(start_pose:list, end_pose:list, exploration:bool= Tr
             
         path = path.tolist()
         action_seq = []
-        # action_seq_alt = []
+        action_seq_alt = []
         for step in range(1,len(path)+1):
             # print('step', step)
             continue_path = True
@@ -224,22 +224,23 @@ def define_policies_to_goal(start_pose:list, end_pose:list, exploration:bool= Tr
                 #--- Save action in action_seq or alternative_action_seq --#
                 if option ==0 :
                     ##If we have no alternative action seq but 2 possible motions, get all prev actions 
-                    # if action_seq_alt == [] and len(best_ids) > 1:
-                    #     action_seq_alt = action_seq.copy()
+                    if action_seq_alt == [] and len(best_ids) > 1:
+                            action_seq_alt = action_seq.copy()
                     ##If we have an alternative action seq and we are on an unique path 
-                    # elif action_seq_alt != [] and len(best_ids) == 1:
-                    #     action_seq_alt.extend(seq)
+                    elif action_seq_alt != [] and len(best_ids) == 1:
+                         action_seq_alt.extend(seq)
                     action_seq.extend(seq)
                 #update the second motion option in the alternative seq 
-                # else:
-                #     action_seq_alt.extend(seq)
+                else:
+                     action_seq_alt.extend(seq)
         #path_lengths.append(len(action_seq))
         action_seq_options.append(action_seq)
-        # if action_seq_alt != []:
+        if action_seq_alt != []:
+             
         #     # print('added', action_seq)
         #     # print('added', action_seq_alt)
-        #     action_seq_options.append(action_seq_alt)
-        #     #path_lengths.append(len(action_seq_alt))
+                action_seq_options.append(action_seq_alt)
+        #path_lengths.append(len(action_seq_alt))
     
     return action_seq_options
 

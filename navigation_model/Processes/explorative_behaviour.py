@@ -37,7 +37,7 @@ class ExplorativeBehaviour():
         The agent explore if it is surprised enough in env or it has an idea where to explore next
         For teh agent to reach an info gain coeff < 0.001, it is expected to need about 10-30steps in a room
         """
-        if (abs(info_gain_coeff) < threshold / 1000 and policy_G < threshold/ 10) :
+        if (abs(info_gain_coeff) < (threshold / 1000) and policy_G < (threshold/ 10)) :
             self.agent_exploring = False
         else:
             self.agent_exploring = True
@@ -226,7 +226,7 @@ class ExplorativeBehaviour():
         if self.verbose:
             print('_')
             print('solving doubt over place')
-            print(len(best_hypothesis),'hypothesis being considered')
+            print(len(best_hypothesis),'hypothesis being considered',len(plausible_actions))
             print('kl_per_action:', kl_per_action)
             print('summed_ambiguity_per_action:', summed_ambiguity_per_action)
             print('actions_weight', actions_weight)

@@ -87,6 +87,7 @@ class MinigridInteraction():
 
         #--- ENV INIT ---#
         self.env_name = 'MiniGrid-' + args.env + '-v0'
+        print(self.env_name)
         self.env = gym.make(self.env_name, rooms_in_row=args.rooms_in_row, rooms_in_col=args.rooms_in_col)
         self.env = RGBImgPartialObsWrapper(self.env)
         self.env = ImgActionObsWrapper(self.env)
@@ -254,11 +255,11 @@ class MinigridInteraction():
         print('step in world:', self.step_count())
         print('action to apply:',action)
         obs, _, _, _ = self.env.step(action)
+        print(obs.keys(),obs["pose"])
         obs = no_vel_no_action(obs)
-        print(obs["image"].shape)
         self.models_manager.digest(obs)
-        is_agent_at_door(self.models_manager, sensitivity=0.18)
-        print("is agent at door",is_agent_at_door(self.models_manager, sensitivity=0.18))
+        is_agent_at_door(self.models_manager, sensitivity=0.72)
+        print("is agent at door",is_agent_at_door(self.models_manager, sensitivity=0.54))
         if self.models_manager.agent_lost():
             #we are lost? want the info_gain memory to be reset to 1 value
             slide_window = 1
@@ -272,8 +273,8 @@ class MinigridInteraction():
     def apply_policy(self, policy:list, n_actions:int, collect_data:bool=False)->tuple[list,bool]:
         motion_data = []
         agent_lost = False
-        print("n_sctions",n_actions)
-        for a in range(n_actions):
+        print("n_sctions",n_actions, policy,self.convert_hot_encoded_to_minigrid_action(policy[0]))
+        for a in range(len(policy)):
             action = self.convert_hot_encoded_to_minigrid_action(policy[a])
             agent_lost, obs = self.agent_step(action)
             world_img = self.redraw()
@@ -306,7 +307,7 @@ class MinigridInteraction():
         print('exploring')
         if self.explorative_behaviour.is_agent_exploring(): #agent_exploring return the latest computed value
             policy, n_action = self.explorative_behaviour.one_step_ego_allo_exploration(self.models_manager)
-            print("is agent exploring?")
+            print("is agent exploring?",self.explorative_behaviour.is_agent_exploring())
             print(policy, n_action )
         else:
             policy, n_action = [],[]

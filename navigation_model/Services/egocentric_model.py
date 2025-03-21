@@ -147,9 +147,8 @@ class EgocentricModel(PerceptionModel):
 
         with torch.no_grad():
             step = self.model.forward(action, obs, reconstruct=reconstruct)
-            print("we are inside the egocentric digest, just to see if it is updating", step)
+            #print("we are inside the egocentric digest, just to see if it is updating", step)
             step.surprise = kl_divergence(step.posterior, step.prior)
-            print(torch.__version__)
             print("what kldivergence?", step.surprise)
             
            

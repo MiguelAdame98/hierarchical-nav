@@ -98,14 +98,18 @@ class AllocentricProcess():
 
 #=================  FORMAT METHODS ==========================================================================
     def reset_step_lost_counter(self):
+        print("REEEEEEEESEEEEEEEET")
         self.step_lost_counter = 0
     
     def lost_steps_increase(self) -> None:
         '''
         increase lost steps count, only if we are already lost
         '''
+        print("place_doubt_step before",self.step_lost_counter)
         if self.step_lost_counter > 0:
-            self.step_lost_counter + 1
+            #self.step_lost_counter + 1
+            self.step_lost_counter += 1
+            print("place_doubt_step after",self.step_lost_counter)
 
     def sample_observations(self, observations:dict, num_samples:int)-> dict:
         return self.allocentric_model.sample_observations(observations, sample = num_samples)
@@ -130,7 +134,7 @@ class AllocentricProcess():
         ''' update observations given hypo current pose and action'''
         pose  = action_to_pose(observations['action'],prev_pose)
         observations['pose'] = torch_pose(pose.copy())
-        # observations = self.allocentric_model.sample_observations(observations,sample)
+        #observations = self.allocentric_model.sample_observations(observations,sample)
         return observations, pose  
 
 #================= STEP UPDATE METHODS START==============================================================================#
@@ -142,7 +146,6 @@ class AllocentricProcess():
         #step = [None]*len(self.place_descriptors)
         mse_list = []
         
-        print('place_descriptors length', len(self.place_descriptors))
         print('pose of best hypothesis before action ', self.place_descriptors[0]['pose'])
         #Update the step count for the parallel models run
         self.lost_steps_increase()
@@ -153,28 +156,26 @@ class AllocentricProcess():
         # - access and modify directly place_descriptors  (it's a copy, not a deepcopy)
         # - add dicts to place_descriptors 
         tmp_model_properties = self.place_descriptors.copy()
-        print("XXXXXXXX")
-        print(tmp_model_properties.items())
+        print("XXXXXXXX", len(self.place_descriptors))
         for place_idx, place_description in tmp_model_properties.items():
-            print("this is the index and place", place_description, place_idx)
             #---- 1. Observations incorporation ----#
             observations, place_description['pose'] = self.one_action_ob_update(observations, place_description['pose'])
-            print("this is the observation inside the place descriptors", observations, place_description['pose'])
             
             #---- 2. Update Believes of the generative models ----#
             self.allocentric_model.reset() #safety net to be sure to start anew
             step = self.allocentric_model.digest(observations, place_description['post'],sample)
 
-            #---- 3. Process beleieves and update the model properties----#
+            #---- 3. Process believes and update the model properties----#
             
             #If we have a prior to our place
             place_description['mse'], place_description['kl'], place_description['image_predicted'] = self.calculate_hypo_likelihood(place_description, step)
             mse_list.append(place_description['mse'])                          
-            print('place ',place_idx, 'pose',  place_description['pose'],min(mse_list), 'mse and kl:', place_description['mse'],(1.6*self.mse_threhsold),"bnnbb",len(self.get_place_range()), place_description['kl']) 
+            #print('min(mse_list) ',min(mse_list), 'place_description[mse]', place_description['mse'] , "place_doubt_step",self.place_doubt_step_count()) 
   
             #if we have no prior for this place  OR  If our place explain our image
             if np.isnan(place_description['mse']) \
                 or place_description['mse'] < self.mse_threhsold : 
+                print("THIS HAS BEEN EXPLAINAAAAAD","place_doubt_step",self.place_doubt_step_count())
                 place_description = self.increase_hypo_likelihood(place_description, step)
 
             
@@ -182,10 +183,12 @@ class AllocentricProcess():
             #If we already have an mse < th, then we know it's not worth creating new models since all will be erased. 
             #If the mse is too high and there is a lot of models, don't consider this hypo at all
             elif not min(mse_list) < self.mse_threhsold and \
-                (place_description['mse'] <= 1.6 * self.mse_threhsold \
+                (place_description['mse'] <= 1.4 * self.mse_threhsold \
                 or len(self.place_descriptors) < len(self.get_place_range())):
+
                 place_description = self.decrease_hypo_likelihood(place_description)
-                print("CREATING NEW ALTERNATIVE place",)
+                print("WHY",place_description['mse'],place_description['mse'] <= 1.4 * self.mse_threhsold,len(self.place_descriptors) < len(self.get_place_range()))
+                print("CREATING NEW ALTERNATIVE place""place_doubt_step",self.place_doubt_step_count())
                 self.add_new_place_hypothesis(step['place'],place_idx,observations['image'], sample)
         
         if self.place_doubt_step_count() > 0 :
@@ -230,7 +233,7 @@ class AllocentricProcess():
         """
         best_mse_idx = self.best_model_according_mse(mse) 
         print('number of parallel options running: ', len(mse) ,' and lowest values of mse:', mse[best_mse_idx])#, kl[index_min_err])
-        print('place explaining observation best conssidering the recon err:' +str(best_mse_idx))#+ ', considering kl:'+ str(index_min_kl) )
+        #print('place explaining observation best considering the recon err:' +str(best_mse_idx))#+ ', considering kl:'+ str(index_min_kl) )
         self.add_hypo_weight_mse_under_threshold(mse, best_mse_idx)
         return best_mse_idx
     
@@ -263,6 +266,7 @@ class AllocentricProcess():
             print('pose:', self.place_descriptors[best_mse_idx]['pose'])
             #best model preferably always takes index 0
             if self.place_doubt_step_count() > 0 :
+                print(self.place_doubt_step_count())
                 temp = self.place_descriptors[0].copy()
                 self.place_descriptors[0] = self.place_descriptors[best_mse_idx]
                 self.place_descriptors[best_mse_idx] = temp
@@ -275,7 +279,7 @@ class AllocentricProcess():
         """
         mse = self.extract_mse_from_hypothesis(default_value= np.nan)
         list_indexes_max_weight = [idx for idx,val in enumerate(hypothesis_weight) if val==hypothesis_weight[index_max_weight]]
-        print('highest weight models indexes', list_indexes_max_weight)
+        #print('highest weight models indexes', list_indexes_max_weight)
         best_model_idx = index_max_weight
         for idx in list_indexes_max_weight:
             if idx == 0:
@@ -328,7 +332,7 @@ class AllocentricProcess():
         hypothesis_weight = self.extract_weight_from_hypothesis(default_value=0)
         index_max_weight = np.nanargmax(hypothesis_weight)
         print('highest weight index and its value in list and dict',  index_max_weight, self.place_descriptors[index_max_weight]['hypothesis_weight'])
-
+        print("place_doubt_step",self.place_doubt_step_count(),hypothesis_weight[index_max_weight] >= 2.5,self.place_descriptors[index_max_weight]['hypothesis_weight'])
         #if we have likely hypo, we converge to the best hypo among them  
         if hypothesis_weight[index_max_weight] >= 2.5:
             best_model_idx = self.best_model_according_to_weights(hypothesis_weight, index_max_weight)
@@ -336,21 +340,21 @@ class AllocentricProcess():
             self.reset_step_lost_counter()
         
         #Every 2 steps, we erase a part of the worst hypothesis
-        elif self.place_doubt_step_count() >= 2:
+        #elif self.place_doubt_step_count() >= 2:
+        elif self.place_doubt_step_count() >= 3:
             print("________________")
             print("_______________")
             print("________________")
             print("_______________")
-            print("why are we not entering here?", self.place_doubt_step_count)
-            self.remove_worst_hypothesis(portion = 2)
+            print("we erased", self.place_doubt_step_count)
+            self.remove_worst_hypothesis(portion = 3)
     
     def add_new_place_hypothesis(self, current_updated_post, place_idx: int, current_ob: torch.Tensor, num_samples:int) -> None:
         """ we create parallel hypothesis with poses encompasing -most- possible agent position """
         #If we are here, we are doubting our belief.
         if self.step_lost_counter == 0:
             self.step_lost_counter += 1
-        
-        #We re-add the current wrong hypo place in the loop with the previous pose.
+     #We re-add the current wrong hypo place in the loop with the previous pose.
         self.add_parallel_hypothesis(pose=self.place_descriptors[place_idx]['pose'].copy(), post=current_updated_post[:])
         
         pose_options = self.get_place_range()
@@ -359,8 +363,9 @@ class AllocentricProcess():
            
         #we only create post:Normal hypothesis around all ranged poses given current ob 
         #when we start doubting or have been wondering for long enough to have erased enough worst hypothesis
-        if len(self.place_descriptors) < len(pose_options): 
-            print("why are we entering here?", len(self.place_descriptors), len(pose_options))
+        if (len(self.place_descriptors) < len(pose_options)) and self.step_lost_counter > 1: 
+        #if (len(self.place_descriptors) < len(pose_options)):
+            #print("why are we entering here?", len(self.place_descriptors), len(pose_options),range(observations['pose'].shape[0]))
             ob = {'image': current_ob.clone()}
             for pose_idx in range(observations['pose'].shape[0]):
                 pose = observations['pose'][pose_idx,...].unsqueeze(0)
@@ -377,7 +382,6 @@ class AllocentricProcess():
     def add_parallel_hypothesis(self, pose:list, post=None) -> None:
         """ We create new model property batch at the end of current dict """
         new_place_idx = len(self.place_descriptors)
-        print("new place idx", new_place_idx)
         self.place_descriptors[new_place_idx] = {}
         self.place_descriptors[new_place_idx]['post'] = post
         self.place_descriptors[new_place_idx]['pose'] = pose
@@ -389,7 +393,7 @@ class AllocentricProcess():
         self.place_descriptors[new_place_idx]['image_predicted'] = None
         self.place_descriptors[new_place_idx]['kl'] = np.nan
         self.place_descriptors[new_place_idx]['mse'] = np.nan
-        print('new para model', self.place_descriptors[new_place_idx])
+        #print('new para model inside the allocentric process, add parallel hypothesis',new_place_idx )
     
     def add_hypothesis_to_competition(self,place, poses, mse=None, exp=None):
         """
@@ -562,7 +566,7 @@ class AllocentricModel(PerceptionModel):
         self.model.to(config['device'])
     
         self.space_post = None
-        self.live_training = False
+        self.live_training = True
         self.observations_keys = config['dataset']['keys'] 
         self.observations_shape_length = {'image':5, 'action':2, 'pose':3}
      
@@ -589,15 +593,14 @@ class AllocentricModel(PerceptionModel):
     def digest(self, observations:dict, space_posterior:torch, sample:int =1, reconstruct=False): 
         #TODO: adapt for several sensors
         # returns dict with current prior/posterior
-        print('observations', observations['pose'].shape, observations['image'].shape)
         obs = self.sample_observations(observations, sample = sample)
         #NOTE: IF TRAINING continues while moving
         if not self.live_training:
             with torch.no_grad():
                 step = self.model.forward(obs, place = space_posterior, reconstruct=reconstruct)
         else:
-            print('uncomment process in digest pytorchslammodel')
-            #step = self.model.forward(obs, place = space_posterior, reconstruct=False)
+            #print('uncomment process in digest pytorchslammodel')
+            step = self.model.forward(obs, place = space_posterior, reconstruct=False)
         return step
 
     def create_query(self, obs, keys=[]):
@@ -605,6 +608,7 @@ class AllocentricModel(PerceptionModel):
         for k in keys:
             ob = obs.get(k,None)
             observations[k+'_query'] = ob
+        
         return observations
 
 
