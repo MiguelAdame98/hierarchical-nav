@@ -26,8 +26,8 @@ class Manager():
         self.env_specific = env
 
         #DICT CONFIG
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
+        #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = torch.device('cpu')
         #ego config //STATIC//
         self.egocentric_process = init_egocentric_process(env_actions, device)
 
