@@ -544,6 +544,7 @@ class ExperienceMap(object):
                 self.accum_delta_x =  (self.current_exp.x_m+self.accum_delta_x) - close_loop_exp.x_m
                 self.accum_delta_y =  (self.current_exp.y_m+self.accum_delta_y) - close_loop_exp.y_m 
                 #self.accum_delta_facing = self.current_exp.facing_rad
+                self.close_loop_exp.facing_rad=self.accum_delta_facing
                 self.current_exp = close_loop_exp
                 print("Global Position:", self.get_global_position(), self.current_exp.x_m, self.current_exp.y_m,self.current_exp.facing_rad)
                 print('We keep current GP facing rad, this might be an issue in real environment',self.accum_delta_x,self.accum_delta_y,self.accum_delta_facing)
