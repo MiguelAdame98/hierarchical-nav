@@ -211,6 +211,7 @@ def plot_visited_rooms(ax, visited_rooms, env_definition):
     total_rooms = n_row * n_col
     explored_rooms = len(visited_rooms)
     print(f"{explored_rooms} out of {total_rooms} total rooms explored")
+    print("visited_rooms", visited_rooms)
 
     # Create the plot
     im = ax.imshow(grid, cmap='gist_heat', vmin=0, vmax=1)
@@ -232,6 +233,7 @@ def plot_visited_rooms(ax, visited_rooms, env_definition):
     ax.set_title('Rooms ordered by discovery')
 
     return ax
+
 
 
 def plot_memory_map(ax, memory_map_data):
