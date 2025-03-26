@@ -417,7 +417,7 @@ class ExperienceMap(object):
             current_x_m =  self.accum_delta_x
             current_y_m =  self.accum_delta_y
         
-        return [current_x_m, current_y_m, self.accum_delta_facing]
+        return [float(current_x_m), float(current_y_m), float(self.accum_delta_facing)]
     
     def get_exp_global_position(self, exp:object=-1)->list:
         if isinstance(exp, int):
