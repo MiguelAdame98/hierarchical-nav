@@ -158,7 +158,7 @@ def plot_MSE_bar(ax, mse_err, agent_lost):
     plt.grid(axis='y')
     plt.title('mse ob/expectation')
 
-def plot_visited_rooms(ax, visited_rooms, env_definition):
+'''def plot_visited_rooms(ax, visited_rooms, env_definition):
     n_row = env_definition['n_row']
     n_col = env_definition['n_col']
 
@@ -191,7 +191,48 @@ def plot_visited_rooms(ax, visited_rooms, env_definition):
     # Set title for the subplot
     ax.set_title('Rooms ordered by discovery')
 
+    return ax'''
+def plot_visited_rooms(ax, visited_rooms, env_definition):
+    n_row = env_definition['n_row']
+    n_col = env_definition['n_col']
+
+    # Create a grid of the specified size with all white tiles
+    grid = np.ones((n_row, n_col))  
+
+    # Assign colors based on visited rooms
+    for i in range(n_col):
+        for j in range(n_row):
+            if (i, j) in visited_rooms:
+                position_in_list = visited_rooms.index((i, j))
+                color_value = position_in_list / len(visited_rooms)
+                grid[j][i] = color_value
+
+    # Calculate total rooms and explored count
+    total_rooms = n_row * n_col
+    explored_rooms = len(visited_rooms)
+    print(f"{explored_rooms} out of {total_rooms} total rooms explored")
+
+    # Create the plot
+    im = ax.imshow(grid, cmap='gist_heat', vmin=0, vmax=1)
+    ax.set_xticks(np.arange(n_col))
+    ax.set_yticks(np.arange(n_row))
+    
+    # Create a divider for existing axes instance
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size="5%", pad=0.1)
+
+    # Create a colorbar
+    cbar = plt.colorbar(im, cax=cax, orientation='vertical', label='Visited Rooms')
+
+    # Set custom tick labels
+    cbar.set_ticks([0, 0.9, 1])
+    cbar.set_ticklabels(['oldest', 'newest', 'unknown'])
+
+    # Set title for the subplot
+    ax.set_title('Rooms ordered by discovery')
+
     return ax
+
 
 def plot_memory_map(ax, memory_map_data):
     plt.title('Exp Map')
