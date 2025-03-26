@@ -225,10 +225,9 @@ def plot_memory_map(ax, memory_map_data):
     return ax
 
 def print_positions(ax, GP, pose, step_count):
-    current_gp = np.array(GP)
-    current_gp = list(np.around(current_gp, 2))
+    current_gp = [float(x) for x in np.around(np.array(GP), 2)]
     s1 = 'Global Position [x,y,th]: ' 
-    ax.text(-0.3,0.9, s1, fontsize=10, color='black')
+    ax.text(-0.3, 0.9, s1, fontsize=10, color='black')
     ax.text(0, 0.8, str(current_gp), fontsize=10, color='black')
     
     s3 = 'Local Position [x y th]: ' 

@@ -525,32 +525,6 @@ class ExperienceMap(object):
                  )
             print('checking motion between two considered experiences', delta_exp_pc)
             if min_delta_GP_id != self.current_exp.id: #delta_exp_pc > self.DELTA_PC_THRESHOLD: #if we are not considering same exp
-                '''close_loop_exp = self.exps[min_delta_GP_id]
-                self.current_exp = close_loop_exp
-                # Create links between experiences but maintain current trajectory
-                link_exists = False
-                for linked_exp in [l.target for l in self.current_exp.links]:
-                    if linked_exp == close_loop_exp:
-                        link_exists = True
-
-                if not link_exists:
-                    # Create bidirectional links but don't switch experiences
-                    self.current_exp.link_to(
-                        close_loop_exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing, active_link=True)
-                    close_loop_exp.link_to(
-                        self.current_exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing, active_link=False)
-                    
-                # Update current experience with view_cell but don't switch experiences
-                self.update_exp_wt_view_cell(self.current_exp, x_pc, y_pc, th_pc, view_cell, local_pose)
-                self.accum_delta_x = 0
-                self.accum_delta_y = 0
-                self.accum_delta_facing = self.current_exp.facing_rad
-                
-                
-                print('Created link with nearby exp but maintained current trajectory')
-                print("Global Position:", self.get_global_position(), self.current_exp.x_m, self.current_exp.y_m)'''
-                print('too close from exp ', min_delta_GP_id,', dist between exp and here', min_delta_GP_val)
-            
                 print('we are close looping with exp', min_delta_GP_id,' discarding newly generated view_cell ',view_cell.id)
                 adjust_map = True
                 close_loop_exp = self.exps[min_delta_GP_id]
@@ -569,44 +543,10 @@ class ExperienceMap(object):
                 
                 self.accum_delta_x =  (self.current_exp.x_m+self.accum_delta_x) - close_loop_exp.x_m
                 self.accum_delta_y =  (self.current_exp.y_m+self.accum_delta_y) - close_loop_exp.y_m 
-                self.accum_delta_facing = self.current_exp.facing_rad
+                #self.accum_delta_facing = self.current_exp.facing_rad
                 self.current_exp = close_loop_exp
                 print("Global Position:", self.get_global_position(), self.current_exp.x_m, self.current_exp.y_m,self.current_exp.facing_rad)
                 print('We keep current GP facing rad, this might be an issue in real environment',self.accum_delta_x,self.accum_delta_y,self.accum_delta_facing)
-                '''#self.accum_delta_facing = self.current_exp.facing_rad
-                #print('new current exp id and its view cell id:', self.current_exp.id, self.current_exp.view_cell.id)
-                print('we are close looping with exp', min_delta_GP_id,' discarding newly generated view_cell ',view_cell.id,self.current_exp.x_m,self.current_exp.y_m )
-                adjust_map = True
-                close_loop_exp = self.exps[min_delta_GP_id]
-                # see if the exp near by already has a link to the current exp
-                link_exists = False
-                for linked_exp in [l.target for l in self.current_exp.links]:
-                    if linked_exp == close_loop_exp:
-                        link_exists = True
-
-                if not link_exists:
-                    self.current_exp.link_to(
-                        close_loop_exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing, active_link=True)
-                    close_loop_exp.link_to(
-                        self.current_exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing, active_link=False)
-                    
-                dtheta = clip_rad_180(close_loop_exp.facing_rad - self.current_exp.facing_rad)
-                # Transform the (x, y) accumulator from the old frame into the new frame
-                new_accum_delta_x = self.accum_delta_x * np.cos(dtheta) - self.accum_delta_y * np.sin(dtheta)
-                new_accum_delta_y = self.accum_delta_x * np.sin(dtheta) + self.accum_delta_y * np.cos(dtheta)
-                # Adjust the accumulated facing as well
-                new_accum_delta_facing = clip_rad_180(self.accum_delta_facing + dtheta)
-                
-                # Update current experience and carry over the transformed accumulator instead of zeroing it out
-                self.current_exp = close_loop_exp
-                self.accum_delta_x = new_accum_delta_x
-                self.accum_delta_y = new_accum_delta_y
-                self.accum_delta_facing = new_accum_delta_facing
-
-                print('Transformed accumulator:', self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing)
-                print('New current exp id and its view cell id:', self.current_exp.id, self.current_exp.view_cell.id)
-                print("Global Position:", self.get_global_position(), self.current_exp.x_m, self.current_exp.y_m)'''
-                
                 
                 
             else:
