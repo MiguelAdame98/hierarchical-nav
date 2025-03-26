@@ -42,9 +42,9 @@ import numpy as np
 
 #from dommel_library.distributions.multivariate_normal import MultivariateNormal
 # import re
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+#device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-
+device = torch.device('cpu')
 
 class TorchedViewCell(object):
 
