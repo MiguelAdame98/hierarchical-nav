@@ -653,10 +653,16 @@ class ExperienceMap(object):
                     #TODO: add view_cell_copy instead of view_cell
                     matched_exp = self._create_exp(
                         x_pc, y_pc, th_pc, view_cell_copy,local_pose)
+                    self.current_exp = matched_exp
+                    self.accum_delta_x = 0
+                    self.accum_delta_y = 0
 
+                #self.current_exp = matched_exp
+                #self.accum_delta_x = 0
+                #self.accum_delta_y = 0
+                self.accum_delta_x = (self.current_exp.x_m + self.accum_delta_x) - matched_exp.x_m
+                self.accum_delta_y = (self.current_exp.y_m + self.accum_delta_y) - matched_exp.y_m
                 self.current_exp = matched_exp
-                self.accum_delta_x = 0
-                self.accum_delta_y = 0
                 #commented line below as we don't narrow close loop around position but place, this means no strict position correction in odom
                 #self.accum_delta_facing = self.current_exp.facing_rad
         # print('current experience id and matching view',self.current_exp.id, view_cell.id)
