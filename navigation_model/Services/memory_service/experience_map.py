@@ -461,7 +461,9 @@ class ExperienceMap(object):
             delta_exps = []
         
             for e in self.exps:
-                print("this are the experiences in self.exps",e,e.x_m,e.y_m)
+                print("this are the experiences in self.exps",e,e.x_m,e.y_m, e.view_cell,"id  ",e.view_cell.id)
+                print(e.view_cell.exps)
+                print(view_cell.exps)
                 delta_exp = self.get_delta_exp(e.x_m,e.y_m, current_GP[0], current_GP[1])
                 delta_exps.append(delta_exp)
             
