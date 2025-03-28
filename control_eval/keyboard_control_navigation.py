@@ -253,7 +253,6 @@ class MinigridInteraction():
 
     def agent_step(self, action) -> tuple[bool,dict]:
         print('step in world:', self.step_count())
-        print("cm")
         print('action to apply:',action)
         obs, _, _, _ = self.env.step(action)
         print(obs.keys(),obs["pose"])

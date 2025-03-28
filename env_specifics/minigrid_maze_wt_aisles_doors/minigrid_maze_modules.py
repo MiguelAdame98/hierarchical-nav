@@ -92,7 +92,7 @@ def is_agent_at_door(manager:object, sensitivity:float= 1) -> bool:
         mse_door = mse_elements(predicted_image, door_image)
         print("mse_under_th",mse_door, sensitivity,manager.mse_under_threshold(mse_door, sensitivity))
         if manager.mse_under_threshold(mse_door, sensitivity):
-            debug_and_save_images(door_image, predicted_image)
+            #debug_and_save_images(door_image, predicted_image)
             pose = list(best_place_hypothesis['pose'])
             print("save_pose_in_memory")
             manager.save_pose_in_memory(pose)
