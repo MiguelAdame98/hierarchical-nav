@@ -456,14 +456,15 @@ class ExperienceMap(object):
             current_GP = self.get_global_position()
             
             print('CHECK CURRENT GP X,Y,TH', current_GP )
-            print("EXPS IN VIEW CELL", view_cell.exps, "CURRENT CELL", view_cell,self.current_exp )
+            print("EXPS IN VIEW CELL", view_cell.exps, "CURRENT CELL",self.current_exp )
         
             delta_exps = []
         
             for e in self.exps:
-                print("this are the experiences in self.exps",e,e.x_m,e.y_m, e.view_cell,"id  ",e.view_cell.id)
-                print(e.view_cell.exps)
-                print(view_cell.exps)
+                print("this are the experiences in self.exps",e,e.x_m,e.y_m,"id  ",e.view_cell.id)
+                print(e.view_cell.id,e.view_cell.exps)
+                for (i, e) in enumerate(e.view_cell.exps):
+                    print('exp ' + str(i) +' view position x: ' + str(e.x_m) + ' y: '+str(e.y_m) )
                 delta_exp = self.get_delta_exp(e.x_m,e.y_m, current_GP[0], current_GP[1])
                 delta_exps.append(delta_exp)
             
