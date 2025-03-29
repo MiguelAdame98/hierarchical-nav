@@ -645,6 +645,9 @@ class ExperienceMap(object):
                             matched_exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing, active_link=True)
                         matched_exp.link_to(
                             self.current_exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing, active_link=False)
+                    self.accum_delta_x = (self.current_exp.x_m + self.accum_delta_x) - matched_exp.x_m
+                    self.accum_delta_y = (self.current_exp.y_m + self.accum_delta_y) - matched_exp.y_m
+                    self.current_exp = matched_exp
                 
                 if matched_exp is None:
                     if min_delta_GP_val > self.DELTA_EXP_THRESHOLD:
@@ -664,9 +667,7 @@ class ExperienceMap(object):
                 #self.current_exp = matched_exp
                 #self.accum_delta_x = 0
                 #self.accum_delta_y = 0
-                self.accum_delta_x = (self.current_exp.x_m + self.accum_delta_x) - matched_exp.x_m
-                self.accum_delta_y = (self.current_exp.y_m + self.accum_delta_y) - matched_exp.y_m
-                self.current_exp = matched_exp
+    
                 #commented line below as we don't narrow close loop around position but place, this means no strict position correction in odom
                 #self.accum_delta_facing = self.current_exp.facing_rad
         # print('current experience id and matching view',self.current_exp.id, view_cell.id)
