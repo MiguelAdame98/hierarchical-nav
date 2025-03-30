@@ -653,6 +653,7 @@ class ExperienceMap(object):
                     if min_delta_GP_val > self.DELTA_EXP_THRESHOLD:
                         print("Creating new experience because min_delta_GP_val exceeds threshold")
                         matched_exp = self._create_exp(x_pc, y_pc, th_pc, view_cell_copy, local_pose)
+                        self.current_exp = matched_exp
                         self.accum_delta_x = 0
                         self.accum_delta_y = 0
                     '''print("warning, no matched experience although matching view cell ", min_delta_GP_val)
