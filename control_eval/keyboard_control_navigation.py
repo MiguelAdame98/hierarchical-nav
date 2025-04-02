@@ -274,7 +274,8 @@ class MinigridInteraction():
         motion_data = []
         agent_lost = False
         print("n_sctions",n_actions, policy,self.convert_hot_encoded_to_minigrid_action(policy[0]))
-        for a in range(len(policy)):
+        #for a in range(len(policy)):
+        for a in range(n_actions):
             action = self.convert_hot_encoded_to_minigrid_action(policy[a])
             agent_lost, obs = self.agent_step(action)
             world_img = self.redraw()
@@ -316,7 +317,7 @@ class MinigridInteraction():
         while len(policy) == 0:    
             print('++++++++++++++++++++++++ while len policy =0')   
             print('trying to increase lookahead by 1 to increase exploration range')
-            lookahead_increased = self.models_manager.increase_lookahead(max=8)   
+            lookahead_increased = self.models_manager.increase_lookahead(max=7)   
             if not lookahead_increased:
                 print('lookahead at max value, search to return to another place')
                 ongoing_exploration_option = 'change_memory_place'
