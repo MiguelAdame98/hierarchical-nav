@@ -353,16 +353,18 @@ class Manager():
             place = self.allocentric_process.place_as_sampled_Normal_dist(place,self.num_samples)
         #How many entry points do we want to remember
         num_return_poses = call_env_number_of_entry_points(self.env_specific)
+        print("this should be 4", num_return_poses, "  ", place)
         #best poses matching ob
         best_poses_wt_mse = self.allocentric_process.best_matching_poses_with_ob(place, env_relevant_ob, num_return_poses)
+        print(best_poses_wt_mse)
         #remove duplicate pose (in minigrid means removing double orientation)
         ob_poses = call_env_remove_double_poses(self.env_specific, best_poses_wt_mse)
-        
+        print(ob_poses)
         #Only remember pose if it is under a mse threshold
         for mse, p in ob_poses:
             if self.mse_under_threshold(mse, sensitivity=0.2) :
                 door_poses.append(p)
-        print('predicted door poses', door_poses)
+        print('predicted door poses 222', door_poses)
         print('corresponding MSE ', ob_poses[0:len(door_poses)])
         return door_poses
     
