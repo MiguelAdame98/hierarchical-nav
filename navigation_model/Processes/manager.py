@@ -362,7 +362,7 @@ class Manager():
         print(ob_poses)
         #Only remember pose if it is under a mse threshold
         for mse, p in ob_poses:
-            if self.mse_under_threshold(mse, sensitivity=0.2) :
+            if self.mse_under_threshold(mse, sensitivity=0.4) :
                 door_poses.append(p)
         print('predicted door poses 222', door_poses)
         print('corresponding MSE ', ob_poses[0:len(door_poses)])
