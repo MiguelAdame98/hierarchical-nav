@@ -165,7 +165,7 @@ class ExperienceMap(object):
         self.DIM_XY = dim_xy
         self.DIM_TH = dim_th
 
-        self.DELTA_EXP_THRESHOLD = 3
+        self.DELTA_EXP_THRESHOLD = 3.5
         self.DELTA_PC_THRESHOLD = delta_pc_threshold
         self.CORRECTION = correction
         self.LOOPS = loops
@@ -629,7 +629,7 @@ class ExperienceMap(object):
                 min_delta_GP_id = np.argmin(delta_view_exps)
                 min_delta_GP_val = delta_view_exps[min_delta_GP_id]
                 #NOTE: static 2* added that won't be pertinent for all environments
-                if min_delta_GP_val < 2 * self.DELTA_EXP_THRESHOLD :
+                if min_delta_GP_val < self.DELTA_EXP_THRESHOLD :
                     print('the delta between exp' , view_cell.exps[min_delta_GP_id].id ,' and ' ,self.current_exp.id, ' allow for a close-loop')
                     matched_exp = view_cell.exps[min_delta_GP_id]
 

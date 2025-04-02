@@ -37,6 +37,7 @@ class ExplorativeBehaviour():
         The agent explore if it is surprised enough in env or it has an idea where to explore next
         For teh agent to reach an info gain coeff < 0.001, it is expected to need about 10-30steps in a room
         """
+        print("why no explore?",abs(info_gain_coeff),(threshold / 1000) ,abs(info_gain_coeff) < (threshold / 1000),policy_G < (threshold/ 10),policy_G ,(threshold/ 10)  )
         if (abs(info_gain_coeff) < (threshold / 1000) and policy_G < (threshold/ 10)) :
             self.agent_exploring = False
         else:

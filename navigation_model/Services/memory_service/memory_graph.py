@@ -164,7 +164,6 @@ class MemoryGraph(object):
         print(delta_pc_above_thresold)
         kwargs['delta_exp_above_thresold'] = delta_pc_above_thresold
         
-        #print('global position considered for view_cell',  ExperienceMap.accum_delta_x, ExperienceMap.accum_delta_y, 'is delta_exp_above_thresold?', delta_exp, delta_exp_above_thresold)
         view_cell, view_cell_copy = self.view_cells(self.observation, x_pc, y_pc, th_pc, **kwargs)
         #view_cell_copy: same as view cell but with a different id
        

@@ -184,7 +184,7 @@ class Manager():
             print('XXXXXXX relevant_poses',relevant_poses)
             self.memory_graph.memorise_poses(relevant_poses)
 
-    def increase_lookahead(self, max:int=8)->bool:
+    def increase_lookahead(self, max:int=6)->bool:
         '''
         Increase the lookahead if it's under the max lookahead threshold.
         return wether it increased the lookahead or not
