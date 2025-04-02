@@ -9,6 +9,7 @@ if __name__ == "__main__":
     
     flags = parser.parse_args()
     print('in runs flags', flags)
+    #rospy.init_node("nodo")
 
     if 'key' in flags.test :
         redraw_window = True

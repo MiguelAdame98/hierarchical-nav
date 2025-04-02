@@ -4,6 +4,9 @@ import concurrent.futures
 
 import gym
 import gym_minigrid 
+#import rospy
+#from sensor_msgs.msg import Image
+#from cv_bridge import CvBridge
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -254,6 +257,11 @@ class MinigridInteraction():
     def agent_step(self, action) -> tuple[bool,dict]:
         print('step in world:', self.step_count())
         print('action to apply:',action)
+        #bridge = CvBridge()
+        #img_msg = rospy.wait_for_message("/camera/depth_registered/rgb/image_raw", Image, timeout=10)
+        #img_bgr = bridge.imgmsg_to_cv2(img_msg, desired_encoding='passthrough')
+        #print(img_msg)
+        #print(bridge,img_msg,img_bgr.shape)
         obs, _, _, _ = self.env.step(action)
         print(obs.keys(),obs["pose"])
         obs = no_vel_no_action(obs)
