@@ -132,7 +132,6 @@ class Manager():
         is the mse under the allocentric mse threshold * sensitivity?
         the sensitivity is used to adapt the threshold to our need
         '''
-        print()
         return mse < self.get_allocentric_model_mse_theshold() * sensitivity
 
     def get_best_place_hypothesis(self) -> dict:

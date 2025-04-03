@@ -39,7 +39,7 @@ class ExplorativeBehaviour():
         """
         print("why no explore?",abs(info_gain_coeff),(threshold / 500) ,abs(info_gain_coeff) < (threshold / 500),policy_G < (threshold/ 5),policy_G ,(threshold/ 5)  )
         #if (abs(info_gain_coeff) < (threshold / 1000) and policy_G < (threshold/ 10)) :
-        if (abs(info_gain_coeff) < (threshold / 400) and policy_G < (threshold/ 4)) :
+        if (abs(info_gain_coeff) < (threshold / 300) and policy_G < (threshold/ 3)) :
             self.agent_exploring = False
         else:
             self.agent_exploring = True
