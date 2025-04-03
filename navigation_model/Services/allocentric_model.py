@@ -523,6 +523,7 @@ class AllocentricProcess():
         if 'pose' in relevant_ob:
             #IN CASE WE DON'T TRUST THE PLACE POSE ESTIMATION
             #re-estimate the goal position in this place
+            print("is pose in relevant ob?")
             x = list(range(int(relevant_ob['pose'][:,0])-1, int(relevant_ob['pose'][:,0])+2))
             y = list(range(int(relevant_ob['pose'][:,1])-1,int(relevant_ob['pose'][:,1])+2))
             theta = [int(relevant_ob['pose'][:,2])]
@@ -538,7 +539,7 @@ class AllocentricProcess():
           
             #--- MSE EVALUATION ---#
             pose_observations = self.allocentric_model.sample_observations(pose_observations, sample= place.shape[0])
-            #print('show me shape of pose and placein best matching poses with ob', pose_observations['pose'].shape, place.shape)
+            print('show me shape of pose and placein best matching poses with ob', pose_observations['pose'].shape, place.shape)
             model_error, image_predicted = mse_observation(self.allocentric_model.model, place, pose_observations)
             best_pose_options_wt_mse.append([float(model_error.cpu().detach().numpy()), p])
 
