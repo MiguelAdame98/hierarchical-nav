@@ -334,11 +334,14 @@ class MinigridInteraction():
                 print('Searching for another place to go to')
                 place_to_go = self.models_manager.connected_place_to_visit()  
                 print('++++++++++++++++++++++++') 
-                if place_to_go:
+                print("where are we going?",place_to_go['current_exp_door_pose'],place_to_go)
+                '''if place_to_go:
                     print('Searching How to go to the other place')
+                    print("where are we going?",place_to_go['current_exp_door_pose'],place_to_go)
                     policy, n_action = self.exploitative_behaviour.go_to_given_place(\
-                    self.models_manager,place_to_go['current_exp_door_pose'])
-                else:
+                    self.models_manager,place_to_go['current_exp_door_pose'])'''
+                if place_to_go is None:
+                #else:
                     print('No place found to return to, using ego model')
                     ongoing_exploration_option = 'push_from_comfort_zone'
                 
@@ -352,7 +355,7 @@ class MinigridInteraction():
 
         print('++++++++0 policy should be before this++++++++++++++++++++++++') 
         policy_G = self.explorative_behaviour.get_latest_policy_EFE(reset_EFE=True)
-        print("policyG",policy_G)
+        print("policyG",policy_G ,self.explorative_behaviour.is_agent_exploring())
          #we get policy_G and then erase it from memory
         if policy_G is not None: 
             info_gain_coeff = self.explorative_behaviour.rolling_coeff_info_gain()
