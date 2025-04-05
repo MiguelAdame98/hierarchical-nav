@@ -141,7 +141,7 @@ class Manager():
     
     def agent_lost(self) -> bool:
         ''' are we lost? '''
-        return self.allocentric_process.place_doubt_step_count() > 4
+        return self.allocentric_process.place_doubt_step_count() > 0
 
     def get_location_limits(self, exp_id:int=None)-> list:
         return self.memory_graph.get_exp_relevant_poses(exp_id)
@@ -307,8 +307,51 @@ class Manager():
         ob_poses = self.identify_observation_in_place(prev_place, self.env_relevant_ob)
         
         #We save the previous experience door poses in memory
+        
         self.memory_graph.memorise_poses(ob_poses, exp_id)
         #do we create ghost experiences behind identified doors?
+
+   
+    def ascii_hist(self,data, bins=20, width=40):
+        """
+        Create an ASCII histogram for a 1D numpy array.
+        """
+        
+        hist, bin_edges = np.histogram(data, bins=bins)
+        max_val = hist.max()
+        for i in range(len(hist)):
+            edge = bin_edges[i]
+            count = hist[i]
+            # Normalize the count to the desired width
+            bar = '#' * int((count / max_val) * width) if max_val > 0 else ''
+            print(f"{edge:8.2f} | {bar} ({count})")
+    
+    def ascii_histogram_adaptive(self,samples, bins=20):
+        """
+        Adaptively create ASCII histograms based on the shape of the samples.
+        If samples is 1D, prints one histogram.
+        If samples is 2D (num_samples x d), prints one histogram per column.
+        If samples has more dimensions, it flattens the data.
+        """
+        if isinstance(samples, torch.Tensor):
+            samples = samples.detach().cpu().numpy()
+        
+        # Remove singleton dimensions (e.g., if shape is (num_samples, 1, d))
+        samples = np.squeeze(samples)
+        
+        if samples.ndim == 1:
+            print("Histogram for all values:")
+            self.ascii_hist(samples, bins=bins)
+        elif samples.ndim == 2:
+            num_dims = samples.shape[1]
+            for i in range(num_dims):
+                print(f"Histogram for dimension {i}:")
+                self.ascii_hist(samples[:, i], bins=bins)
+                print()  # Blank line for separation
+        else:
+            print("Data has more than 2 dimensions; flattening:")
+            self.ascii_hist(samples.flatten(), bins=bins)
+
 
     #TODO: change how we check for exp plausibility for competition
     def add_memories_to_hypothesis(self, observations):
@@ -336,8 +379,12 @@ class Manager():
                 continue
             entry_poses = call_env_entry_poses_assessment(self.env_specific, entry_poses)
             place = self.allocentric_process.place_as_sampled_Normal_dist(exp['observation'], self.num_samples)
+            print("Visualizing the sampled place distribution:")
+            self.ascii_histogram_adaptive(place, bins=10)
             observations = self.allocentric_process.sample_observations(observations, self.num_samples)
+            print("observations", observations)
             pose_observations = self.allocentric_process.create_pose_observations(entry_poses, self.num_samples)
+            print("this pose_observations",pose_observations)
             plausible_poses, poses_mse = self.allocentric_process.assess_poses_plausibility_in_place(place, observations, pose_observations)
             
             print('exp', exp['id'], 'selected_poses', plausible_poses, 'associated mse:', poses_mse)
