@@ -379,12 +379,12 @@ class Manager():
                 continue
             entry_poses = call_env_entry_poses_assessment(self.env_specific, entry_poses)
             place = self.allocentric_process.place_as_sampled_Normal_dist(exp['observation'], self.num_samples)
-            print("Visualizing the sampled place distribution:")
-            self.ascii_histogram_adaptive(place, bins=10)
+            #print("Visualizing the sampled place distribution:")
+            #self.ascii_histogram_adaptive(place, bins=10)
             observations = self.allocentric_process.sample_observations(observations, self.num_samples)
-            print("observations", observations)
+            #print("observations", observations)
             pose_observations = self.allocentric_process.create_pose_observations(entry_poses, self.num_samples)
-            print("this pose_observations",pose_observations)
+            #print("this pose_observations",pose_observations)
             plausible_poses, poses_mse = self.allocentric_process.assess_poses_plausibility_in_place(place, observations, pose_observations)
             
             print('exp', exp['id'], 'selected_poses', plausible_poses, 'associated mse:', poses_mse)
