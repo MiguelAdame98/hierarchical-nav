@@ -334,16 +334,15 @@ class MinigridInteraction():
                 print('Searching for another place to go to')
                 place_to_go = self.models_manager.connected_place_to_visit()  
                 print('++++++++++++++++++++++++') 
-                print("where are we going?",place_to_go['current_exp_door_pose'],place_to_go)
-                '''if place_to_go:
+                if place_to_go:
                     print('Searching How to go to the other place')
                     print("where are we going?",place_to_go['current_exp_door_pose'],place_to_go)
                     policy, n_action = self.exploitative_behaviour.go_to_given_place(\
-                    self.models_manager,place_to_go['current_exp_door_pose'])'''
+                    self.models_manager,place_to_go['current_exp_door_pose'])
                 
-                #else:
-                print('No place found to return to, using ego model')
-                ongoing_exploration_option = 'push_from_comfort_zone'
+                else:
+                    print('No place found to return to, using ego model')
+                    ongoing_exploration_option = 'push_from_comfort_zone'
                 
             elif ongoing_exploration_option == 'explore':
                 print('Exploring with allo model')
