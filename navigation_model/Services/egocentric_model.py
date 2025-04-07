@@ -172,6 +172,7 @@ class EgocentricModel(PerceptionModel):
                     actions[:, step, :], reconstruct=reconstruct)
                 if collision_condition == True :
                     if 'collision_reconstructed':
+                        print("ego do we enter?")
                         collision = future_step['collision_reconstructed']
                         collision = int(np.round(np.mean(collision.cpu().detach().numpy())))
                     else:
