@@ -162,7 +162,9 @@ class EgocentricModel(PerceptionModel):
         '''
         # returns dict with imagined actions/observations
         actions = actions.repeat(sample,1,1).to(self.model.device)
+        print("actions repeated",actions)
         lookahead = actions.shape[1]
+        print("lookahead?",lookahead)
         fork = self.model.fork(sample)
         result = []
         # lookahead
@@ -180,6 +182,7 @@ class EgocentricModel(PerceptionModel):
                         collision = 0
                     #here we consider the collsion detection near perfect
                     if collision == 1:
+                        print("we collide")
                         try:
                             predictions = cat_dict(*result)
                         except IndexError:
