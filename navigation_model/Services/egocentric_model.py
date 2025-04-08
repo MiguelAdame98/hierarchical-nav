@@ -162,7 +162,6 @@ class EgocentricModel(PerceptionModel):
         '''
         # returns dict with imagined actions/observations
         actions = actions.repeat(sample,1,1).to(self.model.device)
-        print("actions repeated",actions)
         lookahead = actions.shape[1]
         print("lookahead?",lookahead)
         fork = self.model.fork(sample)
@@ -184,8 +183,10 @@ class EgocentricModel(PerceptionModel):
                     if collision == 1:
                         print("we collide")
                         try:
+                            print("we tried")
                             predictions = cat_dict(*result)
                         except IndexError:
+                            print("we tried but failed")
                             predictions = future_step
                         return step, predictions
                 result.append(future_step.unsqueeze(1))
