@@ -253,7 +253,7 @@ class MemoryGraph(object):
             exp = self.experience_map.get_exp(exp_id)
         if exp == None:
             return []
-        print("relevant poses", len(exp.view_cell.relevant_poses.copy()))
+        print("relevant poses", len(exp.view_cell.relevant_poses.copy()),exp.view_cell.relevant_poses.copy())
         return exp.view_cell.relevant_poses.copy()
 
     def get_next_place_view_id(self, door_pose):
@@ -404,6 +404,7 @@ class MemoryGraph(object):
         if exp is None:
             return
         exp.view_cell.relevant_poses = [list(pose) for pose in poses]
+        print("poses_memorized",exp.view_cell.relevant_poses)
 
     def extract_observation(self, view_cell:object) -> np.ndarray:
         if view_cell is not None:
@@ -476,11 +477,15 @@ class MemoryGraph(object):
         #---- Get experience Reference frame and convert it to Global Frame ----#
         
         current_exp_id = self.get_current_exp_id()
+        print("this is the current_exp_id",current_exp_id)
         if current_exp_id < 0:
+            print("we returned nothing")
             return -1, []
         current_exp = self.experience_map.get_exp(current_exp_id)
+        print("this is the current_exp", current_exp)
         exp_global_position = self.experience_map.get_exp_global_position(current_exp)
         exp_local_pose = current_exp.init_local_position
+        
 
         GP_door_pose = convert_LP_to_GP(exp_global_position, exp_local_pose, door_pose)
         
@@ -491,13 +496,14 @@ class MemoryGraph(object):
         exp_options = []
         #Check if exp door goes toward connected exp
         for link in current_exp.links:
-            print()
+            print("a",link)
             linked_exp = link.target
             if linked_exp.ghost_exp == True:
                 print('IMPLEMENT WHAT HAPPENS IF THERE IS A GHOST NODE')
                 continue
 
             linked_exp_global_position = self.experience_map.get_exp_global_position(linked_exp)
+            print("this is the global position", linked_exp_global_position)
             '''
             We consider that a door leading to an exp cannot have an angular displacement between the 2
             of more than 90'.
@@ -505,7 +511,9 @@ class MemoryGraph(object):
             '''
             #the angular distance between the two poses. 
             angle_between_door_exp = angle_between_two_poses(linked_exp_global_position, GP_door_pose)
+            print("angle_between_door",angle_between_door_exp)
             rad_diff = clip_rad_180(GP_door_pose[2] - angle_between_door_exp)
+            print("rad_diff",rad_diff)
             print('Between door', door_pose,' GP:', GP_door_pose , 'and exp', linked_exp.id, 'GP:', linked_exp_global_position, 'the angular distance is:', angle_between_door_exp)
             print('the angular difference considering door orientation is:', np.rad2deg(rad_diff))
             #The angle between the door and the linked exp can't be above 90 def considering door orientation. Else not correct direction

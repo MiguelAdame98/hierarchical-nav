@@ -69,7 +69,7 @@ def local_encoded_orientation_to_global_facing(goal_lp_orientation:int,LP_start_
         orientations.append((LP_start_orientation+i)%4)
         shifting_orientation = shifting_orientation+np.pi/2
         GP_orientations.append(clip_rad_180(shifting_orientation))
-    #print('orientation and GP orientations', GP_orientations, orientations)
+    print('orientation and GP orientations', GP_orientations, orientations)
     goal_orientation_index = orientations.index(goal_lp_orientation)
     
     facing_rad = GP_orientations[goal_orientation_index]
