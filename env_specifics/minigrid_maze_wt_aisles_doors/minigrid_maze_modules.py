@@ -2,7 +2,9 @@ from itertools import product
 from control_eval.input_output import load_h5
 import numpy as np
 import torch
-from navigation_model.Services.model_modules import torch_and_sample_observations
+from navigation_model.Services.model_modules import torch_image
+
+from navigation_model.Services.model_modules import torch_and_sample_observations,sample_ob
 from navigation_model.Processes.AIF_modules import mse_elements
 from navigation_model.Processes.motion_path_modules import action_to_pose
 from navigation_model.visualisation_tools import convert_tensor_image_to_array
@@ -79,22 +81,28 @@ def debug_and_save_images(door_image, predicted_image, filename_prefix="debug_im
 
 
 #NOTE: sensitivity 0.18 for minigrid_aisle_wt_doors and current allocentric model
-def is_agent_at_door(manager:object, sensitivity:float= 1) -> bool:
+def is_agent_at_door(manager:object, real_obs , sensitivity:float= 1) -> bool:
     '''
     verify if the predicted observation matches a door view. if so, save in short-term memory 
     '''
     best_place_hypothesis = manager.get_best_place_hypothesis()
+    #print("Real observation shape:", real_obs.shape)
+    realob = torch_image(real_obs)
+    realobs= sample_ob(realob,5,4)  
+
+
     if 'image_predicted' in best_place_hypothesis and best_place_hypothesis['image_predicted'] is not None:
         door_image = manager.get_env_relevant_ob()['image']
         predicted_image = best_place_hypothesis['image_predicted'].squeeze(1)
         if predicted_image.shape[0] > door_image.shape[0]:
             predicted_image = predicted_image[0]
         mse_door = mse_elements(predicted_image, door_image)
-        print("mse_under_th",mse_door, sensitivity,manager.mse_under_threshold(mse_door, sensitivity))
-        if manager.mse_under_threshold(mse_door, sensitivity):
-            #debug_and_save_images(door_image, predicted_image)
+        mse_door2= mse_elements(realobs,door_image)
+        print("mse_under_th",mse_door2, sensitivity,manager.mse_under_threshold(mse_door, sensitivity))
+        if manager.mse_under_threshold(mse_door2, sensitivity):
+            #debug_and_save_images(door_image, realobs)
             pose = list(best_place_hypothesis['pose'])
-            print("save_pose_in_memory")
+            print("save_pose_in_memory", pose)
             manager.save_pose_in_memory(pose)
             return True
     return False

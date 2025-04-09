@@ -172,9 +172,7 @@ class EgocentricModel(PerceptionModel):
                 future_step = fork.forward(
                     actions[:, step, :], reconstruct=reconstruct)
                 if collision_condition == True :
-                    print("do we always enter?")
-                    if 'collision_reconstructed':
-                        print("ego do we enter?")
+                    if 'collision_reconstructed'in future_step:
                         collision = future_step['collision_reconstructed']
                         collision = int(np.round(np.mean(collision.cpu().detach().numpy())))
                     else:

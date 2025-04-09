@@ -266,8 +266,8 @@ class MinigridInteraction():
         print(obs.keys(),obs["pose"])
         obs = no_vel_no_action(obs)
         self.models_manager.digest(obs)
-        is_agent_at_door(self.models_manager, sensitivity=0.18)
-        print("is agent at door",is_agent_at_door(self.models_manager, sensitivity=0.18))
+        is_agent_at_door(self.models_manager,obs["image"], sensitivity=0.18)
+        print("is agent at door",is_agent_at_door(self.models_manager,obs["image"], sensitivity=0.18))
         if self.models_manager.agent_lost():
             #we are lost? want the info_gain memory to be reset to 1 value
             slide_window = 1
