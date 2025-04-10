@@ -141,7 +141,7 @@ class Manager():
     
     def agent_lost(self) -> bool:
         ''' are we lost? '''
-        return self.allocentric_process.place_doubt_step_count() > 0
+        return self.allocentric_process.place_doubt_step_count() > 6
 
     def get_location_limits(self, exp_id:int=None)-> list:
         return self.memory_graph.get_exp_relevant_poses(exp_id)
