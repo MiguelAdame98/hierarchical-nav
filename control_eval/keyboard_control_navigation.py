@@ -282,8 +282,8 @@ class MinigridInteraction():
         motion_data = []
         agent_lost = False
         print("n_sctions",n_actions, policy,self.convert_hot_encoded_to_minigrid_action(policy[0]))
-        #for a in range(len(policy)):
-        for a in range(n_actions):
+        for a in range(len(policy)):
+        #for a in range(n_actions):
             action = self.convert_hot_encoded_to_minigrid_action(policy[a])
             agent_lost, obs = self.agent_step(action)
             world_img = self.redraw()
