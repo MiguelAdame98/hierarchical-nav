@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 #TESTS
 import concurrent.futures
+from typing import List, Dict, Any
 
 import gym
 import gym_minigrid 
@@ -14,6 +15,9 @@ from gym_minigrid.wrappers import ImgActionObsWrapper, RGBImgPartialObsWrapper
 from gym_minigrid.window import Window
 
 from control_eval.input_output import *
+from collections import Counter
+from navigation_model.Processes.motion_path_modules import action_to_pose
+
 from env_specifics.minigrid_maze_wt_aisles_doors.minigrid_maze_modules import (
     is_agent_at_door, set_door_view_observation)
 from navigation_model.Processes.AIF_modules import mse_elements
@@ -25,7 +29,8 @@ from navigation_model.Processes.manager import Manager
 from navigation_model.Services.model_modules import no_vel_no_action
 from navigation_model.visualisation_tools import (
     convert_tensor_to_matplolib_list, transform_policy_from_hot_encoded_to_str,
-    visualise_image)
+    visualise_image,visualize_replay_buffer)
+from copy import deepcopy
 
 
 def print_keys_explanation():
@@ -55,6 +60,8 @@ class MinigridInteraction():
         self.auto_motion = f_move_aisle + ['Key.left'] + f_move_aisle + ['Key.up']*2 + ['Key.left']*1 + f_move_aisle + ['Key.up']*3 + ['Key.right']
         self.auto_move = False
         self.goal_test = []
+        self.replay_buffer = []  # List to store recent state dictionaries.
+        self.buffer_size = 30
        
         #TODO: ALLOW USER TO SET ITS PREFERRED OB WTOUT ACCESSING CODE
         #Since 255 is the max value of any colour, we don't care about the above value of white
@@ -168,6 +175,26 @@ class MinigridInteraction():
         else:
             raise Exception('unrecognised action to apply:'+str(action))
         return action
+    def convert_minigrid_action_to_hot_encoded(self, action: int) -> list:
+        if action == self.env.actions.forward:
+            return [1, 0, 0]
+        elif action == self.env.actions.right:
+            return [0, 1, 0]
+        elif action == self.env.actions.left:
+            return [0, 0, 1]
+        else:
+            raise Exception("Unrecognized minigrid action: " + str(action))
+    def convert_list_to_hot_encoded(self, actions_list: list) -> list:
+        # Initialize an empty list for the one-hot encoded actions.
+        hot_encoded_actions = []
+
+        # Iterate over each action in the given list.
+        for action in actions_list:
+            # Use your conversion function to convert the action into one-hot encoded format.
+            encoded_action = self.convert_minigrid_action_to_hot_encoded(action)
+            hot_encoded_actions.append(encoded_action)
+
+        return hot_encoded_actions    
         
     def key_handler(self,event:str) -> None:
         print('pressed', event.key)
@@ -253,10 +280,314 @@ class MinigridInteraction():
     
     def agent_situate_memory(self)->int:
         return self.models_manager.get_current_exp_id()
+    
+    def update_replay_buffer(self, state):
+        if len(self.replay_buffer) >= self.buffer_size:
+            self.replay_buffer.pop(0)  # Remove the oldest entry to keep the size fixed.
+        self.replay_buffer.append(deepcopy(state))
+
+    def extract_past_actions(self,replay_buffer):
+        actions = []
+        for state in replay_buffer:
+            # Get the action from the state; use None as the default if not found.
+            action = state.get('action', None)
+            if action is not None:
+                actions.append(action)
+        print(actions)
+        print(self.convert_list_to_hot_encoded(actions))
+        return actions
+    def extract_past_real_poses(self,replay_buffer):
+        actions = []
+        for state in replay_buffer:
+            # Get the action from the state; use None as the default if not found.
+            action = state.get('real_pose', None)
+            if action is not None:
+                actions.append(action)
+        return actions
+    def extract_past_poses(self,replay_buffer):
+        actions = []
+        for state in replay_buffer:
+            # Get the action from the state; use None as the default if not found.
+            action = state.get('imagined_pose', None)
+            if action is not None:
+                actions.append(action)
+        return actions
+    def action_to_past_pose(self, action, final_pose):
+        DIR_TO_VEC = [
+            [1, 0],    # 0: pointing right (positive X)
+            [0, 1],    # 1: down (positive Y)
+            [-1, 0],   # 2: left (negative X)
+            [0, -1]    # 3: up (negative Y)
+        ]
+
+        initial_pose = final_pose.copy()
+        if action[0] == 1:
+            print("action[0] == 1:")
+            initial_pose[0] = final_pose[0] - DIR_TO_VEC[final_pose[2]][0]
+            initial_pose[1] = final_pose[1] - DIR_TO_VEC[final_pose[2]][1]
+        elif action[0] == -1:
+            initial_pose[0] = final_pose[0] + DIR_TO_VEC[final_pose[2]][0]
+            initial_pose[1] = final_pose[1] + DIR_TO_VEC[final_pose[2]][1]
+        elif action[1] == 1:
+            print("action[1] == 1:")
+            initial_pose[2] = (final_pose[2] - 1) % 4
+        elif action[2] == 1:
+            print("action[2] == 1:")
+            initial_pose[2] = (final_pose[2] + 1) % 4
+
+        return initial_pose
+    def extract_branch_paths(self, tree, current_path=None):
+        if current_path is None:
+            current_path = {"actions": [], "poses": [tree["pose"]]}
+            print(f">>> start at pose={tree['pose']}")
+
+        kids = tree.get("children") or []
+        if not kids:
+            # We’re at a leaf
+            L = len(current_path["actions"])
+            print(f"   leaf @ pose={tree['pose']} ➞ length={L}")
+            return [current_path]
+
+        paths = []
+        for child in kids:
+            action, pose = child["action"], child["pose"]
+            new_path = {
+                "actions": current_path["actions"] + [action],
+                "poses":   current_path["poses"]   + [pose]
+            }
+            print(f"  desc → action {action} ➞ pose {pose}  (so far: {len(new_path['actions'])} actions)")
+            paths.extend(self.extract_branch_paths(child, new_path))
+
+        return paths
+    def build_decision_tree_all(self, current_pose, depth, max_depth, branch_history=None):
+        # Initialize the branch history if necessary
+        if branch_history is None:
+            branch_history = [current_pose]
+        
+        # Create the current node.
+        node = {
+            "pose": current_pose,
+            "action": None,   # Root node doesn't have an action that produced it.
+            "children": [],
+            "depth": depth
+        }
+        
+        # Stop expansion if maximum depth is reached.
+        if depth >= max_depth:
+            return node
+
+        # Define the available actions in your grid world.
+        AVAILABLE_ACTIONS = [[1,0,0], [0,1,0], [0,0,1]]
+        
+        # For each action, simulate the new pose.
+        for action in AVAILABLE_ACTIONS:
+            # Compute new_pose using your forward update function.
+            new_pose = action_to_pose(np.array(action), current_pose.copy())
+            if any(np.array_equal(new_pose, p) for p in branch_history):    
+                continue
+
+            new_branch_history = branch_history + [new_pose]
+            
+            subtree = self.build_decision_tree_all(new_pose, depth + 1, max_depth, new_branch_history)
+        
+            # Create a child node that includes the action that led to new_pose.
+            child_node = {
+                "pose": new_pose,
+                "action": action,   # Store this action here.
+                "children": subtree["children"],  # Adopt the children from the subtree.
+                "depth": depth + 1
+            }
+            # Optionally, include any additional fields from subtree into child_node.
+            node["children"].append(child_node)
+            
+        return node
+    def _recency_weight(self,age, tau, kind="exp"):
+        """age = 0 means ‘just visited’.  Larger age → smaller weight."""
+        if kind == "exp":            # exponential decay
+            return np.exp(-age / tau)
+        elif kind == "hyper":        # hyperbolic (1 / (1+age))
+            return 1.0 / (1.0 + age)
+        else:                        # constant (no decay)
+            return 1.0
+    def _rollout_poses(self, start_pose: np.ndarray,
+                   actions: np.ndarray,
+                   action_to_pose) -> List[np.ndarray]:
+        """Re‑compute poses after the policy was shortened by collision trimming."""
+        poses = [start_pose.copy()]
+        cur   = start_pose.copy()
+        for a in actions:
+            cur = action_to_pose(a, cur.copy())
+            poses.append(cur)
+        return poses   
+
+    '''def evaluate_branches(
+        self,
+        paths,
+        past_poses,
+        tau: float = 50,
+        decay: str = "exp",
+        *,
+        eps: float = 0.5,                # radius, in pose units
+        max_keep: int | None = None,     # e.g. 200; None = no hard cap
+        embed_fn=None                    # branch → R^m vector
+    ):
+        if embed_fn is None:
+            # Use the *final* pose as a 3‑D point [x, y, θ]
+            embed_fn = lambda br: np.asarray(br["poses"][-1], dtype=float)
+
+        # ---------- 1. build last‑seen table ----------
+        last_seen = {tuple(p): t for t, p in enumerate(past_poses)}
+        now = len(past_poses)
+        print(type(paths))
+        paths = [br["actions"] for br in paths]  
+        paths= self.models_manager.get_plausible_policies(paths)
+
+        # ---------- 2. score every branch ----------
+        scored = []
+        for br in paths:
+            penalty = 0.0
+            for pose in br["poses"]:
+                key = tuple(pose)
+                if key in last_seen:
+                    age = now - last_seen[key]
+                    penalty += self._recency_weight(age, tau, decay)
+            scored.append((penalty, br))
+
+        # low → high (most novel first)
+        scored.sort(key=lambda x: x[0])
+
+        kept, kept_vecs = [], []
+        for pen, br in scored:
+            v = embed_fn(br)
+
+            # --- DEBUG: inspect distances to all kept vectors ---
+            too_close = False
+            for idx, u in enumerate(kept_vecs):
+                diff  = v - u
+                dist  = np.linalg.norm(diff)
+                if dist < eps:
+                    too_close = True
+                    break             
+            # ----------------------------------------------------
+
+            if not too_close:
+                kept.append((pen, br))
+                kept_vecs.append(v)
+                if max_keep is not None and len(kept) >= max_keep:
+                    break
+        
+        print("_________________  ")
+        print("_________________  ")
+        print(kept)
+        clean_pol = [br["actions"] for _, br in scored] 
+        
+        return paths'''
+    def evaluate_branches(
+    self,
+    branches: List[Dict[str, Any]],     # [{actions, poses}, …] from extract_branch_paths
+    past_poses: List[np.ndarray],
+    tau: float = 50,
+    decay: str = "exp",
+    *,
+    eps: float = 0.5,
+    max_keep: int | None = None,
+    embed_fn=None
+):
+        """
+        1. Feed **action sequences only** to egocentric collision check.
+        2. Reconstruct pose sequences for the surviving (trimmed) policies.
+        3. Score with recency penalty.
+        4. Apply radius‑greedy diversity filter.
+        5. Return list of (penalty, actions, poses) tuples OR just actions.
+        """
+        # ---- 0. default embedding on final (x,y,θ) pose ----
+        if embed_fn is None:
+            embed_fn = lambda poses: np.asarray(poses[-1], dtype=float)
+
+        # ---- 1. collision + dedup first ----
+        action_lists = [br["actions"] for br in branches]
+        pruned_pols  = self.models_manager.get_plausible_policies(action_lists)
+        #           -> list[torch.Tensor]   each shape (T,3)
+
+        # ---- 2. rebuild pose traces so we can score ----
+        # Build quick lookup: initial pose for each ORIGINAL branch
+        # (all branches share the same start pose in typical tree; otherwise
+        #  keep a parallel list or include start_pose in each dict)
+        start_pose = branches[0]["poses"][0]
+
+        rebuilt = []   # list of dicts with keys actions, poses
+        for pol in pruned_pols:
+            acts  = pol.cpu().numpy()              # (T,3)
+            poses = self._rollout_poses(start_pose, acts, action_to_pose)
+            rebuilt.append({"actions": acts, "poses": poses})
+
+        # ---- 3. recency‑penalty scoring ----
+        last_seen = {tuple(p): t for t, p in enumerate(past_poses)}
+        now       = len(past_poses)
+
+        scored = []
+        for br in rebuilt:
+            penalty = 0.0
+            for pose in br["poses"]:
+                if tuple(pose) in last_seen:
+                    age     = now - last_seen[tuple(pose)]
+                    penalty += self._recency_weight(age, tau, decay)
+            scored.append((penalty, br))
+
+        scored.sort(key=lambda x: x[0])            # low → high (novel first)
+
+        # ---- 4. radius‑greedy diversity filter ----
+        kept, kept_vecs = [], []
+        for pen, br in scored:
+            v = embed_fn(br["poses"])
+            if all(np.linalg.norm(v - u) >= eps for u in kept_vecs):
+                kept.append((pen, br))
+                kept_vecs.append(v)
+                if max_keep and len(kept) >= max_keep:
+                    break
+
+        # ---- 5. return whatever format your downstream code needs ----
+        # example: just the action tensors
+        #final_policies = [torch.as_tensor(br["actions"]) for _, br in kept]
+        return kept
+
+    def compute_pose_history(self):
+        # If the replay buffer is empty, return an empty list.
+        if not self.replay_buffer:
+            return []
+        
+        # Get the initial pose from the first state.
+        first_state = self.replay_buffer[-1]
+        if 'imagined_pose' in first_state and first_state['imagined_pose'] is not None:
+            current_pose = list(first_state['imagined_pose'])
+        else:
+            current_pose = list(first_state.get('real_pose', [0, 0, 0]))  # assume pose format: [x, y, theta]
+        
+        pose_history = [current_pose.copy()]
+        print(pose_history)
+        # Iterate through the replay buffer in forward order.
+        # For each state, update the current pose using the stored action.
+        for state in reversed(self.replay_buffer):
+            action = state.get('action')
+            hotenc_action = np.array(self.convert_minigrid_action_to_hot_encoded(action), dtype=np.int32)
+            print("Hot-encoded action:", hotenc_action, type(hotenc_action), hotenc_action.shape)
+            if action is None:
+                # If no action is specified, assume no movement.
+                continue
+            # Compute the updated pose: this function should update the pose given the action.
+            current_pose = self.action_to_past_pose(hotenc_action, current_pose.copy())
+            print("fff",current_pose)
+            # Append a copy of the updated pose to the trajectory history.
+            pose_history.append(current_pose.copy())
+        
+        return pose_history
+
+    
 
     def agent_step(self, action) -> tuple[bool,dict]:
         print('step in world:', self.step_count())
         print('action to apply:',action)
+        
         #bridge = CvBridge()
         #img_msg = rospy.wait_for_message("/camera/depth_registered/rgb/image_raw", Image, timeout=10)
         #img_bgr = bridge.imgmsg_to_cv2(img_msg, desired_encoding='passthrough')
@@ -275,6 +606,51 @@ class MinigridInteraction():
             slide_window = 5
         info_gain = self.models_manager.get_best_place_hypothesis()['info_gain']
         self.explorative_behaviour.update_rolling_info_gain(info_gain, window=slide_window)
+        current_state = {
+        'real_pose': obs["pose"],
+        'imagined_pose':self.models_manager.get_best_place_hypothesis()['pose'],
+        'real_image': obs['image'],   
+        'imagined_image': self.models_manager.get_best_place_hypothesis()['image_predicted'],
+        'action':action}
+        self.update_replay_buffer(current_state)
+        if self.step_count()==10:
+            pose_history=self.compute_pose_history()
+            self.extract_past_actions(self.replay_buffer)
+            a=self.extract_past_poses(self.replay_buffer)
+            b=self.extract_past_real_poses(self.replay_buffer)
+            print("nnn",a)
+            print(b)
+            max_depth = 21
+            tree_all = self.build_decision_tree_all(self.replay_buffer[-1]["imagined_pose"], 0, max_depth)
+            def print_tree(node, indent=0):
+                print(" " * indent, f"Depth: {node['depth']}, Pose: {node['pose']}, Action: {node['action']}")
+                for child in node["children"]:
+                    print_tree(child, indent + 2)
+    
+            print_tree(tree_all)
+            paths=self.extract_branch_paths(tree_all)
+            print(paths)
+            n_branches = len(paths)
+            print(f"Number of branches: {n_branches}")
+            actions_per_branch = [len(p['actions']) for p in paths]
+            poses_per_branch   = [len(p['poses'])   for p in paths]
+
+            # 3. Count how many branches fall into each length
+            action_length_counts = Counter(actions_per_branch)
+            pose_length_counts   = Counter(poses_per_branch)
+
+            # 4. Print a nice summary
+            print("Branches by # of actions:")
+            for length, count in sorted(action_length_counts.items(), reverse=True):
+                print(f"  {count} branch{'es' if count>1 else ''} with {length} action{'s' if length!=1 else ''}")
+
+            print("\nBranches by # of poses:")
+            for length, count in sorted(pose_length_counts.items(), reverse=True):
+                print(f"  {count} branch{'es' if count>1 else ''} with {length} pose{'s' if length!=1 else ''}")
+            top_diverse=self.evaluate_branches(paths,pose_history)
+            print(f"Kept {len(top_diverse)} diverse branches "
+                  f"(≈{100*len(top_diverse)/len(paths):.1f}% of original)")
+            print(top_diverse)
         print('Step Done')
         return self.models_manager.agent_lost(), obs
     

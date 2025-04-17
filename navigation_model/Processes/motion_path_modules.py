@@ -8,13 +8,11 @@ import torch
 #--------------- ACTION PROCESSES ------------#
 def action_to_pose(action,pose):
     current_pose = pose.copy()
-    
     if isinstance(action, torch.Tensor) and len(action.shape)>1:
         action = action[0]
     # #GQN increment action whatever the real situation, so we check if no vel [0,0]
     # if vel_ob[0] ==vel_ob[1] :
     #     action = [0,0,0]
-
     DIR_TO_VEC = [
         # Pointing right (positive X)
         [1, 0],
@@ -33,7 +31,6 @@ def action_to_pose(action,pose):
         current_pose[2] = (current_pose[2]+1)%4
     elif action[2] == 1:
         current_pose[2] = (current_pose[2]-1)%4
-
     return current_pose
 
 #--------------- POLICY PROCESSES ------------#
