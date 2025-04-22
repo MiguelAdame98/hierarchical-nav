@@ -134,7 +134,7 @@ def run_exploration(step_controller:object, env_definition:dict, oracle:object, 
         prev_log_step = 0
         try:
             #while steps <= 2*(env_definition['max_steps']):
-            while steps <= int(32):
+            while steps <= int(600):
                 motion_data, agent_lost = step_controller.agent_explores(collect_data=True)
                 visited_rooms = count_visited_rooms(step_controller.agent_absolute_pose(), rooms_limits, visited_rooms)
                 video_gridmap = record_data(step_controller,video_gridmap, motion_data, env_definition, agent_lost, visited_rooms, steps)

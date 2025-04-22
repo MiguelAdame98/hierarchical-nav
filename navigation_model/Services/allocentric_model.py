@@ -332,7 +332,7 @@ class AllocentricProcess():
         hypothesis_weight = self.extract_weight_from_hypothesis(default_value=0)
         index_max_weight = np.nanargmax(hypothesis_weight)
         print('highest weight index and its value in list and dict',  index_max_weight, self.place_descriptors[index_max_weight]['hypothesis_weight'])
-        print("place_doubt_step",self.place_doubt_step_count(),hypothesis_weight[index_max_weight] >= 2.5,self.place_descriptors[index_max_weight]['hypothesis_weight'])
+        print("place_doubt_step",self.place_doubt_step_count(),hypothesis_weight[index_max_weight] >= 2.5,self.place_descriptors[index_max_weight]['hypothesis_weight'],hypothesis_weight[index_max_weight])
         #if we have likely hypo, we converge to the best hypo among them  
         if hypothesis_weight[index_max_weight] >= 2.5:
             best_model_idx = self.best_model_according_to_weights(hypothesis_weight, index_max_weight)

@@ -61,7 +61,7 @@ class MinigridInteraction():
         self.auto_move = False
         self.goal_test = []
         self.replay_buffer = []  # List to store recent state dictionaries.
-        self.buffer_size = 30
+        self.buffer_size = 600
        
         #TODO: ALLOW USER TO SET ITS PREFERRED OB WTOUT ACCESSING CODE
         #Since 255 is the max value of any colour, we don't care about the above value of white
@@ -487,7 +487,7 @@ class MinigridInteraction():
     branches: List[Dict[str, Any]],     # [{actions, poses}, …] from extract_branch_paths
     past_poses: List[np.ndarray],
     tau: float = 50,
-    decay: str = "exp",
+    decay: str = "hyper",
     *,
     eps: float = 0.5,
     max_keep: int | None = None,
@@ -522,34 +522,48 @@ class MinigridInteraction():
             rebuilt.append({"actions": acts, "poses": poses})
 
         # ---- 3. recency‑penalty scoring ----
-        last_seen = {tuple(p): t for t, p in enumerate(past_poses)}
-        now       = len(past_poses)
+        last_seen = {tuple(p[:2]): t            # 👈  keep only x,y !
+             for t, p in enumerate(past_poses)}
+        now = len(past_poses)
+        current_key = tuple(start_pose[:2])     # (x0, y0)
+        last_seen[current_key] = now 
 
         scored = []
         for br in rebuilt:
             penalty = 0.0
             for pose in br["poses"]:
-                if tuple(pose) in last_seen:
-                    age     = now - last_seen[tuple(pose)]
+                key = tuple(pose[:2])           # 👈  ignore θ during lookup
+                if key in last_seen:
+                    age     = now - last_seen[key]
                     penalty += self._recency_weight(age, tau, decay)
             scored.append((penalty, br))
+        current_xy = np.asarray(start_pose[:2], dtype=float)
+        scored.sort(key=lambda x: (x[0],              # 1️⃣ low penalty
+                           np.linalg.norm(embed_fn(x[1]["poses"])[:2] - current_xy)))
 
-        scored.sort(key=lambda x: x[0])            # low → high (novel first)
+        ALPHA = 60.0         # weight for recency‑penalty
+        BETA  = 0.5         # weight for outward distance (tweak!)
 
-        # ---- 4. radius‑greedy diversity filter ----
-        kept, kept_vecs = [], []
-        for pen, br in scored:
-            v = embed_fn(br["poses"])
-            if all(np.linalg.norm(v - u) >= eps for u in kept_vecs):
-                kept.append((pen, br))
-                kept_vecs.append(v)
-                if max_keep and len(kept) >= max_keep:
-                    break
+        best_branch = None
+        best_score  = np.inf
 
-        # ---- 5. return whatever format your downstream code needs ----
-        # example: just the action tensors
-        #final_policies = [torch.as_tensor(br["actions"]) for _, br in kept]
-        return kept
+        for pen, br in scored:                       # kept comes out of radius‑greedy
+            end_xy = np.asarray(br["poses"][-1][:2], dtype=float)
+            dist   = np.linalg.norm(end_xy - current_xy)      # outward distance
+            lin    = ALPHA * pen - BETA * dist               # lower is better
+            print(pen,br)
+            print("who is winning",ALPHA * pen,BETA * dist,)
+            print(f"lin={lin:.10f}   best_score={best_score:.10f}")
+            if lin < best_score:
+                print("inside the best score",lin,br)
+                best_score  = lin
+                best_branch = br
+
+        # what you return / store
+        return_best_actions = torch.as_tensor(best_branch["actions"])
+        
+        return return_best_actions
+        
 
     def compute_pose_history(self):
         # If the replay buffer is empty, return an empty list.
@@ -613,44 +627,7 @@ class MinigridInteraction():
         'imagined_image': self.models_manager.get_best_place_hypothesis()['image_predicted'],
         'action':action}
         self.update_replay_buffer(current_state)
-        if self.step_count()==10:
-            pose_history=self.compute_pose_history()
-            self.extract_past_actions(self.replay_buffer)
-            a=self.extract_past_poses(self.replay_buffer)
-            b=self.extract_past_real_poses(self.replay_buffer)
-            print("nnn",a)
-            print(b)
-            max_depth = 21
-            tree_all = self.build_decision_tree_all(self.replay_buffer[-1]["imagined_pose"], 0, max_depth)
-            def print_tree(node, indent=0):
-                print(" " * indent, f"Depth: {node['depth']}, Pose: {node['pose']}, Action: {node['action']}")
-                for child in node["children"]:
-                    print_tree(child, indent + 2)
-    
-            print_tree(tree_all)
-            paths=self.extract_branch_paths(tree_all)
-            print(paths)
-            n_branches = len(paths)
-            print(f"Number of branches: {n_branches}")
-            actions_per_branch = [len(p['actions']) for p in paths]
-            poses_per_branch   = [len(p['poses'])   for p in paths]
 
-            # 3. Count how many branches fall into each length
-            action_length_counts = Counter(actions_per_branch)
-            pose_length_counts   = Counter(poses_per_branch)
-
-            # 4. Print a nice summary
-            print("Branches by # of actions:")
-            for length, count in sorted(action_length_counts.items(), reverse=True):
-                print(f"  {count} branch{'es' if count>1 else ''} with {length} action{'s' if length!=1 else ''}")
-
-            print("\nBranches by # of poses:")
-            for length, count in sorted(pose_length_counts.items(), reverse=True):
-                print(f"  {count} branch{'es' if count>1 else ''} with {length} pose{'s' if length!=1 else ''}")
-            top_diverse=self.evaluate_branches(paths,pose_history)
-            print(f"Kept {len(top_diverse)} diverse branches "
-                  f"(≈{100*len(top_diverse)/len(paths):.1f}% of original)")
-            print(top_diverse)
         print('Step Done')
         return self.models_manager.agent_lost(), obs
     
@@ -679,7 +656,44 @@ class MinigridInteraction():
         policy, n_actions = self.apply_exploration()
         motion_data,agent_lost = self.apply_policy(policy, n_actions, collect_data)
         return motion_data, agent_lost
+    
+    def push_explo_stm(self):
+            pose_history=self.compute_pose_history()
+            self.extract_past_actions(self.replay_buffer)
+            a=self.extract_past_poses(self.replay_buffer)
+            b=self.extract_past_real_poses(self.replay_buffer)
+            print("nnn",a)
+            print(b)
+            max_depth = 9
+            tree_all = self.build_decision_tree_all(self.replay_buffer[-1]["imagined_pose"], 0, max_depth)
+            def print_tree(node, indent=0):
+                print(" " * indent, f"Depth: {node['depth']}, Pose: {node['pose']}, Action: {node['action']}")
+                for child in node["children"]:
+                    print_tree(child, indent + 2)
+    
+            paths=self.extract_branch_paths(tree_all)
+            n_branches = len(paths)
+            print(f"Number of branches: {n_branches}")
+            actions_per_branch = [len(p['actions']) for p in paths]
+            poses_per_branch   = [len(p['poses'])   for p in paths]
 
+            # 3. Count how many branches fall into each length
+            action_length_counts = Counter(actions_per_branch)
+            pose_length_counts   = Counter(poses_per_branch)
+
+            # 4. Print a nice summary
+            print("Branches by # of actions:")
+            for length, count in sorted(action_length_counts.items(), reverse=True):
+                print(f"  {count} branch{'es' if count>1 else ''} with {length} action{'s' if length!=1 else ''}")
+
+            print("\nBranches by # of poses:")
+            for length, count in sorted(pose_length_counts.items(), reverse=True):
+                print(f"  {count} branch{'es' if count>1 else ''} with {length} pose{'s' if length!=1 else ''}")
+            top_diverse=self.evaluate_branches(paths,pose_history)
+            print(top_diverse)
+            print(top_diverse.tolist(),len(top_diverse))
+            return top_diverse.tolist(),len(top_diverse)
+    
     def apply_exploration(self)->tuple[list,int]:
         print('====================================================explo')
         if self.models_manager.agent_lost():
@@ -701,16 +715,17 @@ class MinigridInteraction():
         while len(policy) == 0:    
             print('++++++++++++++++++++++++ while len policy =0')   
             print('trying to increase lookahead by 1 to increase exploration range')
-            lookahead_increased = self.models_manager.increase_lookahead(max=7)   
+            lookahead_increased = self.models_manager.increase_lookahead(max=5)   
             if not lookahead_increased:
                 print('lookahead at max value, search to return to another place')
                 ongoing_exploration_option = 'change_memory_place'
               
             if ongoing_exploration_option == 'change_memory_place':
                 print('Searching for another place to go to')
-                place_to_go = self.models_manager.connected_place_to_visit()  
-                print('++++++++++++++++++++++++') 
-                if place_to_go:
+                print("this time for real",self.step_count())
+                policy, n_action= self.push_explo_stm()  
+                print('this time ++++++++++++++++++++++++',self.step_count()) 
+                '''if place_to_go:
                     print('Searching How to go to the other place')
                     print("where are we going?",place_to_go['current_exp_door_pose'],place_to_go)
                     policy, n_action = self.exploitative_behaviour.go_to_given_place(\
@@ -718,7 +733,7 @@ class MinigridInteraction():
                 
                 else:
                     print('No place found to return to, using ego model')
-                    ongoing_exploration_option = 'push_from_comfort_zone'
+                    ongoing_exploration_option = 'push_from_comfort_zone'''
                 
             elif ongoing_exploration_option == 'explore':
                 print('Exploring with allo model')
