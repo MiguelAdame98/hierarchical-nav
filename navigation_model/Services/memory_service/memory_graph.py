@@ -44,6 +44,7 @@ implementation [2]_.
 '''
 import torch
 import dill
+import cv2
 import numpy as np
 from .odometry import VisualOdometry,\
     PoseOdometry, ActionOdometry, Odometry, HotEncodedActionOdometry
@@ -70,6 +71,8 @@ class MemoryGraph(object):
         :param odom: which key to use for odometry estimation
         '''
         self.observation_key = observation
+        self.device = torch.device('cpu')
+
         self.local_position = kwargs.get('local_position', None)
         self.ghost_node_process = kwargs.get('ghost_node', False)
         self.odometry_key = odom
@@ -89,7 +92,7 @@ class MemoryGraph(object):
 
         self.pose_cells = PoseCells(**kwargs)
         self.experience_map = ExperienceMap(**kwargs)
-
+        
         Experience._ID = 0
         TorchedViewCell._ID = 0
         self.observation = None
@@ -121,6 +124,7 @@ class MemoryGraph(object):
         '''
 
         
+                                                  
         self.observation = observations[self.observation_key]
         print("wtf is happening here",self.observation,observations[self.odometry_key])
         action_ob = observations[self.odometry_key]
@@ -146,28 +150,43 @@ class MemoryGraph(object):
         # get odom estimations
         vtrans, vrot = self.odom(action_ob, dt)
         x, y, th = self.odom.odometry
-        print(x, y, th)
+        print("odom", x, y, th)
 
         #TODO: TEMPO SIMPLIFICQTION
         #We want to create a view_cell ONLY if distance is far enough from prev one.
         #_,accum_delta_x, accum_delta_y  = self.experience_map.accumulated_delta_location(vtrans,vrot)
         #delta_exp = self.experience_map.get_delta_exp(0,0,accum_delta_x, accum_delta_y)
-        if self.experience_map.current_exp is not None:
-            delta_pc = self.experience_map.get_delta_exp(self.experience_map.current_exp.x_pc,self.experience_map.current_exp.y_pc, x_pc, y_pc)
-            delta_pc_above_thresold = self.experience_map.delta_pc_above_thresold(delta_pc)
-            print("I dont understand the threshold",delta_pc_above_thresold, "and the delta_pc", delta_pc , "what is measuring",self.experience_map.current_exp.x_pc,self.experience_map.current_exp.y_pc, x_pc, y_pc)
-            kwargs['current_exp_id'] = self.experience_map.current_exp.id
+        print(f"[DEBUG] odometry → vtrans={vtrans:.6f}, vrot={vrot:.6f}, odom pose=({x:.2f}, {y:.2f}, {th:.2f})")
+
+        
+        rotation_only = abs(vtrans) < 1e-4 and abs(vrot) > 0
+        print(f"[DEBUG] rotation_only? {rotation_only}")
+
+        if rotation_only and self.experience_map.current_exp is not None:
+            # override: don’t create a new cell if we only turned
+            print(f"[DEBUG] Pure rotation detected. Forcing no new experience creation.")
+            delta_pc_above_thresold = False
+            kwargs['current_exp_id']= self.experience_map.current_exp.id
+            kwargs['delta_exp_above_thresold'] = False
         else:
-            delta_pc_above_thresold = 100
-            print("This is supposed to be 100", delta_pc_above_thresold)
-            kwargs['current_exp_id'] = None
+            if self.experience_map.current_exp is not None:
+                x_exp = self.experience_map.current_exp.x_pc
+                y_exp = self.experience_map.current_exp.y_pc
+                print(f"[DEBUG] Translational step. last exp at (x_pc={x_exp}, y_pc={y_exp}), now at (x_pc={x_pc}, y_pc={y_pc})")
+                delta_pc = self.experience_map.get_delta_exp(x_exp, y_exp, x_pc, y_pc)
+                delta_pc_above_thresold = self.experience_map.delta_pc_above_thresold(delta_pc)
+                print(f"[DEBUG] computed delta_pc={delta_pc:.4f}, above_threshold={delta_pc_above_thresold}")
+                kwargs['current_exp_id'] = self.experience_map.current_exp.id
+            else:
+                delta_pc_above_thresold = 100
+                kwargs['current_exp_id'] = None
         print(delta_pc_above_thresold)
         kwargs['delta_exp_above_thresold'] = delta_pc_above_thresold
         
         view_cell, view_cell_copy = self.view_cells(self.observation, x_pc, y_pc, th_pc, **kwargs)
         #view_cell_copy: same as view cell but with a different id
        
-
+        print(self.view_cells.cells,len(self.view_cells.cells))
         if view_cell is None:
             #this only happens if we start memory_graph with a memory 
             # and have yet to define the place (no observation yet)
@@ -176,12 +195,14 @@ class MemoryGraph(object):
         # update pose cells
         print("this goes into a pose cell",self.observation, view_cell,vtrans,vrot,adjust_map,"local pose",local_pose)
         x_pc, y_pc, th_pc = self.pose_cells(view_cell, vtrans, vrot)
-                       
+        print("this goes into a pose cell",x_pc, y_pc, th_pc)           
         if self.experience_map.current_exp is None:
             # reset the pose cells to this activity
+            print("reset the pose cell")
             self.pose_cells.reset(view_cell.x_pc,
                                   view_cell.y_pc,
                                   view_cell.th_pc)
+            
 
        
         print("this are the view_cell pre exp:",view_cell.exps,view_cell,view_cell.id)

@@ -125,6 +125,7 @@ class PoseCells(object):
         self.cells = np.zeros([self.DIM_XY, self.DIM_XY, self.DIM_TH])
         self.cells[a, b, c] = 1
         self.active = a, b, c
+        print(a,b,c)
 
     def compute_activity_matrix(self, xywrap, thwrap, wdim, pcw, excite=True):
         '''Compute the activation of pose cells.'''
@@ -214,7 +215,7 @@ class PoseCells(object):
             act_th = np.min(
                 [np.max([int(np.floor(view_cell.th_pc)), 1]), self.DIM_TH])
 
-            # print [act_x, act_y, act_th]
+            print ("ptm",act_x, act_y, act_th)
             # this decays the amount of energy that is injected at the vt's
             # posecell location
             # this is important as the posecell Posecells will errounously snap
@@ -234,7 +235,7 @@ class PoseCells(object):
                                                   self.W_EXCITE,
                                                   excite=True)
         # print np.max(self.cells)
-        # raw_input()
+        #raw_input()
 
         # local inhibition - self.li = self.le - self.le elements * PC weights
         self.cells = self.cells - self.compute_activity_matrix(self.I_XY_WRAP,

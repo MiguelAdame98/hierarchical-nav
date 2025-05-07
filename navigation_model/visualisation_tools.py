@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 import numpy as np
 import torch
 from dommel_library.datastructs import TensorDict
@@ -118,7 +119,7 @@ def record_video_frames(data:dict, env_definition:dict, agent_lost:bool, visited
     #print(f"Canvas size: {canvas_width}x{canvas_height}")
     s, (width, height) = fig.canvas.print_to_buffer()
     #print(f"Buffer size: {len(s)} Expected size: {width, height, 4}")
-    width, height = 1200,600
+    width, height = 2400,1200
     buf = np.frombuffer(s, np.uint8).reshape((height, width, 4))
     # we don't need the alpha channel
     buf = buf[:, :, 0:3]
@@ -236,7 +237,7 @@ def plot_visited_rooms(ax, visited_rooms, env_definition):
 
 
 
-def plot_memory_map(ax, memory_map_data):
+'''def plot_memory_map(ax, memory_map_data):
     plt.title('Exp Map')
     plt.grid()
     
@@ -265,7 +266,137 @@ def plot_memory_map(ax, memory_map_data):
     s0 = str(memory_map_data['current_exp_id'])
     ax.text(memory_map_data['current_exp_GP'][0], memory_map_data['current_exp_GP'][1], s0, fontsize=10, color='red')
 
+    return ax'''
+def plot_memory_map(ax, memory_map_data, *, dbg=False):
+    """
+    Visualise the experience-map on a Matplotlib Axes.
+
+    This version:
+      - Guards against empty arrays
+      - Drops incomplete link pairs
+      - Deduplicates link segments
+      - Clears the axes each call to avoid leakage
+      - Batches debug output for readability
+      - Increases link linewidth for clarity
+      - Annotates each node with its ID
+    """
+    import numpy as np
+
+    # Always clear old drawing
+    ax.cla()
+    ax.set_title("Experience Map")
+    ax.grid(True)
+    ax.set_aspect("equal", "datalim")
+
+    curr_id = memory_map_data.get("current_exp_id", -1)
+    if curr_id < 0:
+        if dbg:
+            print("[VIS] No current exp → skipping map.")
+        return ax
+
+    # --- Nodes ---
+    exps_gp = memory_map_data.get("exps_GP", [])
+    exps_decay = memory_map_data.get("exps_decay", [])
+    if exps_gp:
+        pts = np.array(exps_gp)
+        ax.scatter(
+            pts[:, 0], pts[:, 1],
+            c=exps_decay,
+            cmap="viridis",
+            label="Places",
+            s=60,              # slightly larger markers
+            edgecolor="k",
+            linewidth=0.5
+        )
+        # Annotate each node with its ID
+        for idx, (x, y) in enumerate(pts):
+            ax.text(
+                x, y,
+                str(idx),
+                color="white",
+                fontsize=8,
+                weight="bold",
+                ha="center",
+                va="center"
+            )
+    elif dbg:
+        print("[VIS] No place nodes to plot.")
+
+    # --- Ghosts ---
+    ghost_gp = memory_map_data.get("ghost_exps_GP", [])
+    if ghost_gp:
+        gpts = np.array(ghost_gp)
+        ax.scatter(
+            gpts[:, 0], gpts[:, 1],
+            c="magenta",
+            marker="^",
+            alpha=0.5,
+            label="Ghosts",
+            s=40
+        )
+    ghost_links = memory_map_data.get("ghost_exps_link", [])
+    # collect only complete pairs
+    glinks = []
+    for i in range(0, len(ghost_links) // 2 * 2, 2):
+        p0 = tuple(ghost_links[i])
+        p1 = tuple(ghost_links[i + 1])
+        glinks.append((p0, p1))
+    # dedupe
+    glinks = list(dict.fromkeys(glinks))
+    if glinks:
+        if dbg:
+            print(f"[VIS] Ghost links: showing {len(glinks)} pairs")
+        for p0, p1 in glinks:
+            ax.plot(
+                [p0[0], p1[0]], [p0[1], p1[1]],
+                ls="--",
+                color="magenta",
+                alpha=0.3,
+                linewidth=2    # make ghost links more visible
+            )
+
+    # --- Real links ---
+    exps_links = memory_map_data.get("exps_links", [])
+    rlinks = []
+    for i in range(0, len(exps_links) // 2 * 2, 2):
+        p0 = tuple(exps_links[i])
+        p1 = tuple(exps_links[i + 1])
+        rlinks.append((p0, p1))
+    rlinks = list(dict.fromkeys(rlinks))
+    if dbg:
+        print(f"[VIS] Real links: {len(rlinks)} pairs (deduped)")
+    for p0, p1 in rlinks:
+        ax.plot(
+            [p0[0], p1[0]], [p0[1], p1[1]],
+            color="gray",
+            linewidth=2      # increase link thickness
+        )
+
+    # --- Current position ---
+    cx, cy = memory_map_data["current_exp_GP"][:2]
+    ax.plot(
+        cx, cy,
+        marker="X",
+        color="red",
+        markersize=10,
+        label="Current"
+    )
+    ax.text(
+        cx, cy,
+        str(curr_id),
+        color="white",
+        fontsize=9,
+        weight="bold",
+        ha="center",
+        va="center",
+        bbox=dict(facecolor="red", alpha=0.5, pad=1)
+    )
+
+    # --- Legend & Return ---
+    if dbg:
+        ax.legend(loc="upper right", fontsize=8)
     return ax
+
 
 def print_positions(ax, GP, pose, step_count):
     current_gp = [float(x) for x in np.around(np.array(GP), 2)]
@@ -373,3 +504,94 @@ def plot_room(allo_model:object, door_poses:list, step:int= None):
     background.show()
     background.save('imagination_results/imagined_room/imagined_room_step_'+str(step) +'.png')
     print('room saved as: imagination_results/imagined_room/imagined_room_step_'+str(step)+'.png')
+
+def visualize_replay_buffer(replay_buffer):
+    """
+    Visualize the replay buffer in a grid of subplots.
+    For each state stored in the replay buffer, display:
+      - Left: the real image along with its associated real pose and action.
+      - Right: the imagined (predicted) image along with its predicted pose.
+      
+    If the 'imagined_image' is None, a blank image is used instead.
+    The layout of the figure allocates vertical space (row heights) proportionately
+    based on the real image heights.
+    """
+    num_states = len(replay_buffer)
+    if num_states == 0:
+        print("Replay buffer is empty.")
+        return
+
+    # Close any previous figures to prevent multiple windows.
+    plt.close('all')
+
+    # Compute row heights (in pixels or any relative unit) using the real image's height.
+    row_heights = []
+    processed_states = []
+    for state in replay_buffer:
+        # Process real image.
+        real_img = state.get('real_image')
+        if real_img is not None:
+            if torch.is_tensor(real_img):
+                real_img = real_img.detach().cpu().numpy()
+            else:
+                real_img = np.array(real_img)
+            # Ensure it has at least 2D (in case it's a scalar or very low-dim data).
+            if real_img.ndim < 2:
+                real_img = np.atleast_2d(real_img)
+        else:
+            # Default to blank image of size 10x10 if no real image.
+            real_img = np.zeros((10,10), dtype=np.uint8)
+            
+        # Process imagined image.
+        imagined_img = state.get('imagined_image')
+        if imagined_img is not None: 
+            # Squeeze an extra dimension if present.
+            imagined_img = imagined_img.squeeze(1) 
+            if torch.is_tensor(imagined_img):
+                imagined_img = imagined_img.detach().cpu().numpy()
+            # If 4D, take the first sample.
+            if imagined_img.ndim == 4:
+                imagined_img = imagined_img[0]
+            # If 3D and in (channels, H, W) format (with channels 1 or 3), transpose to (H, W, C)
+            if imagined_img.ndim == 3 and imagined_img.shape[0] in [1, 3]:
+                imagined_img = imagined_img.transpose(1, 2, 0)
+        else:
+            # If no imagined image, create a blank image using the same H, W as real_img.
+            blank_shape = real_img.shape[:2]
+            imagined_img = np.zeros(blank_shape, dtype=np.uint8)
+
+        # Save processed state info.
+        processed_states.append({
+            'real_img': real_img,
+            'imagined_img': imagined_img,
+            'real_pose': state.get('real_pose', 'unknown'),
+            'imagined_pose': state.get('imagined_pose', 'unknown'),
+            'action': state.get('action', 'none')
+        })
+        
+        # For row height, use the height of the real image.
+        row_heights.append(real_img.shape[0])
+    
+    # Set up the GridSpec with dynamic row heights.
+    # You can adjust the scaling factor to control overall figure height.
+    scaling_factor = 0.05  # Adjust this factor as needed (e.g., 0.05 inches per pixel)
+    total_height = sum(row_heights) * scaling_factor
+    fig = plt.figure(figsize=(18, 16))
+    gs = gridspec.GridSpec(num_states, 2, height_ratios=row_heights)
+    
+    # Now, create subplots using the GridSpec.
+    for idx, state in enumerate(processed_states):
+        # Left subplot: Real image.
+        ax_real = fig.add_subplot(gs[idx, 0])
+        ax_real.imshow(state['real_img'], cmap='gray', vmin=0, vmax=255)
+        ax_real.set_title(f"Real Image\nPose: {state['real_pose']} | Action: {state['action']}", fontsize=8)
+        ax_real.axis('off')
+        
+        # Right subplot: Imagined image.
+        ax_imagined = fig.add_subplot(gs[idx, 1])
+        ax_imagined.imshow(state['imagined_img'], cmap='gray', vmin=0, vmax=255)
+        ax_imagined.set_title(f"Imagined Image\nPredicted Pose:{state['imagined_pose']}" , fontsize=8)
+        ax_imagined.axis('off')
+    
+    
+    plt.show()

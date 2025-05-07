@@ -2,6 +2,7 @@
 #TESTS
 import concurrent.futures
 from typing import List, Dict, Any
+from collections import defaultdict
 
 import gym
 import gym_minigrid 
@@ -11,6 +12,9 @@ import gym_minigrid
 
 import matplotlib.pyplot as plt
 import numpy as np
+import random
+from nltk import PCFG
+from nltk.parse.generate import generate
 from gym_minigrid.wrappers import ImgActionObsWrapper, RGBImgPartialObsWrapper
 from gym_minigrid.window import Window
 
@@ -420,68 +424,7 @@ class MinigridInteraction():
             poses.append(cur)
         return poses   
 
-    '''def evaluate_branches(
-        self,
-        paths,
-        past_poses,
-        tau: float = 50,
-        decay: str = "exp",
-        *,
-        eps: float = 0.5,                # radius, in pose units
-        max_keep: int | None = None,     # e.g. 200; None = no hard cap
-        embed_fn=None                    # branch → R^m vector
-    ):
-        if embed_fn is None:
-            # Use the *final* pose as a 3‑D point [x, y, θ]
-            embed_fn = lambda br: np.asarray(br["poses"][-1], dtype=float)
-
-        # ---------- 1. build last‑seen table ----------
-        last_seen = {tuple(p): t for t, p in enumerate(past_poses)}
-        now = len(past_poses)
-        print(type(paths))
-        paths = [br["actions"] for br in paths]  
-        paths= self.models_manager.get_plausible_policies(paths)
-
-        # ---------- 2. score every branch ----------
-        scored = []
-        for br in paths:
-            penalty = 0.0
-            for pose in br["poses"]:
-                key = tuple(pose)
-                if key in last_seen:
-                    age = now - last_seen[key]
-                    penalty += self._recency_weight(age, tau, decay)
-            scored.append((penalty, br))
-
-        # low → high (most novel first)
-        scored.sort(key=lambda x: x[0])
-
-        kept, kept_vecs = [], []
-        for pen, br in scored:
-            v = embed_fn(br)
-
-            # --- DEBUG: inspect distances to all kept vectors ---
-            too_close = False
-            for idx, u in enumerate(kept_vecs):
-                diff  = v - u
-                dist  = np.linalg.norm(diff)
-                if dist < eps:
-                    too_close = True
-                    break             
-            # ----------------------------------------------------
-
-            if not too_close:
-                kept.append((pen, br))
-                kept_vecs.append(v)
-                if max_keep is not None and len(kept) >= max_keep:
-                    break
-        
-        print("_________________  ")
-        print("_________________  ")
-        print(kept)
-        clean_pol = [br["actions"] for _, br in scored] 
-        
-        return paths'''
+    
     def evaluate_branches(
     self,
     branches: List[Dict[str, Any]],     # [{actions, poses}, …] from extract_branch_paths
@@ -608,7 +551,7 @@ class MinigridInteraction():
         #print(img_msg)
         #print(bridge,img_msg,img_bgr.shape)
         obs, _, _, _ = self.env.step(action)
-        print(obs.keys(),obs["pose"])
+        print(obs.keys(),obs["pose"], obs["image"].shape)
         obs = no_vel_no_action(obs)
         self.models_manager.digest(obs)
         is_agent_at_door(self.models_manager,obs["image"], sensitivity=0.18)
@@ -627,6 +570,10 @@ class MinigridInteraction():
         'imagined_image': self.models_manager.get_best_place_hypothesis()['image_predicted'],
         'action':action}
         self.update_replay_buffer(current_state)
+        if self.step_count()>20:
+            grammar = self.build_pcfg_from_memory()
+            plan = list(generate(grammar, n=1))[0]
+            print("[PLAN] Sampled PCFG plan:", plan)
 
         print('Step Done')
         return self.models_manager.agent_lost(), obs
@@ -664,7 +611,7 @@ class MinigridInteraction():
             b=self.extract_past_real_poses(self.replay_buffer)
             print("nnn",a)
             print(b)
-            max_depth = 9
+            max_depth = 6
             tree_all = self.build_decision_tree_all(self.replay_buffer[-1]["imagined_pose"], 0, max_depth)
             def print_tree(node, indent=0):
                 print(" " * indent, f"Depth: {node['depth']}, Pose: {node['pose']}, Action: {node['action']}")
@@ -856,11 +803,11 @@ class MinigridInteraction():
     def save_created_map(self, saving_dir:str)->None:
         save_memory(self.models_manager, saving_dir)
     #TODO: refactor
-    def get_memory_map_data(self):
+    '''def get_memory_map_data(self):
         ''' 
-        This is for plotting the memory map
+    '''This is for plotting the memory map
         
-        TO DO: REFACTOR'''
+        TO DO: REFACTOR''''''
 
         memory_map_data = {'exps_GP':[], 'exps_decay': [], 'ghost_exps_GP':[],\
                            'ghost_exps_link':[], 'exps_links': []}
@@ -894,7 +841,171 @@ class MinigridInteraction():
                             memory_map_data['exps_links'].append([expc.links[l_id].target.x_m,expc.links[l_id].target.y_m])
                             memory_map_data['exps_links'].append([expc.x_m, expc.y_m])
                        
+        return memory_map_data'''
+    def get_memory_map_data(self, dbg=True):
+        """
+        This is for plotting the memory map.
+        Adds debug dumps of every link and deduplicates before returning.
+        """
+        mg = self.models_manager.memory_graph
+        emap = mg.experience_map
+
+        # 1) Prepare the empty payload
+        memory_map_data = {
+            'exps_GP': [], 
+            'exps_decay': [], 
+            'ghost_exps_GP': [],
+            'ghost_exps_link': [], 
+            'exps_links': []
+        }
+
+        # 2) Current experience and global pose
+        memory_map_data['current_exp_id'] = mg.get_current_exp_id()
+        memory_map_data['current_GP']     = mg.get_global_position()
+        if memory_map_data['current_exp_id'] < 0:
+            if dbg:
+                print("[DBG] No current experience → empty map")
+            return memory_map_data
+
+        memory_map_data['current_exp_GP'] = mg.get_exp_global_position()
+
+        # 3) DEBUG: dump every existing link in the graph
+        if dbg:
+            print("[DBG] Full link graph (exp → targets):")
+            for exp in emap.exps:
+                targets = [link.target.id for link in exp.links]
+                print(f"   Exp {exp.id} → {targets}")
+
+        # 4) Collect experience nodes
+        for vc in mg.view_cells.cells:
+            for exp in vc.exps:
+                memory_map_data['exps_GP'].append([exp.x_m, exp.y_m])
+                memory_map_data['exps_decay'].append(vc.decay)
+
+        # 5) Ghost experiences + their links
+        for ghost in emap.ghost_exps:
+            memory_map_data['ghost_exps_GP'].append([ghost.x_m, ghost.y_m])
+            for link in ghost.links:
+                memory_map_data['ghost_exps_link'].append([ghost.x_m, ghost.y_m])
+                memory_map_data['ghost_exps_link'].append([link.target.x_m, link.target.y_m])
+
+        # 6) Real experience‐to‐experience links
+        for exp in emap.exps:
+            for link in exp.links:
+                # skip ghost‐to‐ghost or ghost‐to‐real if any slipped through
+                if not getattr(link.target, 'ghost_exp', False):
+                    memory_map_data['exps_links'].append([link.target.x_m, link.target.y_m])
+                    memory_map_data['exps_links'].append([exp.x_m, exp.y_m])
+
+        # 7) DEBUG: show raw link list
+        if dbg:
+            raw = memory_map_data['exps_links']
+            n_pairs = len(raw) // 2
+            print(f"[DBG] Raw exps_links pairs: {n_pairs}, raw list (first 6 points) = {raw[:6]}")
+
+        # 8) Deduplicate accidental duplicates
+        clean = []
+        seen = set()
+        pts = memory_map_data['exps_links']
+        # interpret as consecutive pairs [p0, p1, p2, p3, ...]
+        for i in range(0, len(pts), 2):
+            p0 = tuple(pts[i])
+            p1 = tuple(pts[i+1])
+            pair = (p0, p1)
+            if pair not in seen:
+                seen.add(pair)
+                clean.extend([list(p0), list(p1)])
+        memory_map_data['exps_links'] = clean
+
+        # 9) DEBUG: show cleaned link list
+        if dbg:
+            n_clean = len(clean) // 2
+            print(f"[DBG] Clean exps_links pairs: {n_clean}, cleaned list (first 6 points) = {clean[:6]}")
+
         return memory_map_data
+    def build_pcfg_from_memory(self):
+        mg = self.models_manager.memory_graph
+        emap = mg.experience_map
+        current_id = mg.get_current_exp_id()
+        exps_by_dist = mg.get_exps_organised(current_id)
+        all_exps = emap.exps
+
+        print("[PCFG DEBUG] exps_by_dist =", exps_by_dist)
+        print(type(exps_by_dist))
+
+        # --- 1. Compute exploration priors based on distance ---
+        id_to_dist = {}
+        total_weight = 0
+        for exp in exps_by_dist:
+            dist = (exp['x']**2 + exp['y']**2)**0.5
+            id_to_dist[exp['id']] = dist
+            total_weight += 1.0 / (dist + 1e-5)
+
+        # --- 2. Rule collection by non-terminal ---
+        rules = defaultdict(list)
+        rules['EXPLORE'].append(('NAVPLAN', 1.0))
+
+        for target_id, dist in id_to_dist.items():
+            prob = (1.0 / (dist + 1e-5)) / total_weight
+            rules['NAVPLAN'].append((f'GOTO_{target_id}', prob))
+            rules[f'GOTO_{target_id}'].append((f'MOVESEQ_{current_id}_{target_id}', 1.0))
+
+        # --- 3. Collect known STEP transitions ---
+        step_rules = set()
+        for exp in all_exps:
+            for link in exp.links:
+                src = exp.id
+                dst = link.target.id
+                lhs = f'STEP_{src}_{dst}'
+                rhs = f"'step({src},{dst})'"
+                step_rules.add((lhs, rhs, 1.0))
+
+        # --- 4. Build MOVESEQ rules dynamically ---
+        defined_moveseq = set()
+
+        for src in id_to_dist:
+            moveseq_nt = f'MOVESEQ_{current_id}_{src}'
+            lhs_defined = False
+
+            # If there's a direct step, fallback to it
+            direct_step = (f'STEP_{current_id}_{src}', f"'step({current_id},{src})'", 1.0)
+            if direct_step not in step_rules:
+                step_rules.add(direct_step)
+
+            rules[moveseq_nt].append((f'STEP_{current_id}_{src}', 1.0))
+            defined_moveseq.add(moveseq_nt)
+
+        # Optional: Add hand-written sequences (they must not overlap existing ones!)
+        # Add only if not already defined
+        hardcoded_paths = {
+            f'MOVESEQ_{current_id}_18': ["STEP_{0}_19".format(current_id), "STEP_19_18"],
+            f'MOVESEQ_{current_id}_3':  ["STEP_{0}_5".format(current_id), "STEP_5_4", "STEP_4_3"],
+        }
+
+        for lhs, steps in hardcoded_paths.items():
+            if lhs not in rules:
+                rhs = " ".join(steps)
+                rules[lhs].append((rhs, 1.0))
+                for step in steps:
+                    src_dst = step.replace("STEP_", "").replace("'", "").split("_")
+                    if len(src_dst) == 2:
+                        s, d = src_dst
+                        step_rules.add((step, f"'step({s},{d})'", 1.0))
+
+        # --- 5. Assemble PCFG strings ---
+        pcfg_lines = []
+        for lhs, productions in rules.items():
+            total = sum(prob for _, prob in productions)
+            for rhs, prob in productions:
+                prob /= total  # normalize
+                pcfg_lines.append(f"{lhs} -> {rhs} [{prob:.4f}]")
+
+        for lhs, rhs, prob in step_rules:
+            pcfg_lines.append(f"{lhs} -> {rhs} [{prob:.4f}]")
+
+        print("[PCFG DEBUG] Final grammar string:\n" + "\n".join(pcfg_lines))
+        grammar = PCFG.fromstring("\n".join(pcfg_lines))
+        return grammar
 
 
 

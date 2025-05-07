@@ -2,6 +2,7 @@ import copy
 
 import numpy as np
 import torch
+import cv2
 
 
 from env_specifics.env_calls import (call_env_entry_poses_assessment,
@@ -208,7 +209,7 @@ class Manager():
 
         #=====Observations treatment process======#
         torch_sensor_data = torch_observations(sensor_data, self.observations_keys)
-        print(torch_sensor_data["pose"])
+        print(torch_sensor_data["pose"],torch_sensor_data["image"])
         #=====ALLO+EGOCENTRIC MODELS process (update model with latest motion observations)======#
         self.egocentric_process.digest(torch_sensor_data, self.num_samples) #
         self.process_place_believes(torch_sensor_data)
@@ -258,8 +259,86 @@ class Manager():
              #self.place_model.update_place(observations, current_view_cell_place)
         
         #If we change experience, we do a recap on previous exp main features before storing it in memory
-        if current_exp_id != prev_exp_id and prev_exp_id != -1:
-            self.handle_exp_change(prev_exp_id)
+        #if current_exp_id != prev_exp_id and prev_exp_id != -1:
+            #self.handle_exp_change(prev_exp_id)
+
+    def rgb56_to_template64(self,
+    img,
+    eps: float = 1e-6,
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+        """
+        56×56×3 RGB  →  64-D descriptor
+            • 48 dims = 16-bin histograms of L*, a*, b*
+            • 16 dims = 4×4 block-mean edge magnitudes (Sobel)
+        """
+
+        # ------------------------------------------------------------------ #
+        # 1. Make sure we have HWC uint8                                     #
+        # ------------------------------------------------------------------ #
+        print(f"[DBG] raw in  {type(img)}, shape={getattr(img,'shape',None)}, "
+            f"dtype={getattr(img,'dtype',None)}")
+
+        if torch.is_tensor(img):
+            if img.shape == (3, 56, 56):                      # CHW tensor
+                img = img.permute(1, 2, 0).contiguous().cpu().numpy()
+                print("[DBG] permuted CHW→HWC, now", img.shape)
+            else:
+                img = img.cpu().numpy()
+                print("[DBG] tensor already HWC → numpy")
+        else:
+            if img.shape == (3, 56, 56):                      # CHW numpy
+                img = np.transpose(img, (1, 2, 0))
+                print("[DBG] numpy CHW→HWC, now", img.shape)
+
+        assert img.shape == (56, 56, 3), f"expected 56×56×3, got {img.shape}"
+
+        if img.dtype != np.uint8:
+            img = (img * 255.0).round().astype(np.uint8)
+            print("[DBG] scaled to uint8")
+
+        # ------------------------------------------------------------------ #
+        # 2. 16-bin Lab histograms (48 dims)                                 #
+        # ------------------------------------------------------------------ #
+        lab = cv2.cvtColor(img, cv2.COLOR_RGB2Lab).astype(np.float32)
+        L   = (lab[:, :, 0] * 255.0 / 100.0).clip(0, 255)
+        a   = lab[:, :, 1] + 128.0
+        b   = lab[:, :, 2] + 128.0
+
+        bins = np.linspace(0, 256, 17, dtype=np.float32)
+        h_L, _ = np.histogram(L, bins=bins)
+        h_a, _ = np.histogram(a, bins=bins)
+        h_b, _ = np.histogram(b, bins=bins)
+
+        h48 = np.concatenate([h_L, h_a, h_b]).astype(np.float32)
+        h48 /= h48.sum() + eps
+        print(f"[DBG] hist L1-norm={h48.sum():.3f}")
+
+        # ------------------------------------------------------------------ #
+        # 3. 4×4 Sobel-edge energy (16 dims)                                 #
+        # ------------------------------------------------------------------ #
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        mag  = cv2.magnitude(
+            cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3),
+            cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3),
+        )
+        edge16 = [
+            mag[y : y + 14, x : x + 14].mean()
+            for y in range(0, 56, 14)
+            for x in range(0, 56, 14)
+        ]
+        edge16 = np.asarray(edge16, np.float32)
+        edge16 /= edge16.sum() + eps
+
+        # ------------------------------------------------------------------ #
+        # 4. Concatenate → 64-D  & return torch tensor                       #
+        # ------------------------------------------------------------------ #
+        vec64 = np.concatenate([h48, edge16])
+        print("[DBG] vec64  shape", vec64.shape, " first5", vec64[:5])
+
+        return torch.from_numpy(vec64).to(device)
+        
+
     
     def memory_digest(self, observations: dict, place_descriptor: dict) -> None:
         """ We update the memory graph with current:
@@ -271,18 +350,25 @@ class Manager():
         in another experience.
         """
         #=== UPDATE MAP WITH CURRENT BELIEF ===#
-        slam_obs = {"place": None, 'pose': None, "HEaction": observations['action'].cpu().detach().numpy()}
+        slam_obs = {"place": None, 'pose': None, "HEaction": observations['action'].cpu().detach().numpy(), "image":None}
         print("This is the place descriptor [0] that updates the memory graph", place_descriptor["pose"])
         print("this is the stable distribution in std place th compared to the place descriptor std ", self.std_place_th)
         #if we have only 1 place hypothesis and we have a stable distribution
         if (not self.agent_lost() and place_descriptor['std'] < self.std_place_th):
+            print("slam before changes",place_descriptor['post'].shape )
             slam_obs["place"] = torch.mean(place_descriptor['post'],dim=0).squeeze(0)
+            print("slam obs place", slam_obs["place"].shape)
             slam_obs["pose"] = place_descriptor['pose']
+            print("slam obs image shape", observations["image"],observations["image"].shape)
+            slam_obs["image"] = self.rgb56_to_template64(
+                                observations["image"]) 
+            print("slam obs image",slam_obs["image"], slam_obs["image"].shape)
             
         else :
             self.memory_graph.memorise_poses([]) #if we are lost, we reset door memories
             
         #process state in memory_graph model
+        print("maybe slam",slam_obs)
         self.memory_graph.digest(slam_obs, dt=1, adjust_map = False)
 
     def handle_exp_change(self, prev_exp_id:int)-> None:

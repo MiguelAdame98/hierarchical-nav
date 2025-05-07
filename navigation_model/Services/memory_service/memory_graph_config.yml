@@ -1,6 +1,6 @@
 
 #rgb ob 10 states
-observation: "place"
+observation: "image"
 local_position: "pose"
 odom: "HEaction"
 

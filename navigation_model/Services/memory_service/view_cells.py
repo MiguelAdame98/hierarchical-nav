@@ -45,7 +45,9 @@ import numpy as np
 #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 device = torch.device('cpu')
-
+K_MAX          = 10      # max exemplars stored per view-cell
+NOVELTY_TAU    = 1.2    # accumulator threshold to force a spawn
+NOVELTY_GAMMA  = 0.97 
 class TorchedViewCell(object):
 
     _ID = 0
@@ -62,6 +64,8 @@ class TorchedViewCell(object):
         self.to_update = False
         #self.init_local_position = local_position
         self.relevant_poses = []
+        self.exemplars   = []   # NEW
+        self.delta_accum = 0.0  # NEW
         #self.template_info = {}
 
         TorchedViewCell._ID += 1
@@ -94,7 +98,7 @@ class TorchedViewCells(object):
 
         self.GLOBAL_DECAY = global_decay
         self.ACTIVE_DECAY = active_decay
-        self.MATCH_THRESHOLD = match_threshold
+        self.MATCH_THRESHOLD = 0.01
         #self.activated_cells = []
 
         self.key = key
@@ -145,12 +149,13 @@ class TorchedViewCells(object):
         
     
         self.templates[cell.id, :] = template
-        
+        cell.exemplars.append(template.clone())      # NEW
+        print(f"[VC]  new cell {cell.id}  |  total={TorchedViewCell._ID}")
         return cell
     def update_prev_cell(self,exp_view_cell):
         self.prev_cell = exp_view_cell
 
-    def _score(self, template):
+    '''def _score(self, template):
         # TODO this only implements state cosine distance
     
         a = torch.matmul(self.templates, template.unsqueeze(-1))
@@ -159,7 +164,19 @@ class TorchedViewCells(object):
 
         s = [[x,i] for i,x in enumerate(score)]
         print('show me the cos similiarity score', s[:TorchedViewCell._ID])
-        return score
+        return score'''
+    def _score(self, template):
+        dists = []
+        for cid, cell in enumerate(self.cells[:TorchedViewCell._ID]):
+            ex = cell.exemplars or [self.templates[cid]]
+            E  = torch.stack(ex)                              # (k,d)
+            cos = 1 - torch.abs(E @ template /
+                (E.norm(dim=-1) * template.norm() + 1e-8))  # (k,)
+            best = cos.min()
+            dists.append(best)
+            # ─ debug ────────────────────────
+            print(f"[VC]  cid={cid:3d}  best_cos_dist={best.item():.3f}")
+        return torch.stack(dists)[:, None]
 
     def _compare_templates_kl_alternative_fct(self, t1, t2):
         split = t1.shape[-1] // 2
@@ -200,24 +217,6 @@ class TorchedViewCells(object):
         print('show me the kl divergence',test_kl)
         return kl
 
-    #//def remove_views_without_exp(self):
-        cells_no_exp = []
-        print('How many view cells:', len(self.cells))
-        for cell in self.cells:
-            if len(cell.exps) == 0:
-                print(cell.id,' has no exp')
-                cells_no_exp.append(cell.id)
-        if len(cells_no_exp)>0:
-            for id in cells_no_exp:
-                self.cells.pop(id)
-                
-                TorchedViewCell._ID-=1
-
-            for id, cell in enumerate(self.cells):
-                print('cell id', cell.id, 'will become', id)
-                cell_template = self.templates[cell.id,:]
-                cell.id = id
-                self.templates[cell.id,:] = cell_template
     def remove_views_without_exp(self):
         print('How many view cells:', len(self.cells))
         
@@ -258,15 +257,15 @@ class TorchedViewCells(object):
         i = indices[-1][0].item()
         return min_score, i
     
-    def __call__(self, observations, x_pc, y_pc, th_pc, **kwargs):
-        '''Execute an iteration of visual template.
+    '''def __call__(self, observations, x_pc, y_pc, th_pc, **kwargs):
+        Execute an iteration of visual template.
 
         :param observation: the observation as a numpy array.
         :param x_pc: index x of the current pose cell.
         :param y_pc: index y of the current pose cell.
         :param th_pc: index th of the current pose cell.
         :return: the active view cell.
-        '''
+        
         cell_bis = None
         delta_exp_above_thresold = kwargs.get('delta_exp_above_thresold', True)
         #local_position = kwargs.get('local_position', None)
@@ -282,22 +281,26 @@ class TorchedViewCells(object):
         
         #The agent holds a single belief, else Multiple models running in parallel, agent lost
         if observations is not None:
+
             if isinstance(observations, np.ndarray):
                 template = torch.from_numpy(observations).to(device)
+                print("template if ndarray", template, template.shape )
             else:
                 template = observations
+                print("template if not ndarray,if",template, template.shape )
             
-            if TorchedViewCell._ID :
+            #if TorchedViewCell._ID :
+                
                 with torch.no_grad():
 
                     min_score, i = self.get_closest_template(template)
                     # kl_score = self._kl_divergence_score(template)
                     
                     print('min scores and indices', min_score, i)
-                    print(' NO KL: closest looking exp ' + str(i)+ ' view match score and th ' + str(min_score) +' '+ str(self.MATCH_THRESHOLD))
+                    print('NO KL: closest looking exp ' + str(i)+ ' view match score and th ' + str(min_score) +' '+ str(self.MATCH_THRESHOLD))
                     
             if not TorchedViewCell._ID or min_score > self.MATCH_THRESHOLD:
-                
+                print("NO MATCH")
                 #TODO: REMOVE THIS IF, THIS IS A SIMPLIFICATION NOT ADAPTED FOR REAL WORLD
                 if delta_exp_above_thresold:
                     print('creating view cell')
@@ -307,24 +310,72 @@ class TorchedViewCells(object):
                 
                 #if not far enough from prev view we replace prev cell ob by the new cell ob
                 else: 
-                    print(' replacing view cell', self.prev_cell.id,'template of exp', current_exp_id,', LP and GP to update')
+                    print('replacing view cell', self.prev_cell.id,'template of exp', current_exp_id,', LP and GP to update')
                     self.templates[self.prev_cell.id, :] = template
-                    self.prev_cell.to_update = True
+                    if len(self.view_cells) > 1:
+                        
+                        self.prev_cell.to_update = True
                 # for exp in self.prev_cell.exps:
                 #     if exp.id == current_exp_id:
                 #         exp.init_local_position = local_position
                 #         break
                     return self.prev_cell, None
-                
+            if TorchedViewCell._ID :
+                with torch.no_grad():
+                    min_score, i = self.get_closest_template(template)
+                    print(f"[VC]  min_score={min_score:.3f}  cell_id={i}")
 
+                    # ─ accumulate novelty ─────────────────────────────
+                    self.prev_cell.delta_accum = \
+                        self.prev_cell.delta_accum * NOVELTY_GAMMA + float(min_score)
+                    force_spawn = self.prev_cell.delta_accum > NOVELTY_TAU
+                    print(f"[VC]  Δacc={self.prev_cell.delta_accum:.3f}  "
+                        f"force={force_spawn}")
+
+                # ─ NO MATCH or forced spawn ──────────────────────────
+            if (not TorchedViewCell._ID) or (
+                    (min_score > self.MATCH_THRESHOLD or force_spawn)
+                    and motion_far_enough):
+
+                print("[VC]  CREATE   (novel visual OR accumulated)")
+                cell = self.create_cell(template, x_pc, y_pc, th_pc)
+                self.prev_cell = cell
+                return cell, None
+
+                # ─ visually new but motion small: add exemplar ───────
+            elif min_score > self.MATCH_THRESHOLD and not motion_far_enough:
+                print("[VC]  EXEMPLAR (visual drift, small motion)")
+                ex = self.prev_cell.exemplars
+                if len(ex) < K_MAX:
+                    ex.append(template.clone())
+                else:
+                    ex.pop(0); ex.append(template.clone())
+                    # refresh mean prototype
+                self.templates[self.prev_cell.id, :] = torch.stack(ex).mean(0)
+                return self.prev_cell, None
+
+                # ─ confident match; update & maybe copy cell ─────────
+            else:
+                print("[VC]  UPDATE   (matched existing cell)")
+                    # soft-update exemplar cache
+                ex = self.prev_cell.exemplars
+                if len(ex) < K_MAX:
+                    ex.append(template.clone())
+                else:
+                    ex.pop(0); ex.append(template.clone())
+                # refresh prototype
+                self.templates[self.prev_cell.id, :] = torch.stack(ex).mean(0)
+                    
             elif self.prev_cell is not None and self.prev_cell.id == i :
-                print('update view cell', i)
+
+                print('updating view cell', i)
                 #if we are still at the same cell, update content 
                 self.templates[self.prev_cell.id, :] = template
                  
-            else :
+            elif :
                 print('selecting old view cell', i)
 
+            print("MATCHED BABY")
             cell = self.cells[i]
             cell.decay += self.ACTIVE_DECAY
 
@@ -339,12 +390,121 @@ class TorchedViewCells(object):
             # in the specific situation if we close loop observations, but dist to other exps > th, 
             # so we create a new exp with a copy of view cell
             # In such a case we need to update to the view_cell copy template (exact same template but higher id) 
+            print("we close looped in view cell")
             min_score, i = self.get_closest_template(self.templates[self.prev_cell.id, :])
             if i != self.prev_cell.id :
                 self.prev_cell = self.cells[i]
 
-        return self.prev_cell, cell_bis
+        return self.prev_cell, cell_bis'''
 
+
+    def __call__(self, observations, x_pc, y_pc, th_pc, **kwargs):
+        """
+        Run one view‑cell iteration.
+
+        Returns
+        -------
+        (active_cell, duplicate_or_None)
+        """
+        # -----------------------------------------------------------------
+        cell_bis = None                                      # duplicate handle
+        motion_far_enough = kwargs.get('delta_exp_above_thresold', True)
+        current_exp_id    = kwargs.get('current_exp_id', None)
+        self.remove_views_without_exp()
+        # ---- decay all cells ----------------------------------------------------
+        for c in self.cells:
+            c.decay = max(0.0, c.decay - self.GLOBAL_DECAY)
+
+        # ------------------------------------------------------------------------
+        # 1.  IF NO IMAGE: keep last cell or switch via template copy
+        # ------------------------------------------------------------------------
+        if observations is None:
+            if self.prev_cell is None:
+                return None, None
+
+            print("[VC]  Fallback – no observation; stay on prev_cell")
+            # option: re‑match to ensure ID still valid
+            min_score, i = self.get_closest_template(
+                self.templates[self.prev_cell.id, :])
+            if i != self.prev_cell.id:
+                self.prev_cell = self.cells[i]
+            return self.prev_cell, None
+
+        # ------------------------------------------------------------------------
+        # 2.  Convert observation to tensor
+        # ------------------------------------------------------------------------
+        template = (torch.from_numpy(observations).to(device)
+                    if isinstance(observations, np.ndarray)
+                    else observations)
+        print(f"[VC]  template shape={tuple(template.shape)}")
+
+        # ------------------------------------------------------------------------
+        # 3.  FAST EXIT WHEN NO CELLS YET
+        # ------------------------------------------------------------------------
+        if TorchedViewCell._ID == 0:
+            print("[VC]  CREATE first view‑cell")
+            cell = self.create_cell(template, x_pc, y_pc, th_pc)
+            self.prev_cell = cell
+            return cell, None
+
+        # ------------------------------------------------------------------------
+        # 4.  MATCH AGAINST EXISTING TEMPLATES
+        # ------------------------------------------------------------------------
+        with torch.no_grad():
+            min_score, i = self.get_closest_template(template)
+        print(f"[VC]  min_score={min_score:.3f}  match_id={i}")
+
+        # ---- novelty accumulator (on *prev* cell) ------------------------------
+        self.prev_cell.delta_accum = \
+            self.prev_cell.delta_accum * NOVELTY_GAMMA + float(min_score)
+        force_spawn = self.prev_cell.delta_accum > NOVELTY_TAU
+        print(f"[VC]  Δacc={self.prev_cell.delta_accum:.3f}  force={force_spawn}")
+
+        # ------------------------------------------------------------------------
+        # 5.  DECISION TREE
+        # ------------------------------------------------------------------------
+
+        # 5‑A  CREATE  (novel visual OR accumulated)  +  enough motion
+        if (min_score > self.MATCH_THRESHOLD or force_spawn) and motion_far_enough:
+            print("[VC]  CREATE   (visual novelty or Δacc) ")
+            cell = self.create_cell(template, x_pc, y_pc, th_pc)
+            self.prev_cell = cell
+            return cell, None
+
+        # 5‑B  EXEMPLAR ADD  (visual drift but robot almost static)
+        if min_score > self.MATCH_THRESHOLD and not motion_far_enough:
+            print("[VC]  EXEMPLAR (drift, small motion)")
+            ex = self.prev_cell.exemplars
+            (ex.append if len(ex) < K_MAX else (lambda t: (ex.pop(0), ex.append(t))))(template.clone())
+            # refresh prototype
+            self.templates[self.prev_cell.id, :] = torch.stack(ex).mean(0)
+            return self.prev_cell, None
+
+        # 5‑C  MATCHED  (min_score ≤ threshold)  → same cell OR switch
+        matched_cell = self.cells[i]
+
+        # (i) SAME cell  ----------------------------------------------------------
+        if matched_cell is self.prev_cell:
+            print("[VC]  UPDATE   (same cell)")
+            # soft exemplar update
+            ex = matched_cell.exemplars
+            (ex.append if len(ex) < K_MAX else (lambda t: (ex.pop(0), ex.append(t))))(template.clone())
+            self.templates[matched_cell.id, :] = torch.stack(ex).mean(0)
+            matched_cell.decay += self.ACTIVE_DECAY
+            return matched_cell, None
+
+        # (ii) DIFFERENT cell  ----------------------------------------------------
+        print("[VC]  SWITCH    (matched different cell)")
+        matched_cell.decay += self.ACTIVE_DECAY
+
+        # optional: duplicate so map can store loop‑closure
+        cell_bis = self.create_cell(self.templates[matched_cell.id, :],
+                                    matched_cell.x_pc,
+                                    matched_cell.y_pc,
+                                    matched_cell.th_pc)
+
+        self.prev_cell = matched_cell
+        return matched_cell, cell_bis
 
 def compare_image_templates(t1, t2, slen):
     cwl = t1.size
