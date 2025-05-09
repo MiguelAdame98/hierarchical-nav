@@ -17,6 +17,7 @@ from nltk import PCFG
 from nltk.parse.generate import generate
 from gym_minigrid.wrappers import ImgActionObsWrapper, RGBImgPartialObsWrapper
 from gym_minigrid.window import Window
+from collections import deque
 
 from control_eval.input_output import *
 from collections import Counter
@@ -297,8 +298,6 @@ class MinigridInteraction():
             action = state.get('action', None)
             if action is not None:
                 actions.append(action)
-        print(actions)
-        print(self.convert_list_to_hot_encoded(actions))
         return actions
     def extract_past_real_poses(self,replay_buffer):
         actions = []
@@ -343,13 +342,13 @@ class MinigridInteraction():
     def extract_branch_paths(self, tree, current_path=None):
         if current_path is None:
             current_path = {"actions": [], "poses": [tree["pose"]]}
-            print(f">>> start at pose={tree['pose']}")
+            #print(f">>> start at pose={tree['pose']}")
 
         kids = tree.get("children") or []
         if not kids:
             # We’re at a leaf
             L = len(current_path["actions"])
-            print(f"   leaf @ pose={tree['pose']} ➞ length={L}")
+            #print(f"   leaf @ pose={tree['pose']} ➞ length={L}")
             return [current_path]
 
         paths = []
@@ -521,19 +520,19 @@ class MinigridInteraction():
             current_pose = list(first_state.get('real_pose', [0, 0, 0]))  # assume pose format: [x, y, theta]
         
         pose_history = [current_pose.copy()]
-        print(pose_history)
+        #print(pose_history)
         # Iterate through the replay buffer in forward order.
         # For each state, update the current pose using the stored action.
         for state in reversed(self.replay_buffer):
             action = state.get('action')
             hotenc_action = np.array(self.convert_minigrid_action_to_hot_encoded(action), dtype=np.int32)
-            print("Hot-encoded action:", hotenc_action, type(hotenc_action), hotenc_action.shape)
+            #print("Hot-encoded action:", hotenc_action, type(hotenc_action), hotenc_action.shape)
             if action is None:
                 # If no action is specified, assume no movement.
                 continue
             # Compute the updated pose: this function should update the pose given the action.
             current_pose = self.action_to_past_pose(hotenc_action, current_pose.copy())
-            print("fff",current_pose)
+            #print("fff",current_pose)
             # Append a copy of the updated pose to the trajectory history.
             pose_history.append(current_pose.copy())
         
@@ -609,14 +608,14 @@ class MinigridInteraction():
             self.extract_past_actions(self.replay_buffer)
             a=self.extract_past_poses(self.replay_buffer)
             b=self.extract_past_real_poses(self.replay_buffer)
-            print("nnn",a)
-            print(b)
+            #print("nnn",a)
+            #print(b)
             max_depth = 6
             tree_all = self.build_decision_tree_all(self.replay_buffer[-1]["imagined_pose"], 0, max_depth)
-            def print_tree(node, indent=0):
+            '''def print_tree(node, indent=0):
                 print(" " * indent, f"Depth: {node['depth']}, Pose: {node['pose']}, Action: {node['action']}")
                 for child in node["children"]:
-                    print_tree(child, indent + 2)
+                    print_tree(child, indent + 2)'''
     
             paths=self.extract_branch_paths(tree_all)
             n_branches = len(paths)
@@ -923,6 +922,7 @@ class MinigridInteraction():
             print(f"[DBG] Clean exps_links pairs: {n_clean}, cleaned list (first 6 points) = {clean[:6]}")
 
         return memory_map_data
+    
     def build_pcfg_from_memory(self):
         mg = self.models_manager.memory_graph
         emap = mg.experience_map
@@ -930,18 +930,21 @@ class MinigridInteraction():
         exps_by_dist = mg.get_exps_organised(current_id)
         all_exps = emap.exps
 
+        # --- Build graph from experience links ---
+        graph = {exp.id: [link.target.id for link in exp.links] for exp in all_exps}
+        print("[PCFG DEBUG] graph:", graph)
         print("[PCFG DEBUG] exps_by_dist =", exps_by_dist)
-        print(type(exps_by_dist))
+        print("[PCFG DEBUG] exps_by_dist type:", type(exps_by_dist))
 
-        # --- 1. Compute exploration priors based on distance ---
+        # --- Distance-based priors ---
         id_to_dist = {}
         total_weight = 0
         for exp in exps_by_dist:
-            dist = (exp['x']**2 + exp['y']**2)**0.5
+            dist = (exp['x'] ** 2 + exp['y'] ** 2) ** 0.5
             id_to_dist[exp['id']] = dist
             total_weight += 1.0 / (dist + 1e-5)
 
-        # --- 2. Rule collection by non-terminal ---
+        # --- Grammar rule collection ---
         rules = defaultdict(list)
         rules['EXPLORE'].append(('NAVPLAN', 1.0))
 
@@ -950,7 +953,7 @@ class MinigridInteraction():
             rules['NAVPLAN'].append((f'GOTO_{target_id}', prob))
             rules[f'GOTO_{target_id}'].append((f'MOVESEQ_{current_id}_{target_id}', 1.0))
 
-        # --- 3. Collect known STEP transitions ---
+        # --- Collect known STEP transitions ---
         step_rules = set()
         for exp in all_exps:
             for link in exp.links:
@@ -960,45 +963,56 @@ class MinigridInteraction():
                 rhs = f"'step({src},{dst})'"
                 step_rules.add((lhs, rhs, 1.0))
 
-        # --- 4. Build MOVESEQ rules dynamically ---
-        defined_moveseq = set()
+        # --- Helper: Path-finding (BFS for simplicity) ---
+        def find_paths(graph, start, goal, max_depth=5, max_paths=3):
+            paths = []
+            queue = deque([[start]])
+            while queue and len(paths) < max_paths:
+                path = queue.popleft()
+                last = path[-1]
+                if last == goal:
+                    paths.append(path)
+                elif len(path) < max_depth:
+                    for neighbor in graph.get(last, []):
+                        if neighbor not in path:
+                            queue.append(path + [neighbor])
+            return paths
 
-        for src in id_to_dist:
-            moveseq_nt = f'MOVESEQ_{current_id}_{src}'
-            lhs_defined = False
+        # --- Generate MOVESEQ rules via all valid path permutations ---
+        for target_id in id_to_dist:
+            moveseq_lhs = f"MOVESEQ_{current_id}_{target_id}"
+            paths = find_paths(graph, current_id, target_id)
+            if paths:
+                for path in paths:
+                    steps = [f"STEP_{a}_{b}" for a, b in zip(path, path[1:])]
+                    rhs = " ".join(steps)
+                    rules[moveseq_lhs].append((rhs, 1.0 / len(paths)))
+            else:
+                # Fallback to direct if no path (or self to self)
+                rhs = f"STEP_{current_id}_{target_id}"
+                rules[moveseq_lhs].append((rhs, 1.0))
+                step_rules.add((rhs, f"'step({current_id},{target_id})'", 1.0))
 
-            # If there's a direct step, fallback to it
-            direct_step = (f'STEP_{current_id}_{src}', f"'step({current_id},{src})'", 1.0)
-            if direct_step not in step_rules:
-                step_rules.add(direct_step)
-
-            rules[moveseq_nt].append((f'STEP_{current_id}_{src}', 1.0))
-            defined_moveseq.add(moveseq_nt)
-
-        # Optional: Add hand-written sequences (they must not overlap existing ones!)
-        # Add only if not already defined
+        # --- Optional: hand-coded paths ---
         hardcoded_paths = {
-            f'MOVESEQ_{current_id}_18': ["STEP_{0}_19".format(current_id), "STEP_19_18"],
-            f'MOVESEQ_{current_id}_3':  ["STEP_{0}_5".format(current_id), "STEP_5_4", "STEP_4_3"],
+            f'MOVESEQ_{current_id}_18': [f'STEP_{current_id}_19', 'STEP_19_18'],
+            f'MOVESEQ_{current_id}_3':  [f'STEP_{current_id}_5', 'STEP_5_4', 'STEP_4_3'],
         }
-
         for lhs, steps in hardcoded_paths.items():
             if lhs not in rules:
                 rhs = " ".join(steps)
                 rules[lhs].append((rhs, 1.0))
                 for step in steps:
-                    src_dst = step.replace("STEP_", "").replace("'", "").split("_")
-                    if len(src_dst) == 2:
-                        s, d = src_dst
-                        step_rules.add((step, f"'step({s},{d})'", 1.0))
+                    s, d = step.replace("STEP_", "").replace("'", "").split("_")
+                    step_rules.add((step, f"'step({s},{d})'", 1.0))
 
-        # --- 5. Assemble PCFG strings ---
+        # --- Final assembly of PCFG string ---
         pcfg_lines = []
         for lhs, productions in rules.items():
             total = sum(prob for _, prob in productions)
             for rhs, prob in productions:
-                prob /= total  # normalize
-                pcfg_lines.append(f"{lhs} -> {rhs} [{prob:.4f}]")
+                norm_prob = prob / total if total > 0 else 1.0
+                pcfg_lines.append(f"{lhs} -> {rhs} [{norm_prob:.4f}]")
 
         for lhs, rhs, prob in step_rules:
             pcfg_lines.append(f"{lhs} -> {rhs} [{prob:.4f}]")
@@ -1006,6 +1020,7 @@ class MinigridInteraction():
         print("[PCFG DEBUG] Final grammar string:\n" + "\n".join(pcfg_lines))
         grammar = PCFG.fromstring("\n".join(pcfg_lines))
         return grammar
+
 
 
 
