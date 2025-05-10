@@ -569,14 +569,17 @@ class MinigridInteraction():
         'imagined_image': self.models_manager.get_best_place_hypothesis()['image_predicted'],
         'action':action}
         self.update_replay_buffer(current_state)
-        if self.step_count()>20:
+        if self.step_count() > 20:
             grammar = self.build_pcfg_from_memory()
-            plan = list(generate(grammar, n=1))[0]
-            print("[PLAN] Sampled PCFG plan:", plan)
-
-        print('Step Done')
-        return self.models_manager.agent_lost(), obs
-    
+            plans = list(generate(grammar, n=10, depth=10))
+            if plans:
+                plan = plans[0]
+                print("[PLAN] Sampled PCFG plan:", plan)
+            else:
+                print("[PLAN] No valid plan could be generated.")
+                print('Step Done')
+                return self.models_manager.agent_lost(), obs
+        
     def apply_policy(self, policy:list, n_actions:int, collect_data:bool=False)->tuple[list,bool]:
         motion_data = []
         agent_lost = False
