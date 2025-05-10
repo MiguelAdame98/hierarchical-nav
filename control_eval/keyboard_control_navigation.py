@@ -571,15 +571,29 @@ class MinigridInteraction():
         self.update_replay_buffer(current_state)
         if self.step_count()>20:
             grammar = self.build_pcfg_from_memory()
-            plans = list(generate(grammar, n=10, depth=10))
-            if plans:
-                plan = plans[0]
-                print("[PLAN] Sampled PCFG plan:", plan)
-            else:
-                print("[PLAN] No valid plan could be generated.")
-                print('Step Done')
+            self.print_adaptive_pcfg_plans(grammar)
         return self.models_manager.agent_lost(), obs
-        
+
+    def print_adaptive_pcfg_plans(self,grammar, max_trials=5, initial_depth=4, max_depth_limit=25):
+        print("[DEBUG] Attempting to generate plans adaptively...")
+
+        depth = initial_depth
+        while depth <= max_depth_limit:
+            try:
+                plans = list(generate(grammar, depth=depth))
+                if plans:
+                    print(f"[PLAN DEBUG] {len(plans)} plans found at depth {depth}:")
+                    for i, plan in enumerate(plans):
+                        print(f"  Plan {i+1}: {' '.join(plan)}")
+                    return plans  # Optionally return for use
+                else:
+                    print(f"[PLAN DEBUG] No plans at depth {depth}. Increasing depth...")
+            except Exception as e:
+                print(f"[PLAN DEBUG] Generation failed at depth {depth}: {e}")
+            depth += 2  # Increase search depth gradually
+
+        print("[PLAN DEBUG] No valid plans found up to max depth limit.")
+        return []    
     def apply_policy(self, policy:list, n_actions:int, collect_data:bool=False)->tuple[list,bool]:
         motion_data = []
         agent_lost = False
