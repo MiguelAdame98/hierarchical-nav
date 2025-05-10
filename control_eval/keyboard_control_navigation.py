@@ -585,7 +585,7 @@ class MinigridInteraction():
                     print(f"[PLAN DEBUG] {len(plans)} plans found at depth {depth}:")
                     for i, plan in enumerate(plans):
                         print(f"  Plan {i+1}: {' '.join(plan)}")
-                    return plans  # Optionally return for use
+                    #return plans  # Optionally return for use
                 else:
                     print(f"[PLAN DEBUG] No plans at depth {depth}. Increasing depth...")
             except Exception as e:
