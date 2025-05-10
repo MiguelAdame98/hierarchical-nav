@@ -1000,16 +1000,27 @@ class MinigridInteraction():
             moveseq_lhs = f"MOVESEQ_{current_id}_{target_id}"
             paths = find_paths(graph, current_id, target_id)
             if paths:
+                valid_paths = 0
                 for path in paths:
                     steps = [f"STEP_{a}_{b}" for a, b in zip(path, path[1:])]
-                    rhs = " ".join(steps)
-                    rules[moveseq_lhs].append((rhs, 1.0 / len(paths)))
+                    if steps:  # <-- This avoids empty RHS productions
+                        rhs = " ".join(steps)
+                        rules[moveseq_lhs].append((rhs, 1.0))  # temp prob
+                        valid_paths += 1
+                if valid_paths > 0:
+                    # Normalize the probabilities
+                    for i in range(len(rules[moveseq_lhs])):
+                        rhs, _ = rules[moveseq_lhs][i]
+                        rules[moveseq_lhs][i] = (rhs, 1.0 / valid_paths)
+                else:
+                    # No valid (non-empty) paths → skip adding the rule
+                    continue
             else:
-                # Fallback to direct if no path (or self to self)
-                rhs = f"STEP_{current_id}_{target_id}"
-                rules[moveseq_lhs].append((rhs, 1.0))
-                step_rules.add((rhs, f"'step({current_id},{target_id})'", 1.0))
-
+                # Fallback to direct step if needed
+                if current_id != target_id:  # avoid MOVESEQ_X_X -> []
+                    rhs = f"STEP_{current_id}_{target_id}"
+                    rules[moveseq_lhs].append((rhs, 1.0))
+                    step_rules.add((rhs, f"'step({current_id},{target_id})'", 1.0))
         # --- Optional: hand-coded paths ---
         hardcoded_paths = {
             f'MOVESEQ_{current_id}_18': [f'STEP_{current_id}_19', 'STEP_19_18'],
