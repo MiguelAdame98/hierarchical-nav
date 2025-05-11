@@ -981,7 +981,7 @@ class MinigridInteraction():
                 step_rules.add((lhs, rhs, 1.0))
 
         # --- Helper: Path-finding (BFS for simplicity) ---
-        def find_paths(graph, start, goal, max_depth=5, max_paths=3):
+        def find_paths(graph, start, goal, max_depth=15, max_paths=15):
             paths = []
             queue = deque([[start]])
             while queue and len(paths) < max_paths:
