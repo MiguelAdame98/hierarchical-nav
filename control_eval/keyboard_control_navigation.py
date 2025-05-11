@@ -325,17 +325,17 @@ class MinigridInteraction():
 
         initial_pose = final_pose.copy()
         if action[0] == 1:
-            print("action[0] == 1:")
+            #print("action[0] == 1:")
             initial_pose[0] = final_pose[0] - DIR_TO_VEC[final_pose[2]][0]
             initial_pose[1] = final_pose[1] - DIR_TO_VEC[final_pose[2]][1]
         elif action[0] == -1:
             initial_pose[0] = final_pose[0] + DIR_TO_VEC[final_pose[2]][0]
             initial_pose[1] = final_pose[1] + DIR_TO_VEC[final_pose[2]][1]
         elif action[1] == 1:
-            print("action[1] == 1:")
+            #print("action[1] == 1:")
             initial_pose[2] = (final_pose[2] - 1) % 4
         elif action[2] == 1:
-            print("action[2] == 1:")
+            #print("action[2] == 1:")
             initial_pose[2] = (final_pose[2] + 1) % 4
 
         return initial_pose
@@ -358,7 +358,7 @@ class MinigridInteraction():
                 "actions": current_path["actions"] + [action],
                 "poses":   current_path["poses"]   + [pose]
             }
-            print(f"  desc → action {action} ➞ pose {pose}  (so far: {len(new_path['actions'])} actions)")
+            #print(f"  desc → action {action} ➞ pose {pose}  (so far: {len(new_path['actions'])} actions)")
             paths.extend(self.extract_branch_paths(child, new_path))
 
         return paths
