@@ -83,7 +83,7 @@ class MinigridInteraction():
         memory_config = setup_memory_config(args.memory_config)
         old_memory = args.memory_load
 
-        self.models_manager = Manager(allo_config, memory_config, mingrid_actions, env= env_type, lookahead=args.lookahead)
+        self.models_manager = Manager(allo_config, memory_config, mingrid_actions, env= env_type, lookahead=args.lookahead,replay_buffer=self.replay_buffer)
         set_door_view_observation(self.models_manager)
         load_memory(self.models_manager,old_memory)
 

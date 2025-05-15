@@ -18,7 +18,7 @@ from navigation_model.Services.model_modules import torch_observations, sample_o
 from navigation_model.visualisation_tools import convert_tensor_to_matplolib_list, visualise_image
 
 class Manager():
-    def __init__(self, allo_model_config:dict, memory_graph_config:dict, env_actions:list, env:str, lookahead:int=5) :
+    def __init__(self, allo_model_config:dict, memory_graph_config:dict, env_actions:list, env:str, lookahead:int=5, replay_buffer=None) :
 
         self.empty_memory = True
         self.num_samples = 5
@@ -34,10 +34,10 @@ class Manager():
 
         #ALLO config 
         self.allocentric_process, self.std_place_th = init_allocentric_process(allo_model_config, self.env_specific, device)
-
+        self.replay_buffer = replay_buffer
         #MemoryGraph initialisation
         self.memory_graph = MemoryGraph(**memory_graph_config) 
-
+        self.memory_graph.experience_map.replay_buffer = self.replay_buffer
 
         self.observations_keys = list(set(self.allocentric_process.get_observations_keys()) | \
                                 set(self.egocentric_process.get_observations_keys()))

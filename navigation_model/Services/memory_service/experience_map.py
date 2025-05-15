@@ -47,7 +47,10 @@ class Experience(object):
     _ID = 0
     _ghost_ID = 0
 
-    def __init__(self, x_pc, y_pc, th_pc, x_m, y_m, facing_rad, view_cell, local_pose, ghost_exp):
+    def __init__(self, x_pc, y_pc, th_pc, x_m, y_m, facing_rad, view_cell, local_pose, ghost_exp,
+                 imagined_pose=None,
+                 real_pose=None,
+                 pose_cell_pose=None):
         '''Initializes the Experience.
 
         :param x_pc: index x of the current pose cell.
@@ -69,6 +72,9 @@ class Experience(object):
         self.view_cell = view_cell
         self.links = []
         self.init_local_position = local_pose
+        self.imagined_pose=imagined_pose,
+        self.real_pose=real_pose,
+        self.pose_cell_pose=[x_pc,y_pc,th_pc]
 
         self.ghost_exp = ghost_exp
         if self.ghost_exp:
@@ -79,36 +85,9 @@ class Experience(object):
             Experience._ID += 1
 
 
-
-    '''def link_to(self, target, accum_delta_x, accum_delta_y,
-                accum_delta_facing, active_link):
-        ''' '''Creates a link between this experience and a target one.
-
-        :param target: the target Experience object.
-        :param accum_delta_x: accumulator in axis x computed by experience map.
-        :param accum_delta_y: accumulator in axis y computed by experience map.
-        :param accum_delta_facing: accumulator of orientation, computed by 
-                                   experience map.'''
-        
-    '''
-
-        print('np.arctan2(accum_delta_y, accum_delta_x)', accum_delta_y, accum_delta_x, np.arctan2(accum_delta_y, accum_delta_x) )
-        print('self.facing_rad, accum_delta_facing', self.facing_rad, accum_delta_facing)
-        d = np.sqrt(accum_delta_x**2 + accum_delta_y**2)
-        heading_rad = signed_delta_rad(
-            self.facing_rad,
-            np.arctan2(accum_delta_y, accum_delta_x)
-        )
-        facing_rad = signed_delta_rad(
-            self.facing_rad,
-            accum_delta_facing
-        )
-        link = ExperienceLink(self, target, facing_rad, d, heading_rad, active_link)
-        self.links.append(link)
-        print('     _     ')'''
     def link_to(self, target,
             accum_delta_x, accum_delta_y, accum_delta_facing,
-            active_link):
+            active_link,prim_path=None):
         """
         Create a directed link *self → target* and append it to self.links.
         Extra‑verbose debug version.
@@ -138,7 +117,8 @@ class Experience(object):
                             facing_rad=facing_rad,
                             d=d,
                             heading_rad=heading_rad,
-                            active_link=active_link)
+                            active_link=active_link,
+                            path=prim_path)
 
         self.links.append(link)
         print("       -> stored as  d={:.3f}, head={:+.3f}, face={:+.3f}, "
@@ -177,7 +157,7 @@ class Experience(object):
 class ExperienceLink(object):
     '''A representation of connection between experiences.'''
 
-    def __init__(self, parent, target, facing_rad, d, heading_rad, active_link):
+    def __init__(self, parent, target, facing_rad, d, heading_rad, active_link, path):
         '''Initializes the link.
 
         :param parent: the Experience object that owns this link.
@@ -193,6 +173,23 @@ class ExperienceLink(object):
         self.d = d
         self.heading_rad = heading_rad
         self.active_link = active_link
+        # Store the forward primitive sequence (A→B)
+        self.path_forward = path or []
+        # And the reverse: invert primitives in reverse order
+        self.path_reverse = []
+        for act in reversed(self.path_forward):
+            if act == 'forward':
+                self.path_reverse.append('forward')
+            elif act == 'left':
+                self.path_reverse.append('right')
+            elif act == 'right':
+                self.path_reverse.append('left')
+    def __repr__(self):
+        bf = list(self.path_forward)
+        br = list(self.path_reverse)
+        return (f"Link({self.parent.id}->{self.target.id}, d={self.d:.2f}, "
+                f"head={self.heading_rad:.2f}, face={self.facing_rad:.2f}, "
+                f"prims={bf}, rev={br})")
 
 
 class ExperienceMap(object):
@@ -200,9 +197,9 @@ class ExperienceMap(object):
 
     def __init__(self, dim_xy=61, dim_th=36,
                  delta_exp_threshold=1.0, delta_pc_threshold= 1.0, correction=0.5, loops=100,
-                 constant_adjust=False, **kwargs):
+                 constant_adjust=False,replay_buffer=None, **kwargs):
         '''Initializes the experience map.'''
-
+        self.replay_buffer = replay_buffer
         self.DIM_XY = dim_xy
         self.DIM_TH = dim_th
 
@@ -224,7 +221,8 @@ class ExperienceMap(object):
         self.accum_delta_facing = np.pi / 2
 
         
-    def _create_exp(self, x_pc, y_pc, th_pc, view_cell, local_pose):
+    def _create_exp(self, x_pc, y_pc, th_pc, view_cell, local_pose,imagined_pose=None,
+                    real_pose=None):
         '''Creates a new Experience object.
 
         This method creates a new experience object, which will be a point the
@@ -245,15 +243,26 @@ class ExperienceMap(object):
             x_m += self.current_exp.x_m
             y_m += self.current_exp.y_m
         print('in exp create local init_location', local_pose )
-        exp = Experience(x_pc, y_pc, th_pc, x_m, y_m, facing_rad, view_cell, local_pose, ghost_exp=False)
+        exp = Experience(x_pc, y_pc, th_pc, x_m, y_m, facing_rad, view_cell, local_pose, ghost_exp=False,imagined_pose=None,
+                    real_pose=None,
+                    pose_cell_pose=None)
 
         if self.current_exp is not None:
+            prim_path=self._get_recent_prims(self.current_exp.id, exp.id)
+            path_reverse = []
+            for act in reversed(self.path_forward):
+                if act == 'forward':
+                    self.path_reverse.append('forward')
+                elif act == 'left':
+                    self.path_reverse.append('right')
+                elif act == 'right':
+                    self.path_reverse.append('left')
             #connect from prev to newly created exp
             self.current_exp.link_to(
-                exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing, active_link=True)
+                exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing, active_link=True,prim_path=prim_path)
             #and vice versa
             exp.link_to(
-                self.current_exp, - self.accum_delta_x, - self.accum_delta_y, self.current_exp.facing_rad, active_link=False)
+                self.current_exp, - self.accum_delta_x, - self.accum_delta_y, self.current_exp.facing_rad, active_link=False,prim_path=path_reverse)
             try:
                 print('linked exp', self.current_exp.id,' to ', self.current_exp.links[-1].target.id, 'f,h,d:', self.current_exp.links[-1].facing_rad, self.current_exp.links[-1].heading_rad, self.current_exp.links[-1].d)
                 print('inverse link exp', exp.id,' to ', exp.links[-1].target.id, 'f,h,d:', exp.links[-1].facing_rad, exp.links[-1].heading_rad, exp.links[-1].d)
@@ -265,6 +274,48 @@ class ExperienceMap(object):
         
 
         return exp
+    def _map_raw_action(self, raw):
+        """
+        Turn whatever was stored under 'action' into one of
+        the strings 'forward', 'left', or 'right'.
+        """
+        # 1) One–hot lists or tuples of length 3
+        if isinstance(raw, (list, tuple)) and len(raw) == 3:
+            idx = max(range(3), key=lambda i: raw[i])
+            return ['forward', 'right', 'left'][idx]
+
+        # 2) Integers (gym_minigrid: 0=left, 1=right, 2=forward)
+        if isinstance(raw, int):
+            return {0: 'left',  1: 'right',  2: 'forward'}.get(raw, 'forward')
+
+        # 3) Already a string?
+        if isinstance(raw, str):
+            low = raw.lower()
+            if 'forw' in low: return 'forward'
+            if 'left' in low: return 'left'
+            if 'right'  in low: return 'right'
+
+        # 4) Fallback default
+        return 'forward'
+
+    def _get_recent_prims(self, u_id: int, v_id: int) -> list[str]:
+        """
+        Look in self.replay_buffer (the same list object 
+        injected from MinigridInteraction) for the last
+        occurrence of node_id=u_id followed immediately 
+        by node_id=v_id.  Return [primitive] or [].
+        """
+        rb = self.replay_buffer or []
+        # Walk backwards so we pick the most recent transition first
+        for i in range(len(rb) - 1, 0, -1):
+            prev = rb[i-1]
+            cur  = rb[i]
+            if prev.get('node_id') == u_id and cur.get('node_id') == v_id:
+                raw = cur.get('action', prev.get('action'))
+                prim = self._map_raw_action(raw)
+                return [prim]
+        # No matching transition found
+        return []
 
     def _create_ghost_exp(self, x_m, y_m, facing_rad, linked_exp = None):
         '''Creates a new Experience object.
