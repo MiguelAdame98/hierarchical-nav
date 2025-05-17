@@ -442,9 +442,9 @@ class Exploration_Minigrid(ExplorativeBehaviour):
         connected_place_door_pose
         """
         imagined_doors_info = {}
-        current_exp_door_poses = manager.get_location_limits()
+        '''current_exp_door_poses = manager.get_location_limits()
         for pose in current_exp_door_poses:
-            imagined_doors_info = self.new_entry_in_imagined_doors_info(manager, imagined_doors_info, pose)
+            imagined_doors_info = self.new_entry_in_imagined_doors_info(manager, imagined_doors_info, pose)'''
         return imagined_doors_info
     
     def new_entry_in_imagined_doors_info(self, manager:object, imagined_doors_info:dict, pose:list)-> dict:

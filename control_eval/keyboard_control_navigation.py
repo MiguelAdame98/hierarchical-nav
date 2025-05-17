@@ -13,6 +13,9 @@ import gym_minigrid
 import matplotlib.pyplot as plt
 import numpy as np
 import random
+import heapq
+from collections import namedtuple
+State = namedtuple("State", ["x","y","d"])
 from nltk import PCFG
 from nltk.parse.generate import generate
 from gym_minigrid.wrappers import ImgActionObsWrapper, RGBImgPartialObsWrapper
@@ -53,7 +56,8 @@ def print_keys_explanation():
     print('up arrow: agent goes forward in its reference frame')
     print('====================================')
 
-
+DIR_VECS = [(1,0),(0,1),(-1,0),(0,-1)]
+ACTIONS   = ["forward","left","right"]
 class MinigridInteraction():
     def __init__(self, args, redraw_window:bool = True) -> None:
         env_type = 'Minigrid_maze_aisle_wt_doors' + args.env
@@ -538,7 +542,58 @@ class MinigridInteraction():
         
         return pose_history
 
-    
+    def debug_recompute_all_paths(self):
+        """
+        For every pair of connected experiences u→v in the map,
+        re‐plan with A* and compare to the stored primitive sequences.
+        """
+        mg       = self.models_manager.memory_graph
+        emap     = mg.experience_map
+        exps     = emap.exps
+        ego      = self.models_manager.egocentric_process
+        samples  = getattr(self.models_manager, "num_samples", 5)
+
+        if len(exps) <= 1:
+            print("[DEBUG] only {} experience(s), skipping path recomputation".format(len(exps)))
+            return
+
+        print(f"[DEBUG] recomputing paths across {len(exps)} experiences…")
+        for exp in exps:
+            for link in exp.links:
+                u_id = exp.id
+                v_id = link.target.id
+
+                print(f"\n[DEBUG] Link {u_id} → {v_id}")
+                print("    stored forward:", link.path_forward)
+                print("    stored reverse:", link.path_reverse)
+
+                # Extract real poses (must have been injected into Experience.real_pose)
+                start_pose = getattr(exp,        "real_pose", None)
+                goal_pose  = getattr(link.target, "real_pose", None)
+                if start_pose is None or goal_pose is None:
+                    print("    ✖ missing real_pose for exp", u_id, "or", v_id)
+                    continue
+
+                # Discretize into State(x:int, y:int, d:int)
+                s0 = State(int(round(start_pose[0])),
+                           int(round(start_pose[1])),
+                           int(round(start_pose[2])))
+                g0 = State(int(round(goal_pose[0])),
+                           int(round(goal_pose[1])),
+                           int(round(goal_pose[2])))
+                print("    start_state =", s0, " goal_state =", g0)
+
+                # Recompute forward
+                new_fwd = self.astar_prims(s0, g0, ego, num_samples=samples)
+                print("    new forward:", new_fwd,
+                      "✅" if new_fwd == link.path_forward else "❌")
+
+                # Recompute reverse
+                new_rev = self.astar_prims(g0, s0, ego, num_samples=samples)
+                print("    new reverse:", new_rev,
+                      "✅" if new_rev == link.path_reverse else "❌")
+
+        print("\n[DEBUG] path recomputation complete.")
 
     def agent_step(self, action) -> tuple[bool,dict]:
         print('step in world:', self.step_count())
@@ -552,6 +607,12 @@ class MinigridInteraction():
         obs, _, _, _ = self.env.step(action)
         print(obs.keys(),obs["pose"], obs["image"].shape)
         obs = no_vel_no_action(obs)
+        emap = self.models_manager.memory_graph.experience_map
+        emap.last_link_action     = action
+        emap.last_real_pose       = obs["pose"]
+        emap.last_imagined_pose   = self.models_manager.get_best_place_hypothesis()['pose']
+        prim = emap._map_raw_action(action)
+        emap._recent_prims.append(prim)
         self.models_manager.digest(obs)
         is_agent_at_door(self.models_manager,obs["image"], sensitivity=0.18)
         print("is agent at door",is_agent_at_door(self.models_manager,obs["image"], sensitivity=0.18))
@@ -563,15 +624,18 @@ class MinigridInteraction():
         info_gain = self.models_manager.get_best_place_hypothesis()['info_gain']
         self.explorative_behaviour.update_rolling_info_gain(info_gain, window=slide_window)
         current_state = {
+        'node_id': self.agent_situate_memory(),
         'real_pose': obs["pose"],
         'imagined_pose':self.models_manager.get_best_place_hypothesis()['pose'],
         'real_image': obs['image'],   
         'imagined_image': self.models_manager.get_best_place_hypothesis()['image_predicted'],
         'action':action}
         self.update_replay_buffer(current_state)
+        self.debug_recompute_all_paths()
         if self.step_count()>20:
             grammar = self.build_pcfg_from_memory()
             self.print_adaptive_pcfg_plans(grammar)
+            
         return self.models_manager.agent_lost(), obs
 
     def print_adaptive_pcfg_plans(self,grammar, max_trials=5, initial_depth=4, max_depth_limit=25):
@@ -940,6 +1004,7 @@ class MinigridInteraction():
 
         return memory_map_data
     
+
     def build_pcfg_from_memory(self):
         mg = self.models_manager.memory_graph
         emap = mg.experience_map
@@ -950,8 +1015,6 @@ class MinigridInteraction():
         # --- Build graph from experience links ---
         graph = {exp.id: [link.target.id for link in exp.links] for exp in all_exps}
         print("[PCFG DEBUG] graph:", graph)
-        print("[PCFG DEBUG] exps_by_dist =", exps_by_dist)
-        print("[PCFG DEBUG] exps_by_dist type:", type(exps_by_dist))
 
         # --- Distance-based priors ---
         id_to_dist = {}
@@ -1048,6 +1111,138 @@ class MinigridInteraction():
         print("[PCFG DEBUG] Final grammar string:\n" + "\n".join(pcfg_lines))
         grammar = PCFG.fromstring("\n".join(pcfg_lines))
         return grammar
+    
+    def get_primitives(self, u: int, v: int) -> list[str]:
+        """
+        Return the best primitive sequence for traversing the edge u→v.
+        1) If we’ve already stored a path in the ExperienceLink, return it.
+        2) Try the replay‐buffer lookup.
+        3) Try compass rollout.
+        4) Finally, BFS/A* fallback.
+        """
+        emap = self.models_manager.memory_graph.experience_map
+
+        # --- 0) stored ExperienceLink? -------------------------------------
+        link = self._find_link(u, v)
+        if link and link.path_forward:
+            print(f"[get_primitives] using cached path for {u}->{v}: {link.path_forward}")
+            return list(link.path_forward)
+
+        # --- 2) greedy compass --------------------------------------------
+        cur_pose  = (*self.env.agent_pos, self.env.agent_dir)
+        goal_pose = self.mem_graph.get_pose(v)   # assume this returns (x,y,θ) or at least (x,y)
+        cg = self.compass_prims(cur_pose, goal_pose, self.env)
+        if self._reaches(cg, goal_pose):
+            print(f"[get_primitives] compass succeeded for {u}->{v}: {cg}")
+            emap.add_prims(u, v, cg)
+            return cg
+
+        # --- 3) BFS / A* in (x,y,θ) -----------------------------------------
+        bf = self._bfs_prims(u, v, max_depth=20)
+        print(f"[get_primitives] BFS fallback for {u}->{v}: {bf}")
+        emap.add_prims(u, v, bf)
+        return bf
+
+
+    def _find_link(self, u: int, v: int):
+        """Scan the experience_map for an ExperienceLink u→v (or return None)."""
+        for exp in self.models_manager.memory_graph.experience_map:
+            if exp.id == u:
+                for link in exp.links:
+                    if link.target.id == v:
+                        return link
+    
+        return None
+
+
+
+    # Cardinal motion vectors for dir ∈ {0=E,1=S,2=W,3=N}
+    
+
+    def heuristic(self, s: State, g: State) -> float:
+        # Manhattan distance + minimal turn cost
+        manh = abs(s.x - g.x) + abs(s.y - g.y)
+        turn = min((s.d - g.d) % 4, (g.d - s.d) % 4)
+        return manh + turn
+
+    def astar_prims(
+    self,
+    start: State,
+    goal:  State,
+    egocentric_process,
+    num_samples: int = 5
+    ) -> list[str]:
+        """
+        A* in (x,y,dir)-space, but we skip ANY forward candidate
+        whose entire prefix fails the egocentric collision check.
+        """
+        print(f"[A*] start={start}  goal={goal}")
+        open_pq = [(self.heuristic(start, goal), 0, start, [])]  # (f, g, state, seq)
+        g_score = { start: 0 }
+        closed   = set()
+        step = 0
+
+        # helper: pack a list of 'forward'/'left'/'right' into a (T,3) float tensor
+        def to_onehot_tensor(seq: list[str]) -> torch.Tensor:
+            mapping = {'forward': [1,0,0], 'right': [0,1,0], 'left': [0,0,1]}
+            return torch.tensor([mapping[a] for a in seq], dtype=torch.float32)
+
+        while open_pq:
+            f, g, (x,y,d), seq = heapq.heappop(open_pq)
+            print(f"[A*][{step}] POP  state={State(x,y,d)}  g={g}  f={f}  seq={seq!r}")
+            step += 1
+
+            if (x,y,d) in closed:
+                print("    SKIP (closed)")
+                continue
+            closed.add((x,y,d))
+
+            # success if we've reached the right cell (ignore final θ)
+            if (x,y) == (goal.x, goal.y):
+                print(f"[A*] reached goal at step {step} → seq={seq!r}")
+                return seq
+
+            for act in ("left","right","forward"):
+                if act == "forward":
+                    dx, dy = DIR_VECS[d]
+                    nx, ny, nd = x + dx, y + dy, d
+                elif act == "left":
+                    nx, ny, nd = x, y, (d - 1) % 4
+                else:  # right
+                    nx, ny, nd = x, y, (d + 1) % 4
+
+                ns = State(nx, ny, nd)
+                print(f"    try {act!r} -> next={ns}", end="")
+
+                if (nx,ny,nd) in closed:
+                    print("   SKIP (closed)")
+                    continue
+
+                new_seq = seq + [act]
+
+                # **egocentric** collision check
+                tensor = to_onehot_tensor(new_seq)               # shape (T,3)
+                safe   = egocentric_process.egocentric_policy_assessment(
+                            tensor, num_samples=num_samples
+                        )
+                if safe.shape[0] < tensor.shape[0]:
+                    print("   SKIP (ego-collision)")
+                    continue
+
+                # accept → push into open
+                g2 = g + 1
+                h2 = self.heuristic(ns, goal)
+                f2 = g2 + h2
+                old = g_score.get(ns, float("inf"))
+                if g2 < old:
+                    g_score[ns] = g2
+                    print(f"   PUSH g={g2} h={h2} f={f2} seq={new_seq!r}")
+                    heapq.heappush(open_pq, (f2, g2, ns, new_seq))
+                else:
+                    print(f"   SKIP (worse g: {g2} ≥ {old})")
+
+        print("[A*] no path found → returning empty")
+        return []
 
 
 

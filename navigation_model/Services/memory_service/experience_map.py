@@ -33,49 +33,47 @@
 # =============================================================================
 
 import numpy as np
+import math
 from operator import itemgetter
 from .modules import *
 from sys import maxsize
 
-class Experience(object):
-    '''A single experience.
 
-    An Experience object is used to point out a single point in the experience
-    map, Thus, it must store its position in the map and activation of pose and
-    view cell modules.
-    '''
+class Experience(object):
+    '''A single experience.'''
+
     _ID = 0
     _ghost_ID = 0
 
-    def __init__(self, x_pc, y_pc, th_pc, x_m, y_m, facing_rad, view_cell, local_pose, ghost_exp,
+    def __init__(self,
+                 x_pc, y_pc, th_pc,
+                 x_m, y_m, facing_rad,
+                 view_cell, local_pose, ghost_exp,
                  imagined_pose=None,
                  real_pose=None,
                  pose_cell_pose=None):
-        '''Initializes the Experience.
-
-        :param x_pc: index x of the current pose cell.
-        :param y_pc: index y of the current pose cell.
-        :param th_pc: index th of the current pose cell.
-        :param x_m: the position of axis x in the experience map.
-        :param y_m: the position of axis x in the experience map.
-        :param facing_rad: the orientation of the experience, in radians.
-        :param view_cell: the last most activated view cell.
-        :param ghost_exp: wether this experience has a view_cell or not (verified or expected exp)
-        '''
-        
+        '''Initializes the Experience.'''
+        # Basic pose-cell and map coordinates
         self.x_pc = x_pc
         self.y_pc = y_pc
         self.th_pc = th_pc
         self.x_m = x_m
         self.y_m = y_m
         self.facing_rad = facing_rad
-        self.view_cell = view_cell
-        self.links = []
-        self.init_local_position = local_pose
-        self.imagined_pose=imagined_pose,
-        self.real_pose=real_pose,
-        self.pose_cell_pose=[x_pc,y_pc,th_pc]
 
+        # Cell references
+        self.view_cell = view_cell
+        self.init_local_position = local_pose
+
+        # New pose attributes
+        self.imagined_pose   = imagined_pose
+        self.real_pose       = real_pose
+        self.pose_cell_pose  = [x_pc, y_pc, th_pc]
+
+        # Link list
+        self.links = []
+
+        # ID assignment
         self.ghost_exp = ghost_exp
         if self.ghost_exp:
             self.id = Experience._ghost_ID
@@ -84,98 +82,78 @@ class Experience(object):
             self.id = Experience._ID
             Experience._ID += 1
 
+        print(f"[DEBUG][Experience __init__] Created {'ghost' if ghost_exp else ''}Exp{self.id}: ")
+        print(f"   pose_cell=({self.x_pc},{self.y_pc},{self.th_pc}), ")
+        print(f"   map=({self.x_m:.3f},{self.y_m:.3f},{self.facing_rad:.3f}), ")
+        print(f"   imagined_pose={self.imagined_pose}, real_pose={self.real_pose}, pose_cell_pose={self.pose_cell_pose}")
 
     def link_to(self, target,
-            accum_delta_x, accum_delta_y, accum_delta_facing,
-            active_link,prim_path=None):
+                accum_delta_x, accum_delta_y, accum_delta_facing,
+                active_link, prim_path=None):
         """
-        Create a directed link *self → target* and append it to self.links.
-        Extra‑verbose debug version.
+        Create a directed link self → target and append it to self.links.
+        Debug prints included.
         """
-        # ---------- raw deltas -------------------------------------------------
-        print("\n[LINK]  create  from Exp{:d}  to Exp{:d}".format(self.id, target.id))
-        print("       Δx={:+.3f}  Δy={:+.3f}  Δθ={:+.3f}  (rad)".format(
-            accum_delta_x, accum_delta_y, accum_delta_facing))
-        print("       self.pos = ({:+.3f},{:+.3f},{:+.3f})".format(
-            self.x_m, self.y_m, self.facing_rad))
-        print("       tgt.pos  = ({:+.3f},{:+.3f},{:+.3f})".format(
-            target.x_m, target.y_m, target.facing_rad))
+        print(f"\n[DEBUG][link_to] from Exp{self.id} to Exp{target.id}")
+        print(f"   deltas: dx={accum_delta_x:.3f}, dy={accum_delta_y:.3f}, dtheta={accum_delta_facing:.3f}")
+        print(f"   self.map=({self.x_m:.3f},{self.y_m:.3f},{self.facing_rad:.3f}), target.map=({target.x_m:.3f},{target.y_m:.3f},{target.facing_rad:.3f})")
 
-        # ---------- geometry ---------------------------------------------------
+        # geometry
         d = np.hypot(accum_delta_x, accum_delta_y)
         abs_heading = np.arctan2(accum_delta_y, accum_delta_x)
         heading_rad = signed_delta_rad(self.facing_rad, abs_heading)
         facing_rad  = signed_delta_rad(self.facing_rad, accum_delta_facing)
 
-        print("       abs_heading={:+.3f}  heading_rad={:+.3f}".format(
-            abs_heading, heading_rad))
-        print("       link length d = {:.3f}".format(d))
-        print("       link facing   = {:+.3f}".format(facing_rad))
+        print(f"   computed abs_heading={abs_heading:.3f}, heading_rad={heading_rad:.3f}, d={d:.3f}, facing_rad={facing_rad:.3f}")
 
-        # ---------- build & store link ----------------------------------------
-        link = ExperienceLink(self, target,
-                            facing_rad=facing_rad,
-                            d=d,
-                            heading_rad=heading_rad,
-                            active_link=active_link,
-                            path=prim_path)
-
+        link = ExperienceLink(
+            parent=self,
+            target=target,
+            facing_rad=facing_rad,
+            d=d,
+            heading_rad=heading_rad,
+            active_link=active_link,
+            path=prim_path
+        )
         self.links.append(link)
-        print("       -> stored as  d={:.3f}, head={:+.3f}, face={:+.3f}, "
-            "active={}".format(link.d, link.heading_rad,
-                                link.facing_rad, link.active_link))
-        print("       _\n")
-        
-    def __repr__(self):
-        # return "[ {} {} {} {} ]".format(self.id, self.x_m, self.y_m,
-        # self.facing_rad)
-        return "[{}]".format(self.id)
+        print(f"   [DEBUG] Stored link: {link}")
 
-    def update_link(self,link, e1):
-        #must change link both way 
-        if link.active_link == True:
+    def __repr__(self):
+        return f"[Exp {self.id}]"
+
+    def update_link(self, link, e1):
+        print(f"[DEBUG][update_link] Exp{self.id} updating link to Exp{e1.id}")
+        if link.active_link:
             delta_x = e1.x_m - self.x_m
             delta_y = e1.y_m - self.y_m
         else:
             delta_x = self.x_m - e1.x_m
-            delta_y = self.y_m - e1.y_m 
+            delta_y = self.y_m - e1.y_m
         delta_facing = signed_delta_rad(self.facing_rad, e1.facing_rad)
-        print('in update link',self.facing_rad, e1.facing_rad, delta_facing)
+        print(f"   deltas: dx={delta_x:.3f}, dy={delta_y:.3f}, dtheta={delta_facing:.3f}")
 
-        
-        link.d = np.sqrt(delta_x**2 + delta_y**2)
-        link.heading_rad = signed_delta_rad(
-            self.facing_rad,
-            np.arctan2(delta_y, delta_x)
-        )
-        link.facing_rad = signed_delta_rad(
-            self.facing_rad,
-            delta_facing
-        )
+        link.d = np.hypot(delta_x, delta_y)
+        link.heading_rad = signed_delta_rad(self.facing_rad, np.arctan2(delta_y, delta_x))
+        link.facing_rad = delta_facing
+        print(f"   updated link: {link}")
         return link
 
+
 class ExperienceLink(object):
-    '''A representation of connection between experiences.'''
+    '''Connection between two experiences, with debug prints.'''
 
-    def __init__(self, parent, target, facing_rad, d, heading_rad, active_link, path):
-        '''Initializes the link.
-
-        :param parent: the Experience object that owns this link.
-        :param target: the target Experience object.
-        :param facing_rad: the angle (in radians) in the map context.
-        :param d: the euclidean distance between the Experiences.
-        :param heading_rad: the angle (in radians) between the Experiences.
-        :param active_link: wether we use this link for dist correction or it's an inverse direction link used to have a bidirectional connection
-        '''
-        self.parent = parent
-        self.target = target
-        self.facing_rad = facing_rad
-        self.d = d
-        self.heading_rad = heading_rad
-        self.active_link = active_link
-        # Store the forward primitive sequence (A→B)
+    def __init__(self, parent, target,
+                 facing_rad, d, heading_rad,
+                 active_link,
+                 path=None):
+        self.parent       = parent
+        self.target       = target
+        self.facing_rad   = facing_rad
+        self.d            = d
+        self.heading_rad  = heading_rad
+        self.active_link  = active_link
+        # Store primitive paths
         self.path_forward = path or []
-        # And the reverse: invert primitives in reverse order
         self.path_reverse = []
         for act in reversed(self.path_forward):
             if act == 'forward':
@@ -184,26 +162,35 @@ class ExperienceLink(object):
                 self.path_reverse.append('right')
             elif act == 'right':
                 self.path_reverse.append('left')
+        print(f"[DEBUG][ExperienceLink __init__] Created link {self.parent.id}->{self.target.id}")
+        print(f"   path_forward={self.path_forward}, path_reverse={self.path_reverse}")
+
     def __repr__(self):
-        bf = list(self.path_forward)
-        br = list(self.path_reverse)
         return (f"Link({self.parent.id}->{self.target.id}, d={self.d:.2f}, "
                 f"head={self.heading_rad:.2f}, face={self.facing_rad:.2f}, "
-                f"prims={bf}, rev={br})")
+                f"prims={self.path_forward}, rev={self.path_reverse})")
 
 
 class ExperienceMap(object):
-    '''Experience Map module.'''
+    '''Experience Map module with debug prints.'''
 
     def __init__(self, dim_xy=61, dim_th=36,
-                 delta_exp_threshold=1.0, delta_pc_threshold= 1.0, correction=0.5, loops=100,
-                 constant_adjust=False,replay_buffer=None, **kwargs):
-        '''Initializes the experience map.'''
+                 delta_exp_threshold=1.0, delta_pc_threshold=1.0,
+                 correction=0.5, loops=100,
+                 constant_adjust=False,
+                 replay_buffer=None,
+                 **kwargs):
+        print("[DEBUG][ExperienceMap __init__] initializing with replay_buffer=", bool(replay_buffer))
         self.replay_buffer = replay_buffer
+        self._recent_prims: list[str] = []
+
+        self.last_link_action= None
+        self.last_real_pose= None
+        self.last_imagined_pose= None
+        # existing fields
         self.DIM_XY = dim_xy
         self.DIM_TH = dim_th
-
-        self.DELTA_EXP_THRESHOLD = 3.5
+        self.DELTA_EXP_THRESHOLD = delta_exp_threshold
         self.DELTA_PC_THRESHOLD = delta_pc_threshold
         self.CORRECTION = correction
         self.LOOPS = loops
@@ -212,110 +199,203 @@ class ExperienceMap(object):
         self.size = 0
         self.exps = []
         self.ghost_exps = []
-
         self.current_exp = None
         self.current_view_cell = None
-
         self.accum_delta_x = 0
         self.accum_delta_y = 0
-        self.accum_delta_facing = np.pi / 2
-
+        self.accum_delta_facing = np.pi/2
         
-    def _create_exp(self, x_pc, y_pc, th_pc, view_cell, local_pose,imagined_pose=None,
-                    real_pose=None):
-        '''Creates a new Experience object.
 
-        This method creates a new experience object, which will be a point the
-        map.
+    def _create_exp(self, x_pc, y_pc, th_pc,
+                    view_cell, local_pose):
+        imagined = self.last_real_pose
+        real     = self.last_imagined_pose
 
-        :param x_pc: index x of the current pose cell.
-        :param y_pc: index y of the current pose cell.
-        :param th_pc: index th of the current pose cell.
-        :param view_cell: the last most activated view cell.
-        :return: the new Experience object.
-        '''
+        print("\n[DEBUG][_create_exp] creating new experience")
         self.size += 1
-        x_m = self.accum_delta_x
-        y_m = self.accum_delta_y
-        facing_rad = clip_rad_180(self.accum_delta_facing)
+        x_m = self.accum_delta_x + (self.current_exp.x_m if self.current_exp else 0)
+        y_m = self.accum_delta_y + (self.current_exp.y_m if self.current_exp else 0)
+        facing_rad = signed_delta_rad(self.accum_delta_facing, 0)
 
+        print(f"   posed at cell=({x_pc},{y_pc},{th_pc}), map=({x_m:.3f},{y_m:.3f},{facing_rad:.3f})")
+        exp = Experience(
+            x_pc, y_pc, th_pc,
+            x_m, y_m, facing_rad,
+            view_cell, local_pose, ghost_exp=False,
+            imagined_pose=imagined,
+            real_pose=real,
+            pose_cell_pose=[x_pc,y_pc,th_pc]
+        )
         if self.current_exp is not None:
-            x_m += self.current_exp.x_m
-            y_m += self.current_exp.y_m
-        print('in exp create local init_location', local_pose )
-        exp = Experience(x_pc, y_pc, th_pc, x_m, y_m, facing_rad, view_cell, local_pose, ghost_exp=False,imagined_pose=None,
-                    real_pose=None,
-                    pose_cell_pose=None)
+            prim_path = self._get_recent_prims(self.current_exp.id, exp.id)
 
-        if self.current_exp is not None:
-            prim_path=self._get_recent_prims(self.current_exp.id, exp.id)
-            path_reverse = []
-            for act in reversed(self.path_forward):
-                if act == 'forward':
-                    self.path_reverse.append('forward')
-                elif act == 'left':
-                    self.path_reverse.append('right')
-                elif act == 'right':
-                    self.path_reverse.append('left')
-            #connect from prev to newly created exp
+            # 2) plus the last “link action” (never present in buffer yet)
+            if self.last_link_action is not None:
+                final = self._map_raw_action(self.last_link_action)
+                print(f"  [DEBUG3] appending last_link_action -> {final}")
+                prim_path.append(final)
+
+            # 3) debug print & link as before
+            print(f"   [DEBUG][_create_exp] final prim_path = {prim_path}")
+            print(f"   [DEBUG] recent prims for Exp{self.current_exp.id}->{exp.id} = {prim_path}")
+            prim_clean= self.net_effect_simplify(prim_path)
+            # forward link
             self.current_exp.link_to(
-                exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing, active_link=True,prim_path=prim_path)
-            #and vice versa
+                exp,
+                self.accum_delta_x,
+                self.accum_delta_y,
+                self.accum_delta_facing,
+                active_link=True,
+                prim_path=prim_clean
+            )
+            # backward link
+            rev = [ {'forward':'forward','left':'right','right':'left'}[p] for p in reversed(prim_clean) ]
             exp.link_to(
-                self.current_exp, - self.accum_delta_x, - self.accum_delta_y, self.current_exp.facing_rad, active_link=False,prim_path=path_reverse)
-            try:
-                print('linked exp', self.current_exp.id,' to ', self.current_exp.links[-1].target.id, 'f,h,d:', self.current_exp.links[-1].facing_rad, self.current_exp.links[-1].heading_rad, self.current_exp.links[-1].d)
-                print('inverse link exp', exp.id,' to ', exp.links[-1].target.id, 'f,h,d:', exp.links[-1].facing_rad, exp.links[-1].heading_rad, exp.links[-1].d)
-            except AttributeError:
-                pass
+                self.current_exp,
+                -self.accum_delta_x,
+                -self.accum_delta_y,
+                self.current_exp.facing_rad,
+                active_link=False,
+                prim_path=rev
+            )
         self.exps.append(exp)
-        if view_cell is not None:
+        if view_cell:
             view_cell.exps.append(exp)
-        
-
+        print(f"[DEBUG][_create_exp] total experiences = {len(self.exps)}")
         return exp
+    def net_effect_simplify(self,raw_prims, start_pose=(0,0,0)):
+        """
+        raw_prims: List[str] of 'forward' / 'left' / 'right'
+        start_pose: (x0, y0, theta0) all ints; theta in {0:E,1:S,2:W,3:N}
+        
+        Returns a minimal sequence:
+        1) shortest turn(s) to match final heading
+        2) then round(hypot) forwards
+        """
+        # 1) Simulate to get final pose
+        x0, y0, theta0 = start_pose
+        x, y, theta = x0, y0, theta0
+        # direction unit‐vectors for 0:E,1:S,2:W,3:N
+        DIRS = [(1,0),(0,1),(-1,0),(0,-1)]
+        for prim in raw_prims:
+            if prim == 'forward':
+                dx, dy = DIRS[theta]
+                x += dx
+                y += dy
+            elif prim == 'left':
+                theta = (theta - 1) % 4
+            elif prim == 'right':
+                theta = (theta + 1) % 4
+
+        # 2) Drop adjacent cancelling turns in the raw trace
+        cleaned = []
+        for p in raw_prims:
+            if cleaned and ((cleaned[-1]=='left' and p=='right') 
+                            or (cleaned[-1]=='right' and p=='left')):
+                cleaned.pop()   # cancel out
+            else:
+                cleaned.append(p)
+
+        # 3) Compute net deltas
+        dx = x - x0
+        dy = y - y0
+        dtheta = (theta - theta0) % 4
+
+        # 4) Build minimal turn sequence
+        turns = []
+        if dtheta == 1:
+            turns = ['right']
+        elif dtheta == 3:
+            turns = ['left']
+        elif dtheta == 2:
+            # choose two rights (could also be two lefts)
+            turns = ['right','right']
+        # dtheta == 0 → no turn
+
+        # 5) Number of forwards = straight‐line distance
+        n_forw = round(math.hypot(dx, dy))
+
+        # 6) Final plan
+        minimal = turns + ['forward'] * n_forw
+
+        # debug print
+        print(f"[net_effect_simplify] simulated to ({x},{y},{theta}), "
+            f"Δ=({dx},{dy},Δθ={dtheta}), "
+            f"cleaned len={len(cleaned)} → minimal={minimal}")
+
+        return minimal
     def _map_raw_action(self, raw):
-        """
-        Turn whatever was stored under 'action' into one of
-        the strings 'forward', 'left', or 'right'.
-        """
-        # 1) One–hot lists or tuples of length 3
-        if isinstance(raw, (list, tuple)) and len(raw) == 3:
+        # unchanged
+        if isinstance(raw, (list, tuple)) and len(raw)==3:
             idx = max(range(3), key=lambda i: raw[i])
-            return ['forward', 'right', 'left'][idx]
-
-        # 2) Integers (gym_minigrid: 0=left, 1=right, 2=forward)
+            return ['forward','right','left'][idx]
         if isinstance(raw, int):
-            return {0: 'left',  1: 'right',  2: 'forward'}.get(raw, 'forward')
-
-        # 3) Already a string?
-        if isinstance(raw, str):
+            return {0:'left',1:'right',2:'forward'}.get(raw,'forward')
+        if isinstance(raw,str):
             low = raw.lower()
             if 'forw' in low: return 'forward'
             if 'left' in low: return 'left'
-            if 'right'  in low: return 'right'
-
-        # 4) Fallback default
+            if 'right' in low: return 'right'
         return 'forward'
 
     def _get_recent_prims(self, u_id: int, v_id: int) -> list[str]:
         """
-        Look in self.replay_buffer (the same list object 
-        injected from MinigridInteraction) for the last
-        occurrence of node_id=u_id followed immediately 
-        by node_id=v_id.  Return [primitive] or [].
+        1) Try to find the exact span where we went u_id → v_id (as before).
+        2) If we’ve not yet recorded v_id in the buffer, fall back to
+           “all actions performed while in u_id,” so that we capture
+           the entire drift inside u_id before the final leave.
         """
         rb = self.replay_buffer or []
-        # Walk backwards so we pick the most recent transition first
-        for i in range(len(rb) - 1, 0, -1):
-            prev = rb[i-1]
-            cur  = rb[i]
-            if prev.get('node_id') == u_id and cur.get('node_id') == v_id:
-                raw = cur.get('action', prev.get('action'))
-                prim = self._map_raw_action(raw)
-                return [prim]
-        # No matching transition found
-        return []
+        L  = len(rb)
+        print(f"[DEBUG3][_get_recent_prims] buffer length = {L}, looking for transition {u_id}->{v_id}")
+
+        # ——— Attempt the exact u→v slice ———
+        entry_idx = None
+        for i in range(L-1, -1, -1):
+            if rb[i].get('node_id') == v_id:
+                entry_idx = i
+                break
+
+        if entry_idx is not None:
+            # (existing logic: scan back to find start_idx, u_idx, etc.)
+            start_idx = entry_idx
+            while start_idx > 0 and rb[start_idx - 1].get('node_id') == v_id:
+                start_idx -= 1
+
+            # find last time we were at u_id
+            u_idx = None
+            for j in range(start_idx - 1, -1, -1):
+                if rb[j].get('node_id') == u_id:
+                    u_idx = j
+                    break
+
+            action_seq = []
+            if u_idx is not None:
+                for k in range(u_idx + 1, start_idx + 1):
+                    raw  = rb[k].get('action')
+                    prim = self._map_raw_action(raw)
+                    action_seq.append(prim)
+                    print(f"  [DEBUG3] idx {k-1}->{k}: nodes {rb[k-1]['node_id']}->{rb[k]['node_id']},"
+                          f" raw_action={raw} -> prim={prim}")
+            print(f"  [DEBUG3] collected buffer‐based prims = {action_seq}")
+            return action_seq
+
+        # ——— Fallback: we haven’t even seen v_id yet ———
+        print(f"  [DEBUG3] never saw v_id={v_id} in buffer; collecting actions while in u_id={u_id}")
+        seq = []
+        # walk backwards while still in u_id
+        idx = L - 1
+        while idx >= 0 and rb[idx].get('node_id') == u_id:
+            raw  = rb[idx].get('action')
+            prim = self._map_raw_action(raw)
+            # prepend to build chronological order
+            seq.insert(0, prim)
+            print(f"  [DEBUG3] idx {idx-1}->{idx}: nodes {rb[idx-1]['node_id'] if idx>0 else '??'}->{u_id},"
+                  f" raw_action={raw} -> prim={prim}")
+            idx -= 1
+
+        print(f"  [DEBUG3] collected same‐node prims = {seq}")
+        return seq
 
     def _create_ghost_exp(self, x_m, y_m, facing_rad, linked_exp = None):
         '''Creates a new Experience object.
