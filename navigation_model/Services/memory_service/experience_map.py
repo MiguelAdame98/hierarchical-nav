@@ -37,7 +37,13 @@ import math
 from operator import itemgetter
 from .modules import *
 from sys import maxsize
-
+import math
+import heapq
+import torch
+from collections import namedtuple
+State = namedtuple("State", ["x","y","d"])
+DIR_VECS = [(1,0),(0,1),(-1,0),(0,-1)]
+ACTIONS   = ["forward","left","right"]
 
 class Experience(object):
     '''A single experience.'''
@@ -66,9 +72,9 @@ class Experience(object):
         self.init_local_position = local_pose
 
         # New pose attributes
-        self.imagined_pose   = imagined_pose
-        self.real_pose       = real_pose
-        self.pose_cell_pose  = [x_pc, y_pc, th_pc]
+        self.imagined_pose= imagined_pose
+        self.real_pose= real_pose
+        self.pose_cell_pose= [x_pc, y_pc, th_pc]
 
         # Link list
         self.links = []
@@ -181,6 +187,7 @@ class ExperienceMap(object):
                  replay_buffer=None,
                  **kwargs):
         print("[DEBUG][ExperienceMap __init__] initializing with replay_buffer=", bool(replay_buffer))
+        
         self.replay_buffer = replay_buffer
         self._recent_prims: list[str] = []
 
@@ -208,8 +215,8 @@ class ExperienceMap(object):
 
     def _create_exp(self, x_pc, y_pc, th_pc,
                     view_cell, local_pose):
-        imagined = self.last_real_pose
-        real     = self.last_imagined_pose
+        imagined = tuple(self.last_imagined_pose)
+        real     = tuple(self.last_real_pose)
 
         print("\n[DEBUG][_create_exp] creating new experience")
         self.size += 1
@@ -218,6 +225,7 @@ class ExperienceMap(object):
         facing_rad = signed_delta_rad(self.accum_delta_facing, 0)
 
         print(f"   posed at cell=({x_pc},{y_pc},{th_pc}), map=({x_m:.3f},{y_m:.3f},{facing_rad:.3f})")
+        print(view_cell.id)
         exp = Experience(
             x_pc, y_pc, th_pc,
             x_m, y_m, facing_rad,
@@ -238,7 +246,23 @@ class ExperienceMap(object):
             # 3) debug print & link as before
             print(f"   [DEBUG][_create_exp] final prim_path = {prim_path}")
             print(f"   [DEBUG] recent prims for Exp{self.current_exp.id}->{exp.id} = {prim_path}")
-            prim_clean= self.net_effect_simplify(prim_path)
+            # 1) simulate where your raw prims would have taken you
+            start_state = self.simulate_prims_to_state(prim_path,
+                            start_state=State(0, 0, 0))
+            # 2) set your goal to “back at origin + default heading”
+            goal_state  = State(0, 0, 0)
+
+            # 3) run A* over (x,y,d)-space using the same egocentric collision check
+            egocentric_process = self.manager.egocentric_process
+            prim_clean = self.astar_prims(
+                start_state,
+                goal_state,
+                egocentric_process=egocentric_process,
+                num_samples=5
+            )
+
+            print(f"[DEBUG][_create_exp]  A* → {prim_clean!r}",prim_path )
+            rev = [ {'forward':'forward','left':'right','right':'left'}[p] for p in reversed(prim_clean) ]
             # forward link
             self.current_exp.link_to(
                 exp,
@@ -246,84 +270,50 @@ class ExperienceMap(object):
                 self.accum_delta_y,
                 self.accum_delta_facing,
                 active_link=True,
-                prim_path=prim_clean
+                prim_path=rev
             )
             # backward link
-            rev = [ {'forward':'forward','left':'right','right':'left'}[p] for p in reversed(prim_clean) ]
+            
             exp.link_to(
                 self.current_exp,
                 -self.accum_delta_x,
                 -self.accum_delta_y,
                 self.current_exp.facing_rad,
                 active_link=False,
-                prim_path=rev
+                prim_path=prim_clean
             )
         self.exps.append(exp)
         if view_cell:
             view_cell.exps.append(exp)
         print(f"[DEBUG][_create_exp] total experiences = {len(self.exps)}")
         return exp
-    def net_effect_simplify(self,raw_prims, start_pose=(0,0,0)):
+    def simulate_prims_to_state(self, raw_prims: list[str],
+                             start_state: State = State(0,0,0)
+                            ) -> State:
         """
-        raw_prims: List[str] of 'forward' / 'left' / 'right'
-        start_pose: (x0, y0, theta0) all ints; theta in {0:E,1:S,2:W,3:N}
-        
-        Returns a minimal sequence:
-        1) shortest turn(s) to match final heading
-        2) then round(hypot) forwards
+        Runs through raw_prims (‘forward’/’left’/’right’) starting from start_state,
+        returns the final State(x,y,d).
         """
-        # 1) Simulate to get final pose
-        x0, y0, theta0 = start_pose
-        x, y, theta = x0, y0, theta0
-        # direction unit‐vectors for 0:E,1:S,2:W,3:N
-        DIRS = [(1,0),(0,1),(-1,0),(0,-1)]
+        x, y, d = start_state.x, start_state.y, start_state.d
         for prim in raw_prims:
             if prim == 'forward':
-                dx, dy = DIRS[theta]
-                x += dx
-                y += dy
+                dx, dy = DIR_VECS[d]
+                x += dx; y += dy
             elif prim == 'left':
-                theta = (theta - 1) % 4
+                d = (d - 1) % 4
             elif prim == 'right':
-                theta = (theta + 1) % 4
-
-        # 2) Drop adjacent cancelling turns in the raw trace
-        cleaned = []
-        for p in raw_prims:
-            if cleaned and ((cleaned[-1]=='left' and p=='right') 
-                            or (cleaned[-1]=='right' and p=='left')):
-                cleaned.pop()   # cancel out
-            else:
-                cleaned.append(p)
-
-        # 3) Compute net deltas
-        dx = x - x0
-        dy = y - y0
-        dtheta = (theta - theta0) % 4
-
-        # 4) Build minimal turn sequence
-        turns = []
-        if dtheta == 1:
-            turns = ['right']
-        elif dtheta == 3:
-            turns = ['left']
-        elif dtheta == 2:
-            # choose two rights (could also be two lefts)
-            turns = ['right','right']
-        # dtheta == 0 → no turn
-
-        # 5) Number of forwards = straight‐line distance
-        n_forw = round(math.hypot(dx, dy))
-
-        # 6) Final plan
-        minimal = turns + ['forward'] * n_forw
-
-        # debug print
-        print(f"[net_effect_simplify] simulated to ({x},{y},{theta}), "
-            f"Δ=({dx},{dy},Δθ={dtheta}), "
-            f"cleaned len={len(cleaned)} → minimal={minimal}")
-
-        return minimal
+                d = (d + 1) % 4
+        return State(x, y, d)
+    
+    def get_pose(self, exp_id: int) -> tuple[float, float, float]:
+        """
+        Return the (x_m, y_m, facing_rad) of the Experience with id==exp_id
+        """
+        for exp in self.exps:
+            if exp.id == exp_id:
+                return exp.real_pose
+        raise KeyError(f"No experience with id={exp_id}")
+    
     def _map_raw_action(self, raw):
         # unchanged
         if isinstance(raw, (list, tuple)) and len(raw)==3:
@@ -895,9 +885,7 @@ class ExperienceMap(object):
                             self.accum_delta_y = (self.current_exp.y_m + self.accum_delta_y) - matched_exp.y_m
                             self.current_exp=matched_exp
                         else:
-                            print("Creating new experience because no exp within metric gate")
-                            if view_cell_copy is None:
-                                view_cell_copy = view_cell      
+                            print("Creating new experience because no exp within metric gate")    
                             matched_exp = self._create_exp(x_pc, y_pc, th_pc,
                                                         view_cell_copy, local_pose)
                             self.current_exp   = matched_exp
@@ -1120,3 +1108,88 @@ class ExperienceMap(object):
                 
                 linked_exp.link_to(
                 exp,accum_delta_x,accum_delta_y,accum_delta_facing, active_link=False)
+
+    def heuristic(self, s: State, g: State) -> float:
+        # Manhattan distance + minimal turn cost
+        manh = abs(s.x - g.x) + abs(s.y - g.y)
+        turn = min((s.d - g.d) % 4, (g.d - s.d) % 4)
+        return manh + turn
+
+    def astar_prims(
+    self,
+    start: State,
+    goal:  State,
+    egocentric_process,
+    num_samples: int = 5
+    ) -> list[str]:
+        """
+        A* in (x,y,dir)-space, but we skip ANY forward candidate
+        whose entire prefix fails the egocentric collision check.
+        """
+        print(f"[A*] start={start}  goal={goal}")
+        open_pq = [(self.heuristic(start, goal), 0, start, [])]  # (f, g, state, seq)
+        g_score = { start: 0 }
+        closed   = set()
+        step = 0
+
+        # helper: pack a list of 'forward'/'left'/'right' into a (T,3) float tensor
+        def to_onehot_tensor(seq: list[str]) -> torch.Tensor:
+            mapping = {'forward': [1,0,0], 'right': [0,1,0], 'left': [0,0,1]}
+            return torch.tensor([mapping[a] for a in seq], dtype=torch.float32)
+
+        while open_pq:
+            f, g, (x,y,d), seq = heapq.heappop(open_pq)
+            print(f"[A*][{step}] POP  state={State(x,y,d)}  g={g}  f={f}  seq={seq!r}")
+            step += 1
+
+            if (x,y,d) in closed:
+                print("    SKIP (closed)")
+                continue
+            closed.add((x,y,d))
+
+            # success only if we've reached the right cell and the correct orientation
+            if (x, y, d) == (goal.x, goal.y, goal.d):
+                print(f"[A*] reached goal at step {step} → seq={seq!r}")
+                return seq
+
+            for act in ("left","right","forward"):
+                if act == "forward":
+                    dx, dy = DIR_VECS[d]
+                    nx, ny, nd = x + dx, y + dy, d
+                elif act == "left":
+                    nx, ny, nd = x, y, (d - 1) % 4
+                else:  # right
+                    nx, ny, nd = x, y, (d + 1) % 4
+
+                ns = State(nx, ny, nd)
+                print(f"    try {act!r} -> next={ns}", end="")
+
+                if (nx,ny,nd) in closed:
+                    print("   SKIP (closed)")
+                    continue
+
+                new_seq = seq + [act]
+
+                # **egocentric** collision check
+                tensor = to_onehot_tensor(new_seq)               # shape (T,3)
+                safe   = egocentric_process.egocentric_policy_assessment(
+                            tensor, num_samples=num_samples
+                        )
+                if safe.shape[0] < tensor.shape[0]:
+                    print("   SKIP (ego-collision)")
+                    continue
+
+                # accept → push into open
+                g2 = g + 1
+                h2 = self.heuristic(ns, goal)
+                f2 = g2 + h2
+                old = g_score.get(ns, float("inf"))
+                if g2 < old:
+                    g_score[ns] = g2
+                    print(f"   PUSH g={g2} h={h2} f={f2} seq={new_seq!r}")
+                    heapq.heappush(open_pq, (f2, g2, ns, new_seq))
+                else:
+                    print(f"   SKIP (worse g: {g2} ≥ {old})")
+
+        print("[A*] no path found → returning empty")
+        return []

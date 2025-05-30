@@ -423,12 +423,22 @@ class TorchedViewCells(object):
                 return None, None
 
             print("[VC]  Fallback – no observation; stay on prev_cell")
-            # option: re‑match to ensure ID still valid
             min_score, i = self.get_closest_template(
                 self.templates[self.prev_cell.id, :])
-            if i != self.prev_cell.id:
-                self.prev_cell = self.cells[i]
-            return self.prev_cell, None
+
+            matched_cell = self.cells[i]
+            cell_bis = None
+
+            if matched_cell != self.prev_cell:
+                print("[VC]  Fallback match is different → optional duplicate for ambiguity handling")
+                matched_cell.decay += self.ACTIVE_DECAY
+                cell_bis = self.create_cell(self.templates[matched_cell.id, :],
+                                            matched_cell.x_pc,
+                                            matched_cell.y_pc,
+                                            matched_cell.th_pc)
+                self.prev_cell = matched_cell
+
+            return self.prev_cell, cell_bis
 
         # ------------------------------------------------------------------------
         # 2.  Convert observation to tensor

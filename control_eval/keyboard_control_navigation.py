@@ -12,7 +12,12 @@ import gym_minigrid
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch.nn.functional as F
+from skimage.metrics import structural_similarity as ssim
+from scipy.spatial.distance import cosine
+import cv2
 import random
+import math
 import heapq
 from collections import namedtuple
 State = namedtuple("State", ["x","y","d"])
@@ -21,7 +26,7 @@ from nltk.parse.generate import generate
 from gym_minigrid.wrappers import ImgActionObsWrapper, RGBImgPartialObsWrapper
 from gym_minigrid.window import Window
 from collections import deque
-
+from copy import deepcopy
 from control_eval.input_output import *
 from collections import Counter
 from navigation_model.Processes.motion_path_modules import action_to_pose
@@ -38,7 +43,7 @@ from navigation_model.Services.model_modules import no_vel_no_action
 from navigation_model.visualisation_tools import (
     convert_tensor_to_matplolib_list, transform_policy_from_hot_encoded_to_str,
     visualise_image,visualize_replay_buffer)
-from copy import deepcopy
+from control_eval.HierarchicalHMMBOCPD import HierarchicalBayesianController
 
 
 def print_keys_explanation():
@@ -70,7 +75,14 @@ class MinigridInteraction():
         self.auto_move = False
         self.goal_test = []
         self.replay_buffer = []  # List to store recent state dictionaries.
+        self.agent_current_pose=None
         self.buffer_size = 600
+        ###3META
+        self.hmm_bayes = HierarchicalBayesianController()
+        self.hmm_bayes.key=self
+        self.current_plan = []
+        self.plan_step_idx = 0
+        self.last_pose = None
        
         #TODO: ALLOW USER TO SET ITS PREFERRED OB WTOUT ACCESSING CODE
         #Since 255 is the max value of any colour, we don't care about the above value of white
@@ -112,6 +124,7 @@ class MinigridInteraction():
         self.env = ImgActionObsWrapper(self.env)
         self.window = Window(self.env_name)
         self.seed = args.seed
+
         self.reset()
 
         self.windows_key_handler()
@@ -542,63 +555,11 @@ class MinigridInteraction():
         
         return pose_history
 
-    def debug_recompute_all_paths(self):
-        """
-        For every pair of connected experiences u→v in the map,
-        re‐plan with A* and compare to the stored primitive sequences.
-        """
-        mg       = self.models_manager.memory_graph
-        emap     = mg.experience_map
-        exps     = emap.exps
-        ego      = self.models_manager.egocentric_process
-        samples  = getattr(self.models_manager, "num_samples", 5)
-
-        if len(exps) <= 1:
-            print("[DEBUG] only {} experience(s), skipping path recomputation".format(len(exps)))
-            return
-
-        print(f"[DEBUG] recomputing paths across {len(exps)} experiences…")
-        for exp in exps:
-            for link in exp.links:
-                u_id = exp.id
-                v_id = link.target.id
-
-                print(f"\n[DEBUG] Link {u_id} → {v_id}")
-                print("    stored forward:", link.path_forward)
-                print("    stored reverse:", link.path_reverse)
-
-                # Extract real poses (must have been injected into Experience.real_pose)
-                start_pose = getattr(exp,        "real_pose", None)
-                goal_pose  = getattr(link.target, "real_pose", None)
-                if start_pose is None or goal_pose is None:
-                    print("    ✖ missing real_pose for exp", u_id, "or", v_id)
-                    continue
-
-                # Discretize into State(x:int, y:int, d:int)
-                s0 = State(int(round(start_pose[0])),
-                           int(round(start_pose[1])),
-                           int(round(start_pose[2])))
-                g0 = State(int(round(goal_pose[0])),
-                           int(round(goal_pose[1])),
-                           int(round(goal_pose[2])))
-                print("    start_state =", s0, " goal_state =", g0)
-
-                # Recompute forward
-                new_fwd = self.astar_prims(s0, g0, ego, num_samples=samples)
-                print("    new forward:", new_fwd,
-                      "✅" if new_fwd == link.path_forward else "❌")
-
-                # Recompute reverse
-                new_rev = self.astar_prims(g0, s0, ego, num_samples=samples)
-                print("    new reverse:", new_rev,
-                      "✅" if new_rev == link.path_reverse else "❌")
-
-        print("\n[DEBUG] path recomputation complete.")
 
     def agent_step(self, action) -> tuple[bool,dict]:
         print('step in world:', self.step_count())
         print('action to apply:',action)
-        
+        prev = self.last_pose
         #bridge = CvBridge()
         #img_msg = rospy.wait_for_message("/camera/depth_registered/rgb/image_raw", Image, timeout=10)
         #img_bgr = bridge.imgmsg_to_cv2(img_msg, desired_encoding='passthrough')
@@ -607,6 +568,9 @@ class MinigridInteraction():
         obs, _, _, _ = self.env.step(action)
         print(obs.keys(),obs["pose"], obs["image"].shape)
         obs = no_vel_no_action(obs)
+        self.agent_current_pose=obs["pose"]
+        pos = obs['pose']
+        self.last_pose = pos
         emap = self.models_manager.memory_graph.experience_map
         emap.last_link_action     = action
         emap.last_real_pose       = obs["pose"]
@@ -631,33 +595,17 @@ class MinigridInteraction():
         'imagined_image': self.models_manager.get_best_place_hypothesis()['image_predicted'],
         'action':action}
         self.update_replay_buffer(current_state)
-        self.debug_recompute_all_paths()
+        hmm_info_gain=self.info_gain(obs['image'],obs['pose'], self.replay_buffer, self.models_manager.memory_graph)
+        hmm_plan_progress=self.plan_progress_placeholder()
+        current_mode,stats=self.hmm_bayes.update(self.replay_buffer,hmm_info_gain,hmm_plan_progress)
+        print(current_mode,stats)
+
         if self.step_count()>20:
             grammar = self.build_pcfg_from_memory()
             self.print_adaptive_pcfg_plans(grammar)
             
         return self.models_manager.agent_lost(), obs
-
-    def print_adaptive_pcfg_plans(self,grammar, max_trials=5, initial_depth=4, max_depth_limit=25):
-        print("[DEBUG] Attempting to generate plans adaptively...")
-
-        depth = initial_depth
-        while depth <= max_depth_limit:
-            try:
-                plans = list(generate(grammar, depth=depth))
-                if plans:
-                    print(f"[PLAN DEBUG] {len(plans)} plans found at depth {depth}:")
-                    for i, plan in enumerate(plans):
-                        print(f"  Plan {i+1}: {' '.join(plan)}")
-                    #return plans  # Optionally return for use
-                else:
-                    print(f"[PLAN DEBUG] No plans at depth {depth}. Increasing depth...")
-            except Exception as e:
-                print(f"[PLAN DEBUG] Generation failed at depth {depth}: {e}")
-            depth += 2  # Increase search depth gradually
-
-        print("[PLAN DEBUG] No valid plans found up to max depth limit.")
-        return []    
+    
     def apply_policy(self, policy:list, n_actions:int, collect_data:bool=False)->tuple[list,bool]:
         motion_data = []
         agent_lost = False
@@ -1006,153 +954,270 @@ class MinigridInteraction():
     
 
     def build_pcfg_from_memory(self):
-        mg = self.models_manager.memory_graph
-        emap = mg.experience_map
-        current_id = mg.get_current_exp_id()
-        exps_by_dist = mg.get_exps_organised(current_id)
-        all_exps = emap.exps
+        mg      = self.models_manager.memory_graph
+        emap    = mg.experience_map
+        current = mg.get_current_exp_id()
+        exps_by_dist = mg.get_exps_organised(current)
+        all_exps     = emap.exps
 
-        # --- Build graph from experience links ---
-        graph = {exp.id: [link.target.id for link in exp.links] for exp in all_exps}
+        # 1) Abstract graph & distance priors
+        graph = {e.id: [l.target.id for l in e.links] for e in all_exps}
         print("[PCFG DEBUG] graph:", graph)
 
-        # --- Distance-based priors ---
-        id_to_dist = {}
-        total_weight = 0
-        for exp in exps_by_dist:
-            dist = (exp['x'] ** 2 + exp['y'] ** 2) ** 0.5
-            id_to_dist[exp['id']] = dist
-            total_weight += 1.0 / (dist + 1e-5)
+        id_to_dist  = {}
+        total_w = 0.0
+        for d in exps_by_dist:
+            dist = math.hypot(d['x'], d['y'])
+            id_to_dist[d['id']] = dist
+            total_w += 1.0/(dist + 1e-5)
 
-        # --- Grammar rule collection ---
+        # 2) Top‐level: EXPLORE→NAVPLAN and NAVPLAN→GOTOₜ
         rules = defaultdict(list)
         rules['EXPLORE'].append(('NAVPLAN', 1.0))
+        for tgt, dist in id_to_dist.items():
+            p = (1.0/(dist+1e-5)) / total_w
+            rules['NAVPLAN'].append((f'GOTO_{tgt}', p))
+            rules[f'GOTO_{tgt}'].append((f'MOVESEQ_{current}_{tgt}', 1.0))
 
-        for target_id, dist in id_to_dist.items():
-            prob = (1.0 / (dist + 1e-5)) / total_weight
-            rules['NAVPLAN'].append((f'GOTO_{target_id}', prob))
-            rules[f'GOTO_{target_id}'].append((f'MOVESEQ_{current_id}_{target_id}', 1.0))
-
-        # --- Collect known STEP transitions ---
-        step_rules = set()
-        for exp in all_exps:
-            for link in exp.links:
-                src = exp.id
-                dst = link.target.id
-                lhs = f'STEP_{src}_{dst}'
-                rhs = f"'step({src},{dst})'"
-                step_rules.add((lhs, rhs, 1.0))
-
-        # --- Helper: Path-finding (BFS for simplicity) ---
-        def find_paths(graph, start, goal, max_depth=15, max_paths=15):
-            paths = []
-            queue = deque([[start]])
-            while queue and len(paths) < max_paths:
-                path = queue.popleft()
-                last = path[-1]
-                if last == goal:
+        # 3) BFS helper on abstract graph
+        def find_paths(start, goal, max_depth=15, max_paths=10):
+            paths, q = [], deque([[start]])
+            while q and len(paths)<max_paths:
+                path = q.popleft()
+                if path[-1]==goal:
                     paths.append(path)
-                elif len(path) < max_depth:
-                    for neighbor in graph.get(last, []):
-                        if neighbor not in path:
-                            queue.append(path + [neighbor])
+                elif len(path)<max_depth:
+                    for nb in graph.get(path[-1],[]):
+                        if nb not in path:
+                            q.append(path+[nb])
             return paths
 
-        # --- Generate MOVESEQ rules via all valid path permutations ---
-        for target_id in id_to_dist:
-            moveseq_lhs = f"MOVESEQ_{current_id}_{target_id}"
-            paths = find_paths(graph, current_id, target_id)
-            if paths:
-                valid_paths = 0
-                for path in paths:
-                    steps = [f"STEP_{a}_{b}" for a, b in zip(path, path[1:])]
-                    if steps:  # <-- This avoids empty RHS productions
-                        rhs = " ".join(steps)
-                        rules[moveseq_lhs].append((rhs, 1.0))  # temp prob
-                        valid_paths += 1
-                if valid_paths > 0:
-                    # Normalize the probabilities
-                    for i in range(len(rules[moveseq_lhs])):
-                        rhs, _ = rules[moveseq_lhs][i]
-                        rules[moveseq_lhs][i] = (rhs, 1.0 / valid_paths)
-                else:
-                    # No valid (non-empty) paths → skip adding the rule
-                    continue
+        # 4) Gather all abstract paths and their edges
+        hop_edges = set()
+        hopseqs   = {}
+        for tgt in id_to_dist:
+            paths = find_paths(current, tgt)
+            hopseqs[tgt] = paths
+            for path in paths:
+                for u,v in zip(path, path[1:]):
+                    hop_edges.add((u,v))
+        hop_edges.add((current, current))
+
+        # 4a) MOVESEQ_current→tgt → HOPSEQ_current→tgt
+        for tgt in id_to_dist:
+            lhs = f'MOVESEQ_{current}_{tgt}'
+            rules[lhs].append((f'HOPSEQ_{current}_{tgt}', 1.0))
+
+        # 4b) HOPSEQ_current→tgt → STEP_u_v … but *prefix* (current→current)
+        for tgt, paths in hopseqs.items():
+            lhs = f'HOPSEQ_{current}_{tgt}'
+            if not paths and current!=tgt:
+                # no path found
+                rules[lhs].append((f'STEP_{current}_{tgt}', 1.0))
+                hop_edges.add((current, tgt))
             else:
-                # Fallback to direct step if needed
-                if current_id != target_id:  # avoid MOVESEQ_X_X -> []
-                    rhs = f"STEP_{current_id}_{target_id}"
-                    rules[moveseq_lhs].append((rhs, 1.0))
-                    step_rules.add((rhs, f"'step({current_id},{target_id})'", 1.0))
-        # --- Optional: hand-coded paths ---
-        hardcoded_paths = {
-            f'MOVESEQ_{current_id}_18': [f'STEP_{current_id}_19', 'STEP_19_18'],
-            f'MOVESEQ_{current_id}_3':  [f'STEP_{current_id}_5', 'STEP_5_4', 'STEP_4_3'],
-        }
-        for lhs, steps in hardcoded_paths.items():
-            if lhs not in rules:
-                rhs = " ".join(steps)
+                w = 1.0/len(paths) if paths else 1.0
+                for path in paths:
+                    # *** here’s the dummy “first hop” ***
+                    hops = [(current, current)] + list(zip(path, path[1:]))
+                    seq = [f'STEP_{u}_{v}' for u,v in hops]
+                    rhs = " ".join(seq)
+                    rules[lhs].append((rhs, w))
+                    print(f"[PCFG DEBUG] HOPSEQ {lhs} ← {hops} → {seq}")
+
+        # 5) STEP_u_v → primitives OR fallback
+        for (u,v) in hop_edges:
+            lhs = f'STEP_{u}_{v}'
+            prims = self.get_primitives(u, v)
+            if prims:
+                rhs = " ".join(f"'{p}'" for p in prims)
                 rules[lhs].append((rhs, 1.0))
-                for step in steps:
-                    s, d = step.replace("STEP_", "").replace("'", "").split("_")
-                    step_rules.add((step, f"'step({s},{d})'", 1.0))
+                print(f"[PCFG DEBUG] STEP_{u}_{v} → prims {prims}")
+            else:
+                rules[lhs].append((f"'step({u},{v})'", 1.0))
+                print(f"[PCFG DEBUG] STEP_{u}_{v} → fallback 'step({u},{v})'")
 
-        # --- Final assembly of PCFG string ---
+        # 6) Optional hard‐coded extras
+        hard = {
+        f'MOVESEQ_{current}_18': [f"step({current},19)","step(19,18)"],
+        f'MOVESEQ_{current}_3' : [f"step({current},5)","step(5,4)","step(4,3)"],
+        }
+        for lhs, steps in hard.items():
+            if lhs not in rules:
+                rhs = " ".join(f"'{s}'" for s in steps)
+                rules[lhs].append((rhs, 1.0))
+                print(f"[PCFG DEBUG] hardcoded {lhs} → {steps}")
+
+        # 7) Assemble into PCFG
         pcfg_lines = []
-        for lhs, productions in rules.items():
-            total = sum(prob for _, prob in productions)
-            for rhs, prob in productions:
-                norm_prob = prob / total if total > 0 else 1.0
-                pcfg_lines.append(f"{lhs} -> {rhs} [{norm_prob:.4f}]")
+        for lhs, prods in rules.items():
+            total = sum(p for _,p in prods)
+            for rhs,p in prods:
+                pcfg_lines.append(f"{lhs} -> {rhs} [{p/total:.4f}]")
 
-        for lhs, rhs, prob in step_rules:
-            pcfg_lines.append(f"{lhs} -> {rhs} [{prob:.4f}]")
+        grammar_src = "\n".join(pcfg_lines)
+        print("[PCFG DEBUG] Final grammar:\n" + grammar_src)
+        return PCFG.fromstring(grammar_src)
+        
+    '''def build_pcfg_from_memory(self):
+        mg      = self.models_manager.memory_graph
+        emap    = mg.experience_map
+        current = mg.get_current_exp_id()
+        exps_by_dist = mg.get_exps_organised(current)
+        all_exps     = emap.exps
 
-        print("[PCFG DEBUG] Final grammar string:\n" + "\n".join(pcfg_lines))
-        grammar = PCFG.fromstring("\n".join(pcfg_lines))
-        return grammar
+        # 1) Abstract graph & distance priors
+        graph = {e.id: [l.target.id for l in e.links] for e in all_exps}
+        print("[PCFG DEBUG] graph:", graph)
+
+        id_to_dist  = {}
+        total_weight = 0.0
+        for d in exps_by_dist:
+            dist = math.hypot(d['x'], d['y'])
+            id_to_dist[d['id']] = dist
+            total_weight += 1.0 / (dist + 1e-5)
+
+        # 2) Top‐level productions
+        rules = defaultdict(list)
+        rules['EXPLORE'].append(('NAVPLAN', 1.0))
+        for tgt, dist in id_to_dist.items():
+            p = (1.0/(dist+1e-5)) / total_weight
+            rules['NAVPLAN'].append((f'GOTO_{tgt}', p))
+            rules[f'GOTO_{tgt}'].append((f'MOVESEQ_{current}_{tgt}', 1.0))
+
+        # 3) BFS helper on abstract graph
+        def find_paths(graph, start, goal, max_depth=15, max_paths=15):
+            paths, queue = [], deque([[start]])
+            while queue and len(paths) < max_paths:
+                path = queue.popleft()
+                if path[-1] == goal:
+                    paths.append(path)
+                elif len(path) < max_depth:
+                    for nb in graph.get(path[-1], []):
+                        if nb not in path:
+                            queue.append(path + [nb])
+            return paths
+
+        # 4) MOVESEQ: only first hop uses get_primitives; rest use stored link.path_forward
+        for tgt in id_to_dist:
+            lhs = f"MOVESEQ_{current}_{tgt}"
+            prods = []
+
+            # a) try all abstract routes
+            for path in find_paths(graph, current, tgt):
+                seq = []
+                hops = list(zip(path, path[1:]))
+                # a) try all abstract routes, *prefixed* by (current→current)
+                for path in find_paths(graph, current, tgt):
+                    seq = []
+                    # force a dummy “hop” that will get you from your real pose into your canonical
+                    # current-node pose via get_primitives(current,current)
+                    hops = [(current, current)] + list(zip(path, path[1:]))
+
+                #  a.1) first hop: from real pose → first node
+                for u, v in hops:
+                    prims = self.get_primitives(u, v)
+                    if prims:
+                        seq.extend(prims)
+                    else:
+                        # fallback to a single step‐token if no stored or computed primitives
+                        seq.append(f"step({u},{v})")
+
+
+                # Flatten into a quoted‐terminals RHS
+                rhs = " ".join(f"'{tok}'" for tok in seq)
+                prods.append(rhs)
+                print(f"[PCFG DEBUG] path {path} → prims {seq}")
+
+            # b) if we got at least one flattened seq, normalize & emit
+            if prods:
+                w = 1.0/len(prods)
+                for rhs in prods:
+                    rules[lhs].append((rhs, w))
+                continue
+
+            # c) fallback if no abstract route found
+            if current != tgt:
+                rhs = f"'step({current},{tgt})'"
+                rules[lhs].append((rhs, 1.0))
+                print(f"[PCFG DEBUG] forced fallback for {lhs}")
+
+        # 5) optional hard‐coded extras (unchanged)
+        hard = {
+            f'MOVESEQ_{current}_18': [f"step({current},19)","step(19,18)"],
+            f'MOVESEQ_{current}_3' : [f"step({current},5)","step(5,4)","step(4,3)"],
+        }
+        for lhs, steps in hard.items():
+            if lhs not in rules:
+                rhs = " ".join(f"'{s}'" for s in steps)
+                rules[lhs].append((rhs,1.0))
+                print(f"[PCFG DEBUG] hardcoded {lhs} -> {steps}")
+
+        # 6) Assemble PCFG
+        pcfg_lines = []
+        for lhs, prods in rules.items():
+            total_p = sum(p for _,p in prods)
+            for rhs,p in prods:
+                pcfg_lines.append(f"{lhs} -> {rhs} [{p/total_p:.4f}]")
+
+        grammar_src = "\n".join(pcfg_lines)
+        print("[PCFG DEBUG] Final grammar:\n" + grammar_src)
+        return PCFG.fromstring(grammar_src)'''
     
     def get_primitives(self, u: int, v: int) -> list[str]:
         """
-        Return the best primitive sequence for traversing the edge u→v.
-        1) If we’ve already stored a path in the ExperienceLink, return it.
-        2) Try the replay‐buffer lookup.
-        3) Try compass rollout.
-        4) Finally, BFS/A* fallback.
+        Return the best primitive sequence for traversing the edge u→v:
+
+        0) If we’ve already stored a path in the ExperienceLink, return it.
+        1) Otherwise, build a fresh A* plan from *our real pose* → node v.
+        2) Cache it in the link and return.
         """
         emap = self.models_manager.memory_graph.experience_map
 
-        # --- 0) stored ExperienceLink? -------------------------------------
+        # 0) do we already have a stored primitive path?
         link = self._find_link(u, v)
         if link and link.path_forward:
-            print(f"[get_primitives] using cached path for {u}->{v}: {link.path_forward}")
+            print(f"[get_primitives] cached path for {u}->{v}: {link.path_forward}")
             return list(link.path_forward)
 
-        # --- 2) greedy compass --------------------------------------------
-        cur_pose  = (*self.env.agent_pos, self.env.agent_dir)
-        goal_pose = self.mem_graph.get_pose(v)   # assume this returns (x,y,θ) or at least (x,y)
-        cg = self.compass_prims(cur_pose, goal_pose, self.env)
-        if self._reaches(cg, goal_pose):
-            print(f"[get_primitives] compass succeeded for {u}->{v}: {cg}")
-            emap.add_prims(u, v, cg)
-            return cg
+        # 1) No cache → build an A* state from our current *real* pose
+        real = self.agent_current_pose 
+        if real is None:
+            raise RuntimeError("No last_real_pose available for A* start!")
+        sx, sy, sd = real
+        start = State(int(round(sx)), int(round(sy)), int(sd))
 
-        # --- 3) BFS / A* in (x,y,θ) -----------------------------------------
-        bf = self._bfs_prims(u, v, max_depth=20)
-        print(f"[get_primitives] BFS fallback for {u}->{v}: {bf}")
-        emap.add_prims(u, v, bf)
-        return bf
+        # target node’s stored map pose
+        gx, gy, gd = emap.get_pose(v)
+        goal = State(int(round(gx)), int(round(gy)), int(gd))
+
+        print(f"[get_primitives] no cache {u}->{v}, A* from {start} → {goal}")
+
+        # 2) Run your egocentric‐aware A*:
+        prims = self.astar_prims(
+            start,
+            goal,
+            self.models_manager.egocentric_process,
+            num_samples=5
+        )
+
+        print(f"[get_primitives] A* returned for {u}->{v}: {prims}")
+
+        return prims
 
 
     def _find_link(self, u: int, v: int):
-        """Scan the experience_map for an ExperienceLink u→v (or return None)."""
-        for exp in self.models_manager.memory_graph.experience_map:
+        """
+        Scan your ExperienceMap for a u→v link; return it or None.
+        """
+        emap = self.models_manager.memory_graph.experience_map
+        for exp in emap.exps:
             if exp.id == u:
                 for link in exp.links:
                     if link.target.id == v:
                         return link
-    
         return None
+
 
 
 
@@ -1172,6 +1237,7 @@ class MinigridInteraction():
     egocentric_process,
     num_samples: int = 5
     ) -> list[str]:
+        
         """
         A* in (x,y,dir)-space, but we skip ANY forward candidate
         whose entire prefix fails the egocentric collision check.
@@ -1197,8 +1263,8 @@ class MinigridInteraction():
                 continue
             closed.add((x,y,d))
 
-            # success if we've reached the right cell (ignore final θ)
-            if (x,y) == (goal.x, goal.y):
+            # success only if we've reached the right cell and the correct orientation
+            if (x, y, d) == (goal.x, goal.y, goal.d):
                 print(f"[A*] reached goal at step {step} → seq={seq!r}")
                 return seq
 
@@ -1243,21 +1309,316 @@ class MinigridInteraction():
 
         print("[A*] no path found → returning empty")
         return []
+    
+    
+
+    # ---------------------------------------------------------------------
+    #  TOP-LEVEL INFORMATION-GAIN WRAPPER
+    # ---------------------------------------------------------------------
+    def info_gain(
+            self,
+            current_image,
+            current_pose,
+            replay_buffer,
+            view_cells_manager,
+            device: str = "cpu",
+            weights: dict | None = None,
+    ):
+        """
+        Compute an information-gain score for the agent’s current observation,
+        with abundant DEBUG prints along the way.
+        """
+        print(f"[INFO-GAIN DEBUG] replay_buffer size = {len(replay_buffer)}")
+
+        if weights is None:
+            weights = {"visual": 0.5, "spatial": 0.3, "temporal": 0.2}
+        print(f"[INFO-GAIN DEBUG] weights      : {weights}")
+
+        # normalise pose to dict --------------------------------------------------
+        if isinstance(current_pose, (tuple, list)):
+            current_pose = self._pose_to_dict(current_pose)
+
+        # components --------------------------------------------------------------
+        visual_novelty = self.calculate_visual_novelty(
+            current_image, replay_buffer, device)
+        print(f"[INFO-GAIN DEBUG] visual_novelty = {visual_novelty:.4f}")
+
+        spatial_novelty = self.calculate_spatial_novelty(
+            current_image, current_pose, view_cells_manager, device)
+        print(f"[INFO-GAIN DEBUG] spatial_novelty = {spatial_novelty:.4f}")
+
+        temporal_novelty = self.calculate_temporal_novelty(
+            current_image, replay_buffer, device)
+        print(f"[INFO-GAIN DEBUG] temporal_novelty = {temporal_novelty:.4f}")
+
+        # weighted average --------------------------------------------------------
+        info_gain_score = (
+            weights["visual"]   * visual_novelty +
+            weights["spatial"]  * spatial_novelty +
+            weights["temporal"] * temporal_novelty
+        )
+        info_gain_score = float(np.clip(info_gain_score, 0.0, 1.0))
+
+        print(f"[INFO-GAIN DEBUG] --> info_gain_score = {info_gain_score:.4f}")
+        print("[INFO-GAIN DEBUG] =================================================\n")
+        return info_gain_score
+
+
+    # ---------------------------------------------------------------------
+    #  VISUAL NOVELTY
+    # ---------------------------------------------------------------------
+    def calculate_visual_novelty(
+            self,
+            current_image,
+            replay_buffer,
+            device,
+            top_k: int = 10,
+    ):
+        print("\n  [VISUAL DEBUG] -------------------------------")
+        if not replay_buffer:
+            print("  [VISUAL DEBUG] replay_buffer empty → novelty = 1.0")
+            return 1.0
+
+        current_features = self.extract_image_features(current_image, device)
+        
+        similarities = []
+        for idx, state in enumerate(replay_buffer[-top_k:]):
+            real_img = state.get("real_image")
+            if real_img is None:
+                continue
+            real_feat = self.extract_image_features(real_img, device)
+            sim = self.compute_feature_similarity(current_features, real_feat)
+            similarities.append(sim)
+            print(f"  [VISUAL DEBUG]   state {-top_k+idx}: sim_real={sim:.4f}")
+
+        if not similarities:
+            print("  [VISUAL DEBUG] no comparable images → novelty = 1.0")
+            return 1.0
+
+        max_sim = max(similarities)
+        novelty = 1.0 - max_sim
+        print(f"  [VISUAL DEBUG] max_similarity={max_sim:.4f}  → novelty={novelty:.4f}")
+        return novelty
+
+
+    # ---------------------------------------------------------------------
+    #  SPATIAL NOVELTY
+    # ---------------------------------------------------------------------
+    def calculate_spatial_novelty(
+            self,
+            current_image,
+            current_pose,
+            view_cells_manager,
+            device,
+    ):
+        print("\n  [SPATIAL DEBUG] ------------------------------")
+
+        cells = getattr(getattr(view_cells_manager, "view_cells", None), "cells", [])
+        if not cells:
+            print("  [SPATIAL DEBUG] no view-cells → novelty = 1.0")
+            return 1.0
+
+        current_feat = self.extract_image_features(current_image, device)
+        novelties = []
+
+        for c_idx, cell in enumerate(cells):
+            if not cell.exemplars:
+                continue
+
+            sims = []
+            for ex in cell.exemplars[-3:]:
+                ex_feat = self.extract_image_features(ex, device)
+                sim = self.compute_feature_similarity(current_feat, ex_feat)
+                sims.append(sim)
+
+            if not sims:
+                continue
+
+            max_sim = max(sims)
+            if max_sim > 0.7:
+                print(f"  [SPATIAL DEBUG] current_pose={current_pose}  "
+                f"cell_pose=({cell.x_pc:.2f},{cell.y_pc:.2f},{cell.th_pc:.2f})")
+                dist = self.calculate_pose_distance(
+                    current_pose,
+                    {"x": cell.x_pc, "y": cell.y_pc, "theta": cell.th_pc})
+                novelty = 0.8 if dist > 2.0 else 0.2
+                novelties.append(novelty)
+                print(f"  [SPATIAL DEBUG] cell {c_idx:3d}: "
+                    f"max_sim={max_sim:.3f}  dist={dist:.2f}  novelty={novelty:.2f}")
+
+        if not novelties:
+            print("  [SPATIAL DEBUG] no visually similar cells → novelty = 0.6")
+            return 0.6
+
+        mean_novelty = float(np.mean(novelties))
+        print(f"  [SPATIAL DEBUG] mean spatial novelty = {mean_novelty:.4f}")
+        return mean_novelty
+
+
+    # ---------------------------------------------------------------------
+    #  TEMPORAL NOVELTY
+    # ---------------------------------------------------------------------
+    def calculate_temporal_novelty(
+            self,
+            current_image,
+            replay_buffer,
+            device,
+            decay_factor: float = 0.9,
+    ):
+        
+        if not replay_buffer:
+            print("  [TEMPORAL DEBUG] replay_buffer empty → novelty = 1.0")
+            return 1.0
+
+        current_feat = self.extract_image_features(current_image, device)
+        score = 1.0
+        for i, state in enumerate(reversed(replay_buffer[-20:])):
+            img = state.get("real_image")
+            if img is None:
+                continue
+            feat = self.extract_image_features(img, device)
+            sim = self.compute_feature_similarity(current_feat, feat)
+            w = decay_factor ** i
+            score *= (1.0 - sim * w * 0.5)
+
+        score = float(np.clip(score, 0.0, 1.0))
+        print(f"  [TEMPORAL DEBUG] final temporal novelty = {score:.4f}")
+        return score
+
+
+    # ---------------------------------------------------------------------
+    #  FEATURE EXTRACTION (with heavy validation prints)
+    # ---------------------------------------------------------------------
+    def extract_image_features(self, img, device="cpu"):
+        """
+        Convert *anything* the code might hand us into the standard 64-D
+        descriptor produced by `rgb56_to_template64`.
+
+        Accepted inputs
+        ----------------
+        • 56×56×3 RGB/BGR   (numpy or torch)  ← main camera frame
+        • (3,56,56)         (numpy or torch)  ← CHW layout
+        • 1-D length-64     (numpy or torch)  ← already a template
+        • list / tuple with the above inside
+        """
+        # ---------- unwrap list/tuple -----------------------------------
+        if isinstance(img, (list, tuple)):
+            img = np.asarray(img)
+
+        # ---------- already a 64-D vector? ------------------------------
+        if torch.is_tensor(img) and img.ndim == 1 and img.numel() == 64:
+            vec = img.detach().cpu().float().numpy()
+            return vec / (np.linalg.norm(vec) + 1e-8)
+
+        if isinstance(img, np.ndarray) and img.ndim == 1 and img.size == 64:
+            vec = img.astype(np.float32)
+            return vec / (np.linalg.norm(vec) + 1e-8)
+
+        # ---------- otherwise convert the 56×56×3 image -----------------
+        vec64_torch = self.models_manager.rgb56_to_template64(img, device=device)
+        vec64 = vec64_torch.detach().cpu().float().numpy()
+        return vec64 / (np.linalg.norm(vec64) + 1e-8)
+
+
+    # ---------------------------------------------------------------------
+    #  SIMILARITY + POSE DISTANCE (unchanged, but with prints if desired)
+    # ---------------------------------------------------------------------
+    def compute_feature_similarity(self, f1, f2):
+        if len(f1) != len(f2):
+            return 0.5
+        sim = 1.0 - cosine(f1, f2)
+        return float(np.clip(sim, 0.0, 1.0))
+
+    def _pose_to_dict(self, p):
+        """
+        Accepts:
+            • {'x':…, 'y':…, 'theta':…}
+            • (x, y, theta)   tuple / list
+            • np.ndarray shape (3,)
+            • torch.Tensor  shape (3,)
+        Returns a plain Python dict with float values.
+        """
+        if isinstance(p, dict):
+            return {"x": float(p["x"]), "y": float(p["y"]), "theta": float(p["theta"])}
+        if isinstance(p, (list, tuple)) and len(p) == 3:
+            return {"x": float(p[0]), "y": float(p[1]), "theta": float(p[2])}
+        if isinstance(p, np.ndarray) and p.size == 3:
+            return {"x": float(p[0]), "y": float(p[1]), "theta": float(p[2])}
+        if torch.is_tensor(p) and p.numel() == 3:
+            p = p.detach().cpu().float().tolist()
+            return {"x": p[0], "y": p[1], "theta": p[2]}
+        raise ValueError(f"_pose_to_dict: unsupported pose format {type(p)}")
+    def calculate_pose_distance(self, pose1, pose2):
+        p1 = self._pose_to_dict(pose1)
+        p2 = self._pose_to_dict(pose2)
+
+        pos = np.hypot(p1["x"] - p2["x"], p1["y"] - p2["y"])
+        ang = abs(p1["theta"] - p2["theta"])
+        ang = min(ang, 2 * np.pi - ang)
+        return pos + 0.5 * ang
+    
+    def plan_progress_hybrid(self,current_pose, goal_pose, plan_adherence_score, time_efficiency):
+        """
+        Hybrid approach combining multiple factors
+        """
+        if current_pose is None or goal_pose is None:
+            return 0.0
+        
+        # Distance component (0-1)
+        distance_progress = self.calculate_distance_progress(current_pose, goal_pose)
+        
+        # Plan adherence component (0-1)
+        adherence_progress = max(0.0, min(1.0, plan_adherence_score))
+        
+        # Time efficiency component (0-1)
+        efficiency_progress = max(0.0, min(1.0, time_efficiency))
+        
+        # Weighted combination
+        progress = (0.5 * distance_progress + 
+                    0.3 * adherence_progress + 
+                    0.2 * efficiency_progress)
+        
+        return min(1.0, max(0.0, progress))
+    def plan_progress_placeholder(replay_buffer=None, current_pose=None, goal_pose=None):
+        
+        # Simple placeholder logic - returns moderate progress
+        # You can replace this with your actual progress calculation
+        
+        if current_pose is None or goal_pose is None:
+            return 0.5  # Default moderate progress when no position info
+        
+        # Very basic distance-based progress (replace with your logic)
+        try:
+            if isinstance(current_pose, (list, tuple)) and isinstance(goal_pose, (list, tuple)):
+                dx = float(goal_pose[0]) - float(current_pose[0])
+                dy = float(goal_pose[1]) - float(current_pose[1])
+                distance = (dx**2 + dy**2)**0.5
+                
+                # Simple progress based on distance (assumes max distance of 10 units)
+                progress = max(0.0, 1.0 - distance / 10.0)
+                return min(1.0, progress)
+        except (IndexError, TypeError, ValueError):
+            pass
+        
+        # Fallback to moderate progress
+        return 0.5
+
+
+            
 
 
 
 
+    #-----------__MAIN -----------------------------------------------------------------------------------------------------------
+    def main():
+        try:
+            args = parser.parse_args()
+            test = MinigridInteraction(args)
 
-#-----------__MAIN -----------------------------------------------------------------------------------------------------------
-def main():
-    try:
-        args = parser.parse_args()
-        test = MinigridInteraction(args)
+        finally:
+            pass
 
-    finally:
-        pass
-
-if __name__ == "__main__":
-# instantiating the decorator
-    main()
-  
+    if __name__ == "__main__":
+    # instantiating the decorator
+        main()
+    

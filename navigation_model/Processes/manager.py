@@ -17,9 +17,10 @@ from navigation_model.Services.memory_service.memory_graph import MemoryGraph
 from navigation_model.Services.model_modules import torch_observations, sample_ob
 from navigation_model.visualisation_tools import convert_tensor_to_matplolib_list, visualise_image
 
+egocentric_process = None
 class Manager():
     def __init__(self, allo_model_config:dict, memory_graph_config:dict, env_actions:list, env:str, lookahead:int=5, replay_buffer=None) :
-
+        global egocentric_process
         self.empty_memory = True
         self.num_samples = 5
         self.env_relevant_ob = {}
@@ -31,12 +32,13 @@ class Manager():
         device = torch.device('cpu')
         #ego config //STATIC//
         self.egocentric_process = init_egocentric_process(env_actions, device)
-
+        egocentric_process = self.egocentric_process
         #ALLO config 
         self.allocentric_process, self.std_place_th = init_allocentric_process(allo_model_config, self.env_specific, device)
         self.replay_buffer = replay_buffer
         #MemoryGraph initialisation
         self.memory_graph = MemoryGraph(**memory_graph_config) 
+        self.memory_graph.experience_map.manager = self
         self.memory_graph.experience_map.replay_buffer = self.replay_buffer
 
         self.observations_keys = list(set(self.allocentric_process.get_observations_keys()) | \
@@ -276,26 +278,25 @@ class Manager():
         # ------------------------------------------------------------------ #
         # 1. Make sure we have HWC uint8                                     #
         # ------------------------------------------------------------------ #
-        print(f"[DBG] raw in  {type(img)}, shape={getattr(img,'shape',None)}, "
-            f"dtype={getattr(img,'dtype',None)}")
+
 
         if torch.is_tensor(img):
             if img.shape == (3, 56, 56):                      # CHW tensor
                 img = img.permute(1, 2, 0).contiguous().cpu().numpy()
-                print("[DBG] permuted CHW→HWC, now", img.shape)
+                
             else:
                 img = img.cpu().numpy()
-                print("[DBG] tensor already HWC → numpy")
+                
         else:
             if img.shape == (3, 56, 56):                      # CHW numpy
                 img = np.transpose(img, (1, 2, 0))
-                print("[DBG] numpy CHW→HWC, now", img.shape)
+                
 
         assert img.shape == (56, 56, 3), f"expected 56×56×3, got {img.shape}"
 
         if img.dtype != np.uint8:
             img = (img * 255.0).round().astype(np.uint8)
-            print("[DBG] scaled to uint8")
+            
 
         # ------------------------------------------------------------------ #
         # 2. 16-bin Lab histograms (48 dims)                                 #
@@ -312,7 +313,6 @@ class Manager():
 
         h48 = np.concatenate([h_L, h_a, h_b]).astype(np.float32)
         h48 /= h48.sum() + eps
-        print(f"[DBG] hist L1-norm={h48.sum():.3f}")
 
         # ------------------------------------------------------------------ #
         # 3. 4×4 Sobel-edge energy (16 dims)                                 #
@@ -352,7 +352,7 @@ class Manager():
         #=== UPDATE MAP WITH CURRENT BELIEF ===#
         slam_obs = {"place": None, 'pose': None, "HEaction": observations['action'].cpu().detach().numpy(), "image":None}
         print("This is the place descriptor [0] that updates the memory graph", place_descriptor["pose"])
-        print("this is the stable distribution in std place th compared to the place descriptor std ", self.std_place_th)
+        print("this is the stable distribution in std place th compared to the place descriptor std ", place_descriptor['std'] < self.std_place_th,place_descriptor['std'], self.std_place_th)
         #if we have only 1 place hypothesis and we have a stable distribution
         if (not self.agent_lost() and place_descriptor['std'] < self.std_place_th):
             print("slam before changes",place_descriptor['post'].shape )
