@@ -2,6 +2,7 @@ import numpy as np
 from collections import defaultdict, deque
 from typing import Dict, List, Tuple, Optional
 import time
+import torch
 from scipy import stats
 
 class TrueHierarchicalHMMWithBOCPD:
@@ -49,8 +50,9 @@ class TrueHierarchicalHMMWithBOCPD:
         self.max_run_length = 50
         self.run_length_dist = np.zeros(self.max_run_length + 1)
         self.run_length_dist[0] = 1.0
-        self.hazard_rate = 1.0 / 25.0
+        self.hazard_rate = 1.0 / 15.0
         self.changepoint_threshold = 0.1
+        self.step_counter =0
         
         # Evidence and history tracking for BOCPD
         self.evidence_buffer = deque(maxlen=100)
@@ -67,6 +69,8 @@ class TrueHierarchicalHMMWithBOCPD:
         self.exploration_attempts = 0
         self.navigation_attempts = 0
         self.recovery_attempts = 0
+
+        self.prev_evidence = None 
         
         # Parameters for behavior detection
         self.params = {
@@ -139,49 +143,99 @@ class TrueHierarchicalHMMWithBOCPD:
             
         return base_persistence
     
-    def _get_intra_mode_transition(self, mode: str, from_sub: str, to_sub: str) -> float:
-        """Probability of switching submodes within the same mode"""
-        base_prob = 0.05  # Low base probability
-        
+    def _get_intra_mode_transition(self, mode: str,
+                               from_sub: str, to_sub: str) -> float:
+        """
+        Directed sub-mode transitions.
+        Values are *unnormalised* weights; the caller
+        will re-scale the entire row so it sums to 1.
+        """
+
+        # ---------- EXPLORE ---------------------------------------------------
         if mode == 'EXPLORE':
-            # Define natural submode progressions within exploration
             transitions = {
-                'ego_allo': {'ego_allo_lookahead': 0.15, 'short_term_memory': 0.1, 'astar_directed': 0.05},
-                'ego_allo_lookahead': {'ego_allo': 0.1, 'astar_directed': 0.1},
-                'short_term_memory': {'ego_allo': 0.1, 'astar_directed': 0.15},
-                'astar_directed': {'ego_allo': 0.1, 'short_term_memory': 0.05}
+                'ego_allo': {
+                    'ego_allo_lookahead': 0.25,   # Natural progression
+                    'short_term_memory': 0.05,
+                    'astar_directed':    0.02
+                },
+                'ego_allo_lookahead': {
+                    'astar_directed':    0.20,
+                    'ego_allo':          0.08,
+                    'short_term_memory': 0.02
+                },
+                'short_term_memory': {
+                    'ego_allo':          0.15,
+                    'astar_directed':    0.10,
+                    'ego_allo_lookahead':0.05
+                },
+                'astar_directed': {
+                    'ego_allo':          0.05,
+                    'short_term_memory': 0.02,
+                    'ego_allo_lookahead':0.08
+                }
             }
+
+        # ---------- NAVIGATE ---------------------------------------------------
         elif mode == 'NAVIGATE':
+            # “distant_node → plan_following → unvisited_priority → distant_node”
             transitions = {
-                'distant_node': {'unvisited_priority': 0.1, 'plan_following': 0.05},
-                'unvisited_priority': {'distant_node': 0.1, 'plan_following': 0.1},
-                'plan_following': {'distant_node': 0.08, 'unvisited_priority': 0.05}
+                'distant_node': {
+                    'plan_following':     0.25,
+                    'unvisited_priority': 0.05
+                },
+                'plan_following': {
+                    'unvisited_priority': 0.20,
+                    'distant_node':       0.08
+                },
+                'unvisited_priority': {
+                    'distant_node':       0.15,
+                    'plan_following':     0.05
+                }
             }
+
+        # ---------- RECOVER ----------------------------------------------------
         elif mode == 'RECOVER':
+            # Simple toggle: solve_doubt ⇄ backtrack_safe (fast)
             transitions = {
-                'solve_doubt': {'backtrack_safe': 0.2},
-                'backtrack_safe': {'solve_doubt': 0.25}
+                'solve_doubt':   {'backtrack_safe': 0.35},
+                'backtrack_safe':{'solve_doubt':   0.40}
             }
+
+        # ---------- TASK_SOLVING ----------------------------------------------
         elif mode == 'TASK_SOLVING':
+            # funnel towards 'task_completion'
             transitions = {
-                'goal_directed': {'systematic_search': 0.05, 'task_completion': 0.02},
-                'systematic_search': {'goal_directed': 0.08, 'task_completion': 0.05},
-                'task_completion': {'goal_directed': 0.03, 'systematic_search': 0.03}
+                'goal_directed': {
+                    'systematic_search': 0.05,
+                    'task_completion':   0.20
+                },
+                'systematic_search': {
+                    'goal_directed':     0.08,
+                    'task_completion':   0.25
+                },
+                'task_completion': {
+                    'goal_directed':     0.03,
+                    'systematic_search': 0.03
+                }
             }
+
+        # ---------- default ----------------------------------------------------
         else:
             transitions = {}
-            
-        return transitions.get(from_sub, {}).get(to_sub, base_prob)
+
+        # default tiny weight for unspecified off-diagonal hops
+        return transitions.get(from_sub, {}).get(to_sub, 0.01)
     
     def _get_inter_mode_transition(self, from_mode: str, from_sub: str, to_mode: str, to_sub: str) -> float:
         """Probability of transitioning between modes"""
         
         # Base inter-mode transition probabilities
         mode_transitions = {
-            'EXPLORE': {'NAVIGATE': 0.15, 'RECOVER': 0.05, 'TASK_SOLVING': 0.05},
-            'NAVIGATE': {'EXPLORE': 0.1, 'RECOVER': 0.15, 'TASK_SOLVING': 0.05},
-            'RECOVER': {'EXPLORE': 0.2, 'NAVIGATE': 0.2, 'TASK_SOLVING': 0.05},
-            'TASK_SOLVING': {'EXPLORE': 0.05, 'NAVIGATE': 0.05, 'RECOVER': 0.05}
+            'EXPLORE': {'NAVIGATE': 0.15, 'RECOVER': 0.09, 'TASK_SOLVING': 0.01},
+            'NAVIGATE': {'EXPLORE': 0.1, 'RECOVER': 0.19, 'TASK_SOLVING': 0.01},
+            'RECOVER': {'EXPLORE': 0.6, 'NAVIGATE': 0.2, 'TASK_SOLVING': 0.01},
+            'TASK_SOLVING': {'EXPLORE': 0.05, 'NAVIGATE': 0.01, 'RECOVER': 0.09}
         }
         
         base_mode_prob = mode_transitions.get(from_mode, {}).get(to_mode, 0.01)
@@ -214,40 +268,101 @@ class TrueHierarchicalHMMWithBOCPD:
     
     def _get_emission_params_for_state(self, mode: str, submode: str) -> Dict:
         """
-        Updated emission parameters - removed reward-based parameters, 
-        made evidence mode-specific
+        Emission parameters with strong differentiation *within* every mode.
+        Tune means/σ to your empirical logs.
         """
-        
+
+        # ─────────────────────────────  EXPLORE  ──────────────────────────
         if mode == 'EXPLORE':
-            return {
-                'info_gain': {'mean': 0.4, 'std': 0.2},
-                'stagnation': {'mean': 0.3, 'std': 0.2},
-                'exploration_productivity': {'mean': 0.4, 'std': 0.2},
-                'lost_prob': 0.2,
-                'loop_prob': 0.3,
-                'new_node_prob': 0.3 if submode == 'astar_directed' else 0.2
-            }
-        elif mode == 'NAVIGATE':
-            return {
-                'navigation_progress': {'mean': 0.6, 'std': 0.2},
-                'stagnation': {'mean': 0.2, 'std': 0.15},
-                'lost_prob': 0.15,
-                'loop_prob': 0.2
-            }
-        elif mode == 'RECOVER':
-            return {
-                'recovery_effectiveness': {'mean': 0.3, 'std': 0.2},
-                'stagnation': {'mean': 0.8, 'std': 0.2},
-                'lost_prob': 0.9,
-                'loop_prob': 0.7
-            }
-        elif mode == 'TASK_SOLVING':
-            return {
-                'task_progress': {'mean': 0.5, 'std': 0.2},
-                'stagnation': {'mean': 0.1, 'std': 0.1},
-                'lost_prob': 0.1,
-                'loop_prob': 0.1
-            }
+            if submode == 'ego_allo':
+                return {
+                    'info_gain':               {'mean': 0.30, 'std': 0.15},
+                    'stagnation':              {'mean': 0.40, 'std': 0.20},
+                    'exploration_productivity':{'mean': 0.25, 'std': 0.15},
+                    'lost_prob': 0.25, 'loop_prob': 0.40, 'new_node_prob': 0.15
+                }
+            if submode == 'ego_allo_lookahead':
+                return {
+                    'info_gain':               {'mean': 0.50, 'std': 0.10},
+                    'stagnation':              {'mean': 0.25, 'std': 0.15},
+                    'exploration_productivity':{'mean': 0.45, 'std': 0.10},
+                    'lost_prob': 0.15, 'loop_prob': 0.20, 'new_node_prob': 0.25
+                }
+            if submode == 'short_term_memory':
+                return {
+                    'info_gain':               {'mean': 0.35, 'std': 0.25},
+                    'stagnation':              {'mean': 0.35, 'std': 0.30},
+                    'exploration_productivity':{'mean': 0.30, 'std': 0.25},
+                    'lost_prob': 0.30, 'loop_prob': 0.35, 'new_node_prob': 0.20
+                }
+            if submode == 'astar_directed':
+                return {
+                    'info_gain':               {'mean': 0.60, 'std': 0.08},
+                    'stagnation':              {'mean': 0.15, 'std': 0.10},
+                    'exploration_productivity':{'mean': 0.55, 'std': 0.08},
+                    'lost_prob': 0.10, 'loop_prob': 0.15, 'new_node_prob': 0.40
+                }
+
+        # ─────────────────────────────  NAVIGATE  ─────────────────────────
+        if mode == 'NAVIGATE':
+            if submode == 'distant_node':
+                return {
+                    'navigation_progress': {'mean': 0.30, 'std': 0.20},
+                    'stagnation':          {'mean': 0.35, 'std': 0.15},
+                    'lost_prob': 0.20, 'loop_prob': 0.25
+                }
+            if submode == 'unvisited_priority':
+                return {
+                    'navigation_progress': {'mean': 0.45, 'std': 0.18},
+                    'stagnation':          {'mean': 0.25, 'std': 0.12},
+                    'lost_prob': 0.18, 'loop_prob': 0.18
+                }
+            if submode == 'plan_following':
+                return {
+                    'navigation_progress': {'mean': 0.70, 'std': 0.12},
+                    'stagnation':          {'mean': 0.15, 'std': 0.10},
+                    'lost_prob': 0.10, 'loop_prob': 0.12
+                }
+
+        # ─────────────────────────────  RECOVER  ──────────────────────────
+        if mode == 'RECOVER':
+            if submode == 'solve_doubt':
+                return {
+                    'recovery_effectiveness': {'mean': 0.35, 'std': 0.20},
+                    'stagnation':             {'mean': 0.75, 'std': 0.15},
+                    'lost_prob': 0.95, 'loop_prob': 0.70
+                }
+            if submode == 'backtrack_safe':
+                return {
+                    'recovery_effectiveness': {'mean': 0.55, 'std': 0.18},
+                    'stagnation':             {'mean': 0.65, 'std': 0.18},
+                    'lost_prob': 0.85, 'loop_prob': 0.60
+                }
+
+        # ───────────────────────────  TASK_SOLVING  ───────────────────────
+        if mode == 'TASK_SOLVING':
+            if submode == 'goal_directed':
+                return {
+                    'task_progress': {'mean': 0.60, 'std': 0.15},
+                    'stagnation':    {'mean': 0.12, 'std': 0.08},
+                    'lost_prob': 0.12, 'loop_prob': 0.12
+                }
+            if submode == 'systematic_search':
+                return {
+                    'task_progress': {'mean': 0.40, 'std': 0.20},
+                    'stagnation':    {'mean': 0.18, 'std': 0.10},
+                    'lost_prob': 0.18, 'loop_prob': 0.15
+                }
+            if submode == 'task_completion':
+                return {
+                    'task_progress': {'mean': 0.80, 'std': 0.10},
+                    'stagnation':    {'mean': 0.08, 'std': 0.05},
+                    'lost_prob': 0.08, 'loop_prob': 0.08
+                }
+
+        # ───────────────────────────  fallback  ───────────────────────────
+        # identical to old behaviour if nothing above matched
+        return super()._get_emission_params_for_state(mode, submode)
     
     def compute_emission_likelihood(self, evidence: Dict, state: Tuple[str, str]) -> float:
         """
@@ -319,341 +434,635 @@ class TrueHierarchicalHMMWithBOCPD:
         # Convert back to probability with numerical stability
         log_ll = np.clip(log_ll, -50, 50)
         return np.exp(log_ll)
-    def extract_evidence_from_replay_buffer(self, replay_buffer, external_info_gain=None, external_plan_progress=None) -> Dict:
+    def extract_evidence_from_replay_buffer(self, replay_buffer, external_info_gain=None, external_plan_progress=None):
         """
-        Extract mode-specific evidence from replay buffer and external sources
+        Centralized evidence extraction that calculates all metrics once and reuses them.
+        This replaces multiple separate calculations with a single comprehensive analysis.
         """
         evidence = {}
         
-        # Get current most likely mode to determine relevant evidence
-        current_mode, _ = self.get_most_likely_state()
-        
-        # UNIVERSAL EVIDENCE (used by all modes)
-        evidence['agent_lost'] = self.detect_agent_lost(replay_buffer)
-        evidence['loop_detected'] = self.detect_loop_behavior(replay_buffer)
-        evidence['movement_score'] = self.calculate_pose_movement(replay_buffer)
-        evidence['stagnation'] = 1.0 - evidence['movement_score']  # Inverse of movement
-        
-        # MODE-SPECIFIC EVIDENCE
-        if current_mode == 'EXPLORE':
-            # Only use info_gain for exploration modes
-            if external_info_gain is not None:
-                evidence['info_gain'] = float(external_info_gain)
-            else:
-                evidence['info_gain'] = 0.5  # Default moderate info gain
-            
-            # Exploration-specific metrics
-            evidence['new_node_created'] = self.detect_new_node_created(replay_buffer)
-            evidence['exploration_productivity'] = evidence['info_gain'] * (1.0 - evidence['stagnation'])
-            
-        elif current_mode == 'NAVIGATE':
-            # Only use plan_progress for navigation modes
-            if external_plan_progress is not None:
-                evidence['plan_progress'] = float(external_plan_progress)
-                evidence['navigation_progress'] = evidence['plan_progress']
-            else:
-                evidence['navigation_progress'] = 0.5  # Default moderate progress
-            
-        elif current_mode == 'RECOVER':
-            # Recovery-specific evidence
-            evidence['recovery_effectiveness'] = self.calculate_recovery_effectiveness(replay_buffer)
-            
-        elif current_mode == 'TASK_SOLVING':
-            # Task-solving specific evidence
-            if external_plan_progress is not None:
-                evidence['task_progress'] = float(external_plan_progress)
-            
-        return evidence
-    def detect_agent_lost(self, replay_buffer) -> bool:
-        """
-        Detect if agent seems lost based on replay buffer
-        """
         if len(replay_buffer) < 5:
-            return False
-            
-        # Check for indicators of being lost (implement based on your criteria)
-        # For example, checking for repeated failed actions or high uncertainty
-        recent_entries = list(replay_buffer)[-5:]
+            # Return default values for insufficient data
+            return {
+                'agent_lost': False,
+                'loop_detected': False,
+                'movement_score': 0.5,
+                'stagnation': 0.5,
+                'info_gain': float(external_info_gain) if external_info_gain is not None else 0.3,
+                'exploration_productivity': 0.3,
+                'navigation_progress': float(external_plan_progress) if external_plan_progress is not None else 0.3,
+                'plan_progress': float(external_plan_progress) if external_plan_progress is not None else 0.3,
+                'task_progress': float(external_plan_progress) if external_plan_progress is not None else 0.3,
+                'recovery_effectiveness': 0.5,
+                'new_node_created': False
+            }
         
-        # Placeholder logic - implement based on your specific indicators
-        return False
-    def calculate_recovery_effectiveness(self, replay_buffer) -> float:
-        """
-        Calculate how effective recovery attempts have been
-        """
-        if len(replay_buffer) < 10:
-            return 0.5
+        # Convert replay buffer to list for easier manipulation
+        buffer_list = list(replay_buffer)
+        recent_entries = buffer_list[-10:]  # Last 10 entries for most calculations
+        
+        # ===== CENTRALIZED METRIC CALCULATIONS =====
+        
+        # 1. Extract poses and positions
+        poses = []
+        positions = []
+        
+        for entry in recent_entries:
+            if 'real_pose' in entry:
+                p = entry['real_pose']
+
+                # Accept dict
+                if isinstance(p, dict) and {'x','y'}.issubset(p):
+                    poses.append( (p['x'], p['y'], p.get('theta', 0.0)) )
+                    positions.append( (float(p['x']), float(p['y'])) )
+
+                # Accept list / tuple
+                elif isinstance(p, (list, tuple)) and len(p) >= 2:
+                    poses.append(p)
+                    positions.append( (float(p[0]), float(p[1])) )
+
+                # Accept numpy / tensor
+                elif isinstance(p, np.ndarray) and p.size >= 2:
+                    p = p.astype(float)
+                    poses.append(p.tolist())
+                    positions.append( (p[0], p[1]) )
+
+                elif torch.is_tensor(p) and p.numel() >= 2:
+                    p = p.detach().cpu().float().tolist()
+                    poses.append(p)
+                    positions.append( (p[0], p[1]) )
+# 2. Extract doubt counts (primary recovery/lost indicator)
+        doubt_counts = []
+        current_doubt_count = 0
+        for entry in recent_entries:
+            if 'place_doubt_step_count' in entry:
+                doubt_count = entry['place_doubt_step_count']
+                doubt_counts.append(doubt_count)
+                current_doubt_count = doubt_count  # Keep updating to get latest
+        
+        # 3. Calculate movement metrics
+        movement_metrics = self._calculate_movement_metrics(poses, positions)
+        
+        # 4. Calculate position analysis
+        position_metrics = self._calculate_position_metrics(positions, recent_entries)
+        
+        # 5. Calculate doubt trend analysis
+        doubt_metrics = self._calculate_doubt_metrics(doubt_counts)
+        
+        # ===== BUILD EVIDENCE USING CENTRALIZED METRICS =====
+        
+        # Universal evidence
+        evidence['agent_lost'] = self._determine_agent_lost(
+            current_doubt_count, movement_metrics, position_metrics
+        )
+        evidence['loop_detected'] = self._determine_loop_detected(
+            position_metrics, buffer_list
+        )
+        evidence['movement_score'] = movement_metrics['movement_score']
+        evidence['stagnation'] = 1.0 - movement_metrics['movement_score']
+        
+        # Mode-specific evidence with external inputs
+        if external_info_gain is not None:
+            evidence['info_gain'] = float(external_info_gain)
+            evidence['exploration_productivity'] = (
+                evidence['info_gain'] * (1.0 - evidence['stagnation']) * 
+                movement_metrics['exploration_factor']
+            )
+        else:
+            evidence['info_gain'] = movement_metrics['exploration_factor'] * 0.6
+            evidence['exploration_productivity'] = evidence['info_gain'] * (1.0 - evidence['stagnation'])
+        
+        if external_plan_progress is not None:
+            progress_value = float(external_plan_progress)
+            evidence['navigation_progress'] = progress_value
+            evidence['plan_progress'] = progress_value
+            evidence['task_progress'] = progress_value
+        else:
+            # Estimate progress from movement and doubt patterns
+            estimated_progress = self._estimate_progress_from_movement(
+                movement_metrics, doubt_metrics, position_metrics
+            )
+            evidence['navigation_progress'] = estimated_progress
+            evidence['plan_progress'] = estimated_progress
+            evidence['task_progress'] = estimated_progress
+        
+        # Recovery effectiveness using centralized metrics
+        evidence['recovery_effectiveness'] = self._calculate_recovery_effectiveness_centralized(
+            doubt_metrics, movement_metrics, position_metrics
+        )
+        
+        # New node detection
+        evidence['new_node_created'] = self._detect_new_node_created_centralized(recent_entries)
+        
+        return evidence
+
+    def _calculate_movement_metrics(self, poses, positions):
+        """Calculate all movement-related metrics in one place"""
+        metrics = {
+            'movement_score': 0.5,
+            'total_distance': 0.0,
+            'movement_variance': 0.0,
+            'exploration_factor': 0.5
+        }
+        
+        if len(poses) < 2:
+            return metrics
+        
+        # Calculate total distance moved
+        total_distance = 0.0
+        distances = []
+        for i in range(1, len(positions)):
+            dx = positions[i][0] - positions[i-1][0]
+            dy = positions[i][1] - positions[i-1][1]
+            dist = (dx**2 + dy**2)**0.5
+            total_distance += dist
+            distances.append(dist)
+        
+        metrics['total_distance'] = total_distance
+        
+        # Movement score (normalized)
+        metrics['movement_score'] = min(total_distance / 10.0, 1.0)
+        
+        # Movement variance (how varied are the movements)
+        if len(distances) > 1:
+            mean_dist = np.mean(distances)
+            variance = np.var(distances)
+            metrics['movement_variance'] = min(variance / (mean_dist + 1e-6), 1.0)
+        
+        # Exploration factor (combination of movement and variance)
+        metrics['exploration_factor'] = (
+            0.7 * metrics['movement_score'] + 
+            0.3 * metrics['movement_variance']
+        )
+        
+        return metrics
+
+    def _calculate_position_metrics(self, positions, recent_entries):
+        """Calculate all position-related metrics in one place"""
+        metrics = {
+            'position_repetition': 0.0,
+            'position_diversity': 0.5,
+            'position_stagnation': False,
+            'unique_positions': 0
+        }
+        
+        if len(positions) < 3:
+            return metrics
+        
+        # Round positions to avoid floating point issues
+        rounded_positions = [(round(pos[0], 1), round(pos[1], 1)) for pos in positions]
+        
+        # Calculate position repetition
+        position_counts = {}
+        for pos in rounded_positions:
+            position_counts[pos] = position_counts.get(pos, 0) + 1
+        
+        if position_counts:
+            max_count = max(position_counts.values())
+            metrics['position_repetition'] = max_count / len(positions)
+            metrics['unique_positions'] = len(position_counts)
             
-        # Calculate based on position changes during recovery
-        movement = self.calculate_pose_movement(replay_buffer)
-        return movement  # Simple proxy for recovery effectiveness
-    # ===== BOCPD Methods =====
-    
-    def detect_loop_behavior(self, replay_buffer) -> bool:
-        """
-        Detect loops using external replay buffer positions
-        """
-        if len(replay_buffer) < self.params['loop_threshold']:
+            # Position diversity (inverse of repetition, adjusted)
+            metrics['position_diversity'] = 1.0 - (metrics['position_repetition'] - 1.0/len(positions))
+            metrics['position_diversity'] = max(0.0, min(1.0, metrics['position_diversity']))
+        
+        # Position stagnation check
+        if len(recent_entries) >= 8:
+            last_4_positions = rounded_positions[-4:]
+            if len(set(last_4_positions)) <= 2:  # Only 1-2 unique positions in last 4 steps
+                metrics['position_stagnation'] = True
+        
+        return metrics
+
+    def _calculate_doubt_metrics(self, doubt_counts):
+        """Calculate all doubt-related metrics in one place"""
+        metrics = {
+            'current_doubt': 0,
+            'doubt_trend': 0.0,
+            'max_doubt': 0,
+            'doubt_stability': 0.5
+        }
+        
+        if not doubt_counts:
+            return metrics
+        
+        metrics['current_doubt'] = doubt_counts[-1]
+        metrics['max_doubt'] = max(doubt_counts)
+        
+        # Calculate trend (simple linear regression slope)
+        if len(doubt_counts) >= 3:
+            x = np.arange(len(doubt_counts))
+            y = np.array(doubt_counts)
+            if len(x) > 1 and np.std(y) > 1e-6:
+                slope, _ = np.polyfit(x, y, 1)
+                metrics['doubt_trend'] = slope
+        
+        # Doubt stability (how consistent are the doubt levels)
+        if len(doubt_counts) > 1:
+            metrics['doubt_stability'] = 1.0 / (1.0 + np.std(doubt_counts))
+        
+        return metrics
+
+    def _determine_agent_lost(self, current_doubt_count, movement_metrics, position_metrics):
+        """Determine if agent is lost using centralized metrics"""
+        base_threshold = 6
+        
+        if current_doubt_count <= base_threshold:
             return False
-            
-        # Extract positions from last N entries in replay buffer
+        
+        # High repetition indicates being lost
+        if position_metrics['position_repetition'] > 0.6:
+            return True
+        
+        # Low movement + very high doubt
+        if (movement_metrics['movement_variance'] < 0.2 and 
+            current_doubt_count > base_threshold + 2):
+            return True
+        
+        # Extremely high doubt regardless
+        if current_doubt_count > base_threshold + 4:
+            return True
+        
+        # Position stagnation + moderate doubt
+        if (position_metrics['position_stagnation'] and 
+            current_doubt_count > 3):
+            return True
+        
+        return False
+
+    def _determine_loop_detected(self, position_metrics, buffer_list):
+        """Determine if loop is detected using centralized metrics"""
+        if len(buffer_list) < self.params['loop_threshold']:
+            return False
+        
+        # Use position repetition as primary indicator
+        if position_metrics['position_repetition'] > 0.3:
+            return True
+        
+        # Additional check: recent position clustering
         recent_positions = []
-        for entry in list(replay_buffer)[-self.params['loop_threshold']:]:
+        for entry in buffer_list[-self.params['loop_threshold']:]:
             if 'real_pose' in entry:
                 pos = entry['real_pose']
                 if isinstance(pos, (list, tuple)) and len(pos) >= 2:
-                    recent_positions.append((float(pos[0]), float(pos[1])))
+                    recent_positions.append((round(pos[0], 1), round(pos[1], 1)))
         
-        if len(recent_positions) < self.params['loop_threshold']:
-            return False
-            
-        # Check for repeated positions
-        position_counts = {}
-        for pos in recent_positions:
-            rounded_pos = (round(pos[0], 1), round(pos[1], 1))
-            position_counts[rounded_pos] = position_counts.get(rounded_pos, 0) + 1
+        if len(recent_positions) >= self.params['loop_threshold']:
+            unique_recent = len(set(recent_positions))
+            repetition_ratio = 1.0 - (unique_recent / len(recent_positions))
+            return repetition_ratio > 0.4
         
-        if not position_counts:
-            return False
-            
-        max_count = max(position_counts.values())
-        threshold = len(recent_positions) * 0.3
-        return max_count > threshold
-    
-    def detect_new_node_created(self, replay_buffer) -> bool:
-        """
-        Check if a new node was created in recent steps
-        """
-        if len(replay_buffer) < 2:
-            return False
-            
-        # Check last few entries for new node creation
-        recent_entries = list(replay_buffer)[-5:]  # Check last 5 steps
+        return False
+
+    def _calculate_recovery_effectiveness_centralized(self, doubt_metrics, movement_metrics, position_metrics):
+        """Calculate recovery effectiveness using centralized metrics"""
+        if doubt_metrics['current_doubt'] == 0:
+            return 0.9  # Excellent recovery
         
-        for entry in recent_entries:
+        recovery_score = 0.5  # Base score
+        
+        # Doubt trend analysis
+        if doubt_metrics['doubt_trend'] < -0.5:  # Strong decreasing trend
+            recovery_score += 0.3
+        elif doubt_metrics['doubt_trend'] < 0:  # Mild decreasing trend
+            recovery_score += 0.1
+        elif doubt_metrics['doubt_trend'] > 0.5:  # Increasing trend (getting worse)
+            recovery_score -= 0.3
+        
+        # Movement analysis
+        if movement_metrics['movement_score'] > 0.3:  # Good movement
+            recovery_score += 0.1
+        elif movement_metrics['movement_score'] < 0.1:  # Too little movement
+            recovery_score -= 0.1
+        
+        # Position diversity helps recovery
+        if position_metrics['position_diversity'] > 0.4:
+            recovery_score += 0.1
+        
+        # Avoid repetitive behavior during recovery
+        if position_metrics['position_repetition'] > 0.7:
+            recovery_score -= 0.2
+        
+        return max(0.0, min(1.0, recovery_score))
+
+    def _estimate_progress_from_movement(self, movement_metrics, doubt_metrics, position_metrics):
+        """Estimate progress when external progress info is not available"""
+        base_progress = 0.3
+        
+        # Good movement suggests progress
+        if movement_metrics['movement_score'] > 0.4:
+            base_progress += 0.2
+        
+        # Low doubt suggests good progress
+        if doubt_metrics['current_doubt'] < 3:
+            base_progress += 0.2
+        elif doubt_metrics['current_doubt'] > 8:
+            base_progress -= 0.2
+        
+        # Position diversity suggests exploration progress
+        if position_metrics['position_diversity'] > 0.5:
+            base_progress += 0.1
+        
+        # Decreasing doubt trend suggests recovery progress
+        if doubt_metrics['doubt_trend'] < -0.3:
+            base_progress += 0.2
+        
+        return max(0.0, min(1.0, base_progress))
+
+    def _detect_new_node_created_centralized(self, recent_entries):
+        """Detect new node creation using centralized approach"""
+        if len(recent_entries) < 2:
+            return False
+        
+        # Check for node_id changes in recent entries
+        node_ids = []
+        for entry in recent_entries[-5:]:  # Check last 5 steps
             if 'node_id' in entry:
-                # If we have a way to detect new nodes, implement here
-                # For now, simple check if node_id changed recently
-                pass
+                node_ids.append(entry['node_id'])
         
-        return False  # Implement based on your node tracking logic
-    def calculate_pose_movement(self, replay_buffer) -> float:
-        """
-        Calculate movement/stagnation from replay buffer poses
-        """
-        if len(replay_buffer) < 10:
-            return 0.5  # Default moderate movement
-            
-        recent_poses = []
-        for entry in list(replay_buffer)[-10:]:
-            if 'real_pose' in entry:
-                pose = entry['real_pose']
-                if isinstance(pose, (list, tuple)) and len(pose) >= 2:
-                    recent_poses.append((float(pose[0]), float(pose[1])))
+        if len(node_ids) >= 2:
+            # If node_id changed recently, likely a new node was created
+            return len(set(node_ids)) > 1
         
-        if len(recent_poses) < 2:
-            return 0.5
-            
-        # Calculate total distance moved
-        total_distance = 0.0
-        for i in range(1, len(recent_poses)):
-            dx = recent_poses[i][0] - recent_poses[i-1][0]
-            dy = recent_poses[i][1] - recent_poses[i-1][1]
-            total_distance += (dx**2 + dy**2)**0.5
-        
-        # Normalize to 0-1 range (adjust scale as needed)
-        movement_score = min(total_distance / 10.0, 1.0)  # Adjust divisor based on your scale
-        return movement_score
+        return False
     
+        # ───────────────────────────────────────────────────────────────────
+    #  0.  Small helper for consistent, compact arrays in prints
+    # ───────────────────────────────────────────────────────────────────
+    def _vec2str(self, v):
+        """Return first k elements of a vector as a string."""
+        v = np.asarray(v)
+        k=len(v)
+        head = ", ".join(f"{x:.3f}" for x in v[:k])
+        suffix = "…" if v.size > k else ""
+        return f"[{head}{suffix}]"
+
+    # ───────────────────────────────────────────────────────────────────
+    #  1.  Prior likelihood  (uniform over joint states)
+    # ───────────────────────────────────────────────────────────────────
     def _compute_prior_likelihood(self, evidence: Dict) -> float:
-        """
-        Uniform prior over *all* joint (mode,submode) states.
-        """
-        # simply average the emission probability under each joint state
         likes = [
             self.compute_emission_likelihood(evidence, state)
             for state in self.hierarchical_states
         ]
-        return float(np.mean(likes))
-    
+        prior_like = float(np.mean(likes))
+        print(f"[DBG-PRIOR]   evidence={evidence}  "
+            f"mean emisLike={prior_like:.3e}")
+        return prior_like
+
+    # ───────────────────────────────────────────────────────────────────
+    #  2.  Joint weighted likelihood (soft mixture)
+    # ───────────────────────────────────────────────────────────────────
     def _compute_joint_weighted_likelihood(self, evidence: Dict, var: str) -> float:
-        """
-        Soft‐assign fallback: weight the PDF of `var` under each joint state
-        by the current joint-state belief.
-        """
         total = 0.0
         for idx, state in enumerate(self.hierarchical_states):
             p_state = self.state_beliefs[idx]
             prm = self.emission_params[state].get(var)
             if isinstance(prm, dict):
-                total += p_state * stats.norm.pdf(
-                    evidence[var],
-                    prm['mean'],
-                    prm['std']
-                )
+                pdf = stats.norm.pdf(evidence[var], prm['mean'], prm['std'])
+                total += p_state * pdf
+        print(f"[DBG-MIX]     var={var:<23} mixedPDF={total:.3e}")
         return total
-    
-    def compute_run_length_specific_likelihood(self, evidence: Dict, run_length: int) -> float:
-        """
-        For each candidate run_length, build an empirical norm from the
-        last `run_length` observations of each var, and score current evidence.
-        Fallback to joint-weighted static if not enough history.
-        """
-        # 1) changepoint = use uniform prior
+
+    # ───────────────────────────────────────────────────────────────────
+    #  3.  Run-length-specific likelihood for BOCPD
+    # ───────────────────────────────────────────────────────────────────
+    def compute_run_length_specific_likelihood(self, evidence: Dict,
+                                            run_length: int) -> float:
         if run_length == 0:
             return self._compute_prior_likelihood(evidence)
 
         hist = list(self.evidence_history)
         relevant = hist[-run_length:] if len(hist) >= run_length else hist
+        print(f"[DBG-RL-{run_length:02d}] ---- scoring run length {run_length} "
+        f"using {len(relevant)} past samples ----")
+
         if not relevant:
             return self._compute_prior_likelihood(evidence)
 
         logl = 0.0
-        for var in ['info_gain','progress','stagnation',
-                    'exploration_productivity',
-                    'navigation_progress',
-                    'recovery_effectiveness']:
+        variables_to_check = ['Δ_info_gain', 'Δ_stagnation', 'Δ_movement_score',
+                    'Δ_exploration_productivity', 'Δ_navigation_progress',
+                    'Δ_recovery_effectiveness', 'Δ_plan_progress', 'Δ_task_progress'
+                ]
+        for var in variables_to_check:
+
             if var in evidence:
                 vals = [e[var] for e in relevant if var in e]
                 if len(vals) >= 2:
                     μ = np.mean(vals)
-                    σ = max(np.std(vals), 1e-2) * (1 + 1.0/run_length)
-                    logl += stats.norm.logpdf(evidence[var], μ, σ)
+                    σ = max(np.std(vals), 0.05) * (1 + 1.0/run_length)
+                    lp = stats.norm.logpdf(evidence[var], μ, σ)
+                    logl += lp
+                    print(f"[DBG-RL-{run_length:02d}] var={var:<23} μ={μ:.3f} "
+                        f"σ={σ:.3f}  logp={lp:.3f}")
                 else:
-                    # not enough history → fallback to static joint mixture
-                    logl += np.log(self._compute_joint_weighted_likelihood(evidence, var) + 1e-10)
+                    mix = self._compute_joint_weighted_likelihood(evidence, var)
+                    lp  = np.log(mix + 1e-10)
+                    logl += lp
+                    print(f"[DBG-RL-{run_length:02d}] var={var:<23} "
+                        f"fallback logp={lp:.3f}")
 
-        # 2) combine with a static fallback on emission likelihood
-        #    static_mix = Σ_b(state) · p(evidence | state)
+        # static emission mixture
         emis = np.array([
-            self.compute_emission_likelihood(evidence, state)
-            for state in self.hierarchical_states
+            self.compute_emission_likelihood(evidence, s)
+            for s in self.hierarchical_states
         ])
         static_mix = float(np.dot(self.state_beliefs, emis))
-
-        # 3) convex combine
         comb = 0.7 * np.exp(logl) + 0.3 * static_mix
+        print(f"[DBG-RL-{run_length:02d}] combined like={comb:.3e}",static_mix,comb)
         return max(comb, 1e-10)
-    
+
+    # ───────────────────────────────────────────────────────────────────
+    #  4.  BOCPD update
     def bocpd_update(self, evidence: Dict) -> Tuple[bool, float]:
         """
-        Run‐length recursion using run_length‐specific likelihoods.
-        Fixed array handling and probability computation.
+        Update run-length distribution p(r_t | e_1:t) using Adams & MacKay’s
+        BOCPD, but:
+            • work in log-space first        (avoids under/overflow)
+            • derive a **proper probability** of changepoint (0–1)
+        Returns
+        -------
+        changepoint_detected : bool      True if cp_prob crosses threshold
+        cp_prob              : float     p(r_t = 0 | evidence)
         """
-        # Compute likelihoods for each run length
-        likelihoods = np.zeros(self.max_run_length + 1)
-        for r in range(len(self.run_length_dist)):
+
+        # 1) log-likelihoods  ℓ_r = log p(e_t | r_{t-1}=r)
+        log_like = np.full(self.max_run_length + 1, -np.inf)
+        for r in range(len(self.run_length_dist)):               # only where mass
             if self.run_length_dist[r] > 1e-10:
-                likelihoods[r] = self.compute_run_length_specific_likelihood(evidence, r)
-        
-        # Growth probabilities (no changepoint)
-        growth_probs = np.zeros(self.max_run_length + 1)
-        if len(self.run_length_dist) > 1:
-            growth_probs[1:] = (self.run_length_dist[:-1] * 
-                            (1 - self.hazard_rate) * 
-                            likelihoods[:-1])
-        
-        # Changepoint probability 
-        cp_mass = float(np.sum(self.run_length_dist * self.hazard_rate * likelihoods))
-        
-        # Update run length distribution
-        new_dist = np.zeros_like(self.run_length_dist)
-        new_dist[0] = cp_mass  # Changepoint mass goes to run length 0
-        new_dist[1:] = growth_probs[1:]  # Growth probabilities
-        
-        # Normalize to ensure it's a proper probability distribution
-        total_mass = new_dist.sum()
-        if total_mass > 1e-10:
-            new_dist /= total_mass
+                l = self.compute_run_length_specific_likelihood(evidence, r)
+                log_like[r] = np.log(max(l, 1e-10))              # clamp at 1e-10
+                print(f"[DBG-BAYES-LL] r={r:02d} raw_like={l:.3e} "
+                        f"log_like={log_like[r]:.3f}")
+
+        # 2) stabilise & exponentiate back to ordinary scale
+        max_log = np.max(log_like)
+        if max_log == -np.inf:                 # <-- add this block
+            like = np.ones_like(log_like)      # uniform – no information
         else:
-            # Fallback to uniform if numerical issues
-            new_dist = np.ones_like(new_dist) / len(new_dist)
+            like = np.exp(log_like - max_log)
+        print(f"[DBG-MAX] max_log={max_log:.3f}")                       # safe, all ≤ 1
+        print(f"[DBG-LIKE] like[:10]={like[:10]}")
+        # 3) “growth” term  p(r_t=r+1 , no-cp)
+        growth = np.zeros_like(self.run_length_dist)
+        if len(self.run_length_dist) > 1:
+            growth[1:] = (self.run_length_dist[:-1] *
+                        (1.0 - self.hazard_rate) *
+                        like[:-1])
+
+        # 4) “changepoint” numerator  p(r_t=0 , cp)
+        cp_num = np.sum(self.run_length_dist * self.hazard_rate * like)
+        print(f"[DBG-GROW] growth[:5]={growth[:5]}  cp_num={cp_num:.3e}")
         
+
+        # 5) evidence normaliser  p(e_t | e_1:t-1)
+        evidence_prob = cp_num + np.sum(growth[1:])
+        print(f"[DBG-NORM] evidence_prob={evidence_prob:.3e}")
+        # 6) proper posterior run-length distribution
+        new_dist = np.zeros_like(self.run_length_dist)
+        new_dist[0] = cp_num
+        new_dist[1:] = growth[1:]
+        if evidence_prob > 0:
+            den = max(evidence_prob, 1e-12)
+            new_dist /= den
+
+        else:                                   # pathological case
+            new_dist[:] = 1.0 / len(new_dist)
+
         self.run_length_dist = new_dist
-        
-        # Detect changepoint based on mass at run length 0
-        changepoint_detected = cp_mass > self.changepoint_threshold
-        
-        return changepoint_detected, cp_mass
-    
+        cp_prob = new_dist[0]                  # now guaranteed ∈ [0,1]
+
+        changep = cp_prob > self.changepoint_threshold
+        print(f"[DBG-BOCPD] cp_prob={cp_prob:.3f}  changepoint={changep}  "
+            f"runLenDist(0..4)={new_dist}")
+
+        return changep, cp_prob
+
+    # ───────────────────────────────────────────────────────────────────
+    #  5.  HMM forward step
+    # ───────────────────────────────────────────────────────────────────
     def hmm_forward_step(self, evidence: Dict) -> np.ndarray:
-        """
-        Standard HMM forward (predict + update) over joint states.
-        """
-        # emission likelihood under each joint (mode,submode)
         e_likes = np.array([
-            self.compute_emission_likelihood(evidence, state)
-            for state in self.hierarchical_states
+            self.compute_emission_likelihood(evidence, s)
+            for s in self.hierarchical_states
         ])
 
-        # predict
         pred = self.transition_matrix.T @ self.state_beliefs
-
-        # update
         newb = e_likes * pred
         if newb.sum() > 0:
             self.state_beliefs = newb / newb.sum()
         else:
-            self.state_beliefs = np.ones(self.n_states) / self.n_states
+            self.state_beliefs[:] = 1.0 / self.n_states
 
+        print(f"[DBG-HMM]    eLikes={self._vec2str(e_likes)}  "
+            f"pred={self._vec2str(pred)}  "
+            f"newBelief={self._vec2str(self.state_beliefs)}")
         return self.state_beliefs
-    
-    def update(self, replay_buffer, external_info_gain=None, external_plan_progress=None) -> Tuple[np.ndarray, Dict]:
-        """
-        Updated method that uses external replay buffer and specific evidence
-        
-        Args:
-            replay_buffer: External deque with agent state history
-            external_info_gain: Optional info_gain value from image comparison
-            external_plan_progress: Optional plan progress value during navigation
-        """
-        
-        # Extract evidence from replay buffer and external sources
+
+    # ───────────────────────────────────────────────────────────────────
+    #  6.  GLOBAL UPDATE ENTRY POINT
+    # ───────────────────────────────────────────────────────────────────
+    def update(self, replay_buffer, external_info_gain=None,
+            external_plan_progress=None) -> Tuple[np.ndarray, Dict]:
+
+        # step counter ---------------------------------------------------
+        self.step_counter += 1
+        print(f"\n================ STEP {self.step_counter} =================")
+
+        # evidence extraction -------------------------------------------
         evidence = self.extract_evidence_from_replay_buffer(
             replay_buffer, external_info_gain, external_plan_progress
         )
-        
-        # Store evidence for BOCPD
+        print(f"[DBG-UPD]   extracted evidence: {evidence}")
+
+        # store / history ----------------------------------------------
         self.evidence_buffer.append(evidence)
         self.evidence_history.append(evidence.copy())
+        evidence2 = self._add_deltas(evidence)
+        # --- BOCPD -----------------------------------------------------
+        changep, cp_prob = self.bocpd_update(evidence2)
+        if changep:
+            print(f"[DBG-BOCPD] >>> CHG-PT triggered, prob={cp_prob:.3f}")
 
-        # Run BOCPD update first
-        changepoint_detected, cp_probability = self.bocpd_update(evidence)
+            # 2.1  Determine how hard to reset
+            #       • cp_prob near 1.0  → hard reset (w = 0.9)
+            #       • cp_prob near thr  → gentle reset (w = 0.3)
+            thr = self.changepoint_threshold
+            w = 0.3 + 0.6 * (cp_prob - thr) / max(1.0 - thr, 1e-6)   # clamp [0.3,0.9]
+            w = np.clip(w, 0.3, 0.9)
 
-        # If changepoint detected, partially reset beliefs
-        if changepoint_detected:
-            uniform = np.ones(self.n_states) / self.n_states
-            self.state_beliefs = 0.5 * self.state_beliefs + 0.5 * uniform
-            print(f"[BOCPD] Changepoint detected with probability: {cp_probability:.3f}")
+            # 2.2  Build "anti-dominant" proposal
+            mode_probs = self.get_mode_probabilities()
+            dominant_mode = max(mode_probs.items(), key=lambda x: x[1])[0]
 
-        # Run HMM forward step
+            proposal = np.ones(self.n_states) / self.n_states
+            for i, (mode, _) in enumerate(self.hierarchical_states):
+                if mode == dominant_mode:
+                    proposal[i] *= 0.3          # suppress
+                else:
+                    proposal[i] *= 1.2          # boost
+            proposal /= proposal.sum()
+
+            # 2.3  Blend with previous belief vector
+            self.state_beliefs = (1.0 - w) * self.state_beliefs + w * proposal
+
+            # 2.4  Reset the run-length distribution to "just changed"
+            self.run_length_dist[:] = 0.0
+            self.run_length_dist[0] = 1.0
+
+        # --- HMM forward update ---------------------------------------
         self.hmm_forward_step(evidence)
 
-        # Store history
+        # --- bookkeeping ----------------------------------------------
         self.state_history.append((time.time(), self.state_beliefs.copy()))
         self.mode_history.append((time.time(), self.state_beliefs.copy()))
 
-        # Compute marginal probabilities
         mode_probs = self.get_mode_probabilities()
-        submode_probs = self.get_submode_probabilities()
+        print(f"[DBG-UPD]   modeProbs   = {mode_probs}")
+        print(f"[DBG-UPD]   entropy(S)  = {self.compute_state_entropy():.3f}")
 
         diagnostics = {
             'mode_probabilities': mode_probs,
-            'submode_probabilities': submode_probs,
+            'submode_probabilities': self.get_submode_probabilities(),
             'most_likely_state': self.get_most_likely_state(),
             'state_entropy': self.compute_state_entropy(),
             'mode_entropy': self.compute_mode_entropy(),
-            'changepoint_detected': changepoint_detected,
-            'changepoint_probability': cp_probability,
+            'changepoint_detected': changep,
+            'changepoint_probability': cp_prob,
             'run_length_dist': self.run_length_dist.copy(),
             'max_run_length_prob': np.max(self.run_length_dist),
             'evidence_buffer_size': len(self.evidence_buffer),
             'evidence_history_size': len(self.evidence_history),
-            'evidence_used': evidence  # Add evidence for debugging
+            'evidence_used': evidence
         }
-
         return self.state_beliefs, diagnostics
     
+    def _add_deltas(self, evidence: dict) -> dict:
+        """
+        Return a *new* dict that contains the original evidence **plus**
+        first-difference features Δ_x = x_t – x_{t-1} for every scalar
+        we care about.  Uses self.prev_evidence for the t-1 values.
+        """
+        keys = [
+            'info_gain', 'stagnation', 'movement_score',
+            'exploration_productivity', 'navigation_progress',
+            'recovery_effectiveness', 'plan_progress', 'task_progress',
+        ]
+
+        if self.prev_evidence is None:                # first frame → no deltas yet
+            self.prev_evidence = evidence.copy()
+            return evidence
+
+        # build a shallow copy so we don’t mutate the caller’s dict
+        aug = evidence.copy()
+
+        for k in keys:
+            if k in evidence and k in self.prev_evidence:
+                aug[f'Δ_{k}'] = evidence[k] - self.prev_evidence[k]
+
+        self.prev_evidence = evidence.copy()          # store for next call
+        return aug
     def get_mode_probabilities(self) -> Dict[str, float]:
         """Compute marginal probabilities over modes"""
         mode_probs = defaultdict(float)
@@ -757,7 +1166,6 @@ class HierarchicalBayesianController:
     """
     
     def __init__(self, key=None):
-        self.key = key
         self.hhmm = TrueHierarchicalHMMWithBOCPD()
         self.strategy_history = deque(maxlen=100)
         self.last_update_time = time.time()
@@ -818,47 +1226,6 @@ class HierarchicalBayesianController:
             'uptime': time.time() - (self.strategy_history[0]['timestamp'] if self.strategy_history else time.time())
         }
     
-    
-    def _enhance_diagnostics(self, base_diagnostics, strategy, evidence) -> Dict:
-        """Add controller-specific diagnostics to base HMM diagnostics"""
-        enhanced = base_diagnostics.copy()
-        
-        # Add performance history
-        enhanced['performance_history'] = {
-            'cumulative_reward': self.cumulative_reward,
-            'step_count': self.step_count,
-            'average_reward': self.cumulative_reward / max(self.step_count, 1),
-            'recent_performance': list(self.performance_buffer)[-10:] if self.performance_buffer else []
-        }
-        
-        # Add strategy stability metrics
-        if len(self.strategy_history) > 1:
-            recent_strategies = [s['strategy']['recommended_mode'] for s in list(self.strategy_history)[-10:]]
-            strategy_changes = sum(1 for i in range(1, len(recent_strategies)) 
-                                 if recent_strategies[i] != recent_strategies[i-1])
-            enhanced['strategy_stability'] = {
-                'recent_changes': strategy_changes,
-                'stability_ratio': 1.0 - (strategy_changes / max(len(recent_strategies) - 1, 1))
-            }
-        
-        # Add evidence quality metrics
-        enhanced['evidence_quality'] = {
-            'info_gain_trend': self._compute_trend([e['evidence']['info_gain'] 
-                                                  for e in list(self.strategy_history)[-10:]]),
-            'progress_trend': self._compute_trend([e['evidence']['progress'] 
-                                                 for e in list(self.strategy_history)[-10:]]),
-            'stagnation_trend': self._compute_trend([e['evidence']['stagnation'] 
-                                                   for e in list(self.strategy_history)[-10:]])
-        }
-        
-        # Add timing information
-        enhanced['timing'] = {
-            'last_update': self.last_update_time,
-            'update_frequency': len(self.strategy_history) / max(time.time() - self.strategy_history[0]['timestamp'], 1) 
-                              if self.strategy_history else 0
-        }
-        
-        return enhanced
     
     def _compute_trend(self, values) -> str:
         """Compute simple trend (increasing, decreasing, stable) for a list of values"""

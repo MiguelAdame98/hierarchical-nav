@@ -44,7 +44,7 @@ from navigation_model.visualisation_tools import (
     convert_tensor_to_matplolib_list, transform_policy_from_hot_encoded_to_str,
     visualise_image,visualize_replay_buffer)
 from control_eval.HierarchicalHMMBOCPD import HierarchicalBayesianController
-
+from control_eval.NavigationSystem import NavigationSystem
 
 def print_keys_explanation():
     print('NOTE: the agent needs a first push forward to initialise the model with a first observation. \
@@ -83,6 +83,8 @@ class MinigridInteraction():
         self.current_plan = []
         self.plan_step_idx = 0
         self.last_pose = None
+        self.prev_mode: str | None = None          # last HMM mode we saw
+        self.mode_changed: bool   = False 
        
         #TODO: ALLOW USER TO SET ITS PREFERRED OB WTOUT ACCESSING CODE
         #Since 255 is the max value of any colour, we don't care about the above value of white
@@ -124,6 +126,11 @@ class MinigridInteraction():
         self.env = ImgActionObsWrapper(self.env)
         self.window = Window(self.env_name)
         self.seed = args.seed
+
+        self.nav_system = NavigationSystem(
+                self.models_manager.memory_graph,
+                lambda: self.agent_current_pose
+            )
 
         self.reset()
 
@@ -593,16 +600,20 @@ class MinigridInteraction():
         'imagined_pose':self.models_manager.get_best_place_hypothesis()['pose'],
         'real_image': obs['image'],   
         'imagined_image': self.models_manager.get_best_place_hypothesis()['image_predicted'],
-        'action':action}
+        'action':action,
+        'place_doubt_step_count':self.models_manager.allocentric_process.place_doubt_step_count()}
+
         self.update_replay_buffer(current_state)
         hmm_info_gain=self.info_gain(obs['image'],obs['pose'], self.replay_buffer, self.models_manager.memory_graph)
         hmm_plan_progress=self.plan_progress_placeholder()
         current_mode,stats=self.hmm_bayes.update(self.replay_buffer,hmm_info_gain,hmm_plan_progress)
-        print(current_mode,stats)
-
-        if self.step_count()>20:
+        current_mode = stats["most_likely_state"][0]
+        print("############",current_mode,stats)
+        self.mode_changed = (current_mode != self.prev_mode)
+        self.prev_mode    = current_mode
+        #if self.step_count()>20:
             grammar = self.build_pcfg_from_memory()
-            self.print_adaptive_pcfg_plans(grammar)
+            #self.print_adaptive_pcfg_plans(grammar)
             
         return self.models_manager.agent_lost(), obs
     
@@ -621,9 +632,9 @@ class MinigridInteraction():
                 data['ground_truth_ob'] = obs['image']
                 motion_data.append(data)
         
-            if agent_lost:
-                print('Agent lost, stopping exploration policy')
-                return motion_data, agent_lost
+            if self.mode_changed:
+                print(f"Stopping policy: {self.prev_mode}")
+                return motion_data, True
         return motion_data, agent_lost
     
     def agent_explores(self, collect_data:bool=False)->tuple[list,bool]:
@@ -632,6 +643,158 @@ class MinigridInteraction():
         motion_data,agent_lost = self.apply_policy(policy, n_actions, collect_data)
         return motion_data, agent_lost
     
+    
+    def apply_exploration(self) -> tuple[list, int]:
+        """
+        Unified high-level controller.
+
+        • Chooses a branch from the HMM’s most-likely (mode, submode)
+        — stored in `self.prev_mode` / `self.prev_submode`
+        • Falls back to the legacy “while-loop” exploration when inside
+        EXPLORE/ego_allo-family sub-modes.
+        • Preserves *all* previous side-effects (prints, counters, resets …).
+
+        Returns
+        -------
+        (policy, n_actions)
+            • policy  : list[np.ndarray]   one-hot action sequence
+            • n_actions : int | list       whatever your behaviour functions use
+        """
+
+        # ------------------------------------------------------------------ #
+        # 0. Read current HMM state (defaults are safe for the very 1st call)
+        # ------------------------------------------------------------------ #
+        mode, submode = (
+            getattr(self, "prev_mode", None)     or "EXPLORE",
+            getattr(self, "prev_submode", None)  or "ego_allo",
+        )
+        print(f"[HMM] mode={mode}  submode={submode}")
+
+        # ------------------------------------------------------------------ #
+        # 1. RECOVER  –— was: “agent lost”
+        # ------------------------------------------------------------------ #
+        if mode == "RECOVER":
+            if submode == "solve_doubt":
+                print("Agent lost ➜ solve_doubt_over_place()")
+                policy, n_action = self.explorative_behaviour.solve_doubt_over_place(
+                    self.models_manager
+                )
+                return policy, n_action
+
+            elif submode == "backtrack_safe":
+                print("Recover ➜ backtrack to known safe node")
+                # TODO: implement/back‐hook a back-tracking routine
+                return [], []  # placeholder
+
+        # ------------------------------------------------------------------ #
+        # 2. NAVIGATE –— path-following & exploitation
+        # ------------------------------------------------------------------ #
+        if mode == "NAVIGATE":
+
+            # ---------- 1. Early feasibility gate ----------
+            if not self.nav_system.check_navigation_feasibility():
+                # HMM will see the flags and flip out of NAVIGATE
+                self.navigation_flags = self.nav_system.navigation_flags
+                return [], []
+
+            # ---------- 2. Build first plan if none ----------
+            #   progress_scalar() < 0  ➜  no plan loaded yet
+            if self.nav_system.progress_scalar() < 0.0:
+                grammar = self.build_pcfg_from_memory()
+                self.nav_system.generate_plan_with_pcfg(grammar)
+
+            # ---------- 3. Delegate to sub-mode handler ----------
+            primitives, n_actions = self.nav_system.universal_navigation(submode)
+            return primitives, n_actions
+        # ------------------------------------------------------------------ #
+        # 3. TASK_SOLVING –— goal-directed behaviour
+        # ------------------------------------------------------------------ #
+        if mode == "TASK_SOLVING":
+            if submode == "goal_directed":
+                print("Task-solving ➜ explicit goal search")
+                # TODO
+                return [], []
+
+            elif submode == "systematic_search":
+                print("Task-solving ➜ systematic sweep")
+                # TODO
+                return [], []
+
+            elif submode == "task_completion":
+                print("Task-solving ➜ finalising task")
+                # TODO
+                return [], []
+            
+        # ------------------------------------------------------------------ #
+        # 4. EXPLORE  –– handled by sub-modes
+        # ------------------------------------------------------------------ #
+        # Enter here whenever  mode == "EXPLORE"
+        # ------------------------------------------------------------------ #
+
+        print("==================================================== EXPLORE")
+
+        policy, n_action = [], []
+
+        # ────────────────────────────────────────────────────────────────
+        # 4A. Sub-mode dispatch
+        # ────────────────────────────────────────────────────────────────
+        if submode == "ego_allo":
+            # Basic ego↔allo oscillation (no look-ahead growth)
+            if self.explorative_behaviour.is_agent_exploring():
+                policy, n_action = self.explorative_behaviour.one_step_ego_allo_exploration(
+                    self.models_manager
+                )
+            else:
+                print("ego_allo: not currently exploring – no policy produced")
+
+        elif submode == "ego_allo_lookahead":
+            # Grow look-ahead horizon until a policy appears (old behaviour)
+            max_extra = 5                     # ← keep original limit
+            attempts  = 0
+            while len(policy) == 0 and attempts <= max_extra:
+                print(f"lookahead attempt {attempts} / {max_extra}")
+                policy, n_action = self.explorative_behaviour.one_step_ego_allo_exploration(
+                    self.models_manager
+                )
+                attempts += 1
+
+        elif submode == "short_term_memory":
+            print("short_term_memory: pushing out of STM comfort zone")
+            policy, n_action = self.push_explo_stm()
+
+        elif submode == "astar_directed":
+            print("astar_directed: frontier-directed exploration (placeholder)")
+            # TODO: implement an A* or frontier planner that returns (policy, n_actions)
+            policy, n_action = [], []
+
+        else:
+            print(f"[WARN] unknown EXPLORE sub-mode: {submode} – defaulting to ego_allo")
+            if self.explorative_behaviour.is_agent_exploring():
+                policy, n_action = self.explorative_behaviour.one_step_ego_allo_exploration(
+                    self.models_manager
+                )
+
+        # ────────────────────────────────────────────────────────────────
+        # 4B. Fallback if still empty •–––– keep agent moving
+        # ────────────────────────────────────────────────────────────────
+        if len(policy) == 0:
+            print("No policy found after sub-mode logic – issuing egocentric poke")
+            policy, n_action = self.explorative_behaviour.one_step_egocentric_exploration(
+                self.models_manager
+            )
+
+        # ────────────────────────────────────────────────────────────────
+        # 4C. Legacy EFE book-keeping (unchanged)
+        # ────────────────────────────────────────────────────────────────
+        policy_G = self.explorative_behaviour.get_latest_policy_EFE(reset_EFE=True)
+        if policy_G is not None:
+            info_gain_coeff = self.explorative_behaviour.rolling_coeff_info_gain()
+            if self.explorative_behaviour.define_is_agent_exploring(
+                info_gain_coeff, policy_G, threshold=1
+            ):
+                self.models_manager.reset_variable_lookahead_to_default()
+
+        return policy, n_action
     def push_explo_stm(self):
             pose_history=self.compute_pose_history()
             self.extract_past_actions(self.replay_buffer)
@@ -667,9 +830,8 @@ class MinigridInteraction():
             top_diverse=self.evaluate_branches(paths,pose_history)
             print(top_diverse)
             print(top_diverse.tolist(),len(top_diverse))
-            return top_diverse.tolist(),len(top_diverse)
-    
-    def apply_exploration(self)->tuple[list,int]:
+            return top_diverse.tolist(),len(top_diverse)        
+    '''def apply_exploration(self)->tuple[list,int]:
         print('====================================================explo')
         if self.models_manager.agent_lost():
             print('Agent lost, trying to determine best place hypothesis')
@@ -700,7 +862,7 @@ class MinigridInteraction():
                 print("this time for real",self.step_count())
                 policy, n_action= self.push_explo_stm()  
                 print('this time ++++++++++++++++++++++++',self.step_count()) 
-                '''if place_to_go:
+                if place_to_go:
                     print('Searching How to go to the other place')
                     print("where are we going?",place_to_go['current_exp_door_pose'],place_to_go)
                     policy, n_action = self.exploitative_behaviour.go_to_given_place(\
@@ -708,7 +870,7 @@ class MinigridInteraction():
                 
                 else:
                     print('No place found to return to, using ego model')
-                    ongoing_exploration_option = 'push_from_comfort_zone'''
+                    ongoing_exploration_option = 'push_from_comfort_zone
                 
             elif ongoing_exploration_option == 'explore':
                 print('Exploring with allo model')
@@ -728,7 +890,7 @@ class MinigridInteraction():
             if self.explorative_behaviour.define_is_agent_exploring(info_gain_coeff, policy_G, threshold=1):
                 self.models_manager.reset_variable_lookahead_to_default()
         print('++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++')            
-        return policy, n_action
+        return policy, n_action''' 
 
     def agent_seeks_goal(self, collect_data:bool=False)->tuple[list,bool]:
         motion_data, agent_lost = self.apply_goal_seeking(collect_data)
@@ -830,46 +992,7 @@ class MinigridInteraction():
     
     def save_created_map(self, saving_dir:str)->None:
         save_memory(self.models_manager, saving_dir)
-    #TODO: refactor
-    '''def get_memory_map_data(self):
-        ''' 
-    '''This is for plotting the memory map
-        
-        TO DO: REFACTOR''''''
-
-        memory_map_data = {'exps_GP':[], 'exps_decay': [], 'ghost_exps_GP':[],\
-                           'ghost_exps_link':[], 'exps_links': []}
-        memory_map_data['current_exp_id'] = self.models_manager.memory_graph.get_current_exp_id()
-        memory_map_data['current_GP'] = self.models_manager.memory_graph.get_global_position()
-        if memory_map_data['current_exp_id'] < 0:
-            return memory_map_data
-        
-        current_exp_GP = self.models_manager.memory_graph.get_exp_global_position() 
-        memory_map_data['current_exp_GP'] = current_exp_GP
-        #GET EXPS POSITIONS
-        for vc in self.models_manager.memory_graph.view_cells.cells:
-            for exp in vc.exps:
-                memory_map_data['exps_GP'].append([exp.x_m, exp.y_m])
-                memory_map_data['exps_decay'].append(vc.decay)
-
-        #GET GHOST EXPS POSITIONS
-        for expc in self.models_manager.memory_graph.experience_map.ghost_exps:
-            memory_map_data['ghost_exps_GP'].append([expc.x_m, expc.y_m])
-            #GET GHOST NODES LINKS
-            for l_id in range(0,len(expc.links)):
-                memory_map_data['ghost_exps_link'].append([expc.x_m, expc.y_m])
-                memory_map_data['ghost_exps_link'].append([expc.links[l_id].target.x_m, expc.links[l_id].target.y_m])
-        #GET EXPS LINKS      
-        for expc in self.models_manager.memory_graph.experience_map.exps:
-                if len(expc.links)>0:
-                    #print('in visualisation tool', expc.id, len(expc.links))
-                    for l_id in range(0,len(expc.links)): 
-                        if expc.links[l_id].target.ghost_exp == False:
-                            #print('target id', expc.links[l_id].target.id)
-                            memory_map_data['exps_links'].append([expc.links[l_id].target.x_m,expc.links[l_id].target.y_m])
-                            memory_map_data['exps_links'].append([expc.x_m, expc.y_m])
-                       
-        return memory_map_data'''
+    
     def get_memory_map_data(self, dbg=True):
         """
         This is for plotting the memory map.
@@ -1058,112 +1181,7 @@ class MinigridInteraction():
         grammar_src = "\n".join(pcfg_lines)
         print("[PCFG DEBUG] Final grammar:\n" + grammar_src)
         return PCFG.fromstring(grammar_src)
-        
-    '''def build_pcfg_from_memory(self):
-        mg      = self.models_manager.memory_graph
-        emap    = mg.experience_map
-        current = mg.get_current_exp_id()
-        exps_by_dist = mg.get_exps_organised(current)
-        all_exps     = emap.exps
-
-        # 1) Abstract graph & distance priors
-        graph = {e.id: [l.target.id for l in e.links] for e in all_exps}
-        print("[PCFG DEBUG] graph:", graph)
-
-        id_to_dist  = {}
-        total_weight = 0.0
-        for d in exps_by_dist:
-            dist = math.hypot(d['x'], d['y'])
-            id_to_dist[d['id']] = dist
-            total_weight += 1.0 / (dist + 1e-5)
-
-        # 2) Top‐level productions
-        rules = defaultdict(list)
-        rules['EXPLORE'].append(('NAVPLAN', 1.0))
-        for tgt, dist in id_to_dist.items():
-            p = (1.0/(dist+1e-5)) / total_weight
-            rules['NAVPLAN'].append((f'GOTO_{tgt}', p))
-            rules[f'GOTO_{tgt}'].append((f'MOVESEQ_{current}_{tgt}', 1.0))
-
-        # 3) BFS helper on abstract graph
-        def find_paths(graph, start, goal, max_depth=15, max_paths=15):
-            paths, queue = [], deque([[start]])
-            while queue and len(paths) < max_paths:
-                path = queue.popleft()
-                if path[-1] == goal:
-                    paths.append(path)
-                elif len(path) < max_depth:
-                    for nb in graph.get(path[-1], []):
-                        if nb not in path:
-                            queue.append(path + [nb])
-            return paths
-
-        # 4) MOVESEQ: only first hop uses get_primitives; rest use stored link.path_forward
-        for tgt in id_to_dist:
-            lhs = f"MOVESEQ_{current}_{tgt}"
-            prods = []
-
-            # a) try all abstract routes
-            for path in find_paths(graph, current, tgt):
-                seq = []
-                hops = list(zip(path, path[1:]))
-                # a) try all abstract routes, *prefixed* by (current→current)
-                for path in find_paths(graph, current, tgt):
-                    seq = []
-                    # force a dummy “hop” that will get you from your real pose into your canonical
-                    # current-node pose via get_primitives(current,current)
-                    hops = [(current, current)] + list(zip(path, path[1:]))
-
-                #  a.1) first hop: from real pose → first node
-                for u, v in hops:
-                    prims = self.get_primitives(u, v)
-                    if prims:
-                        seq.extend(prims)
-                    else:
-                        # fallback to a single step‐token if no stored or computed primitives
-                        seq.append(f"step({u},{v})")
-
-
-                # Flatten into a quoted‐terminals RHS
-                rhs = " ".join(f"'{tok}'" for tok in seq)
-                prods.append(rhs)
-                print(f"[PCFG DEBUG] path {path} → prims {seq}")
-
-            # b) if we got at least one flattened seq, normalize & emit
-            if prods:
-                w = 1.0/len(prods)
-                for rhs in prods:
-                    rules[lhs].append((rhs, w))
-                continue
-
-            # c) fallback if no abstract route found
-            if current != tgt:
-                rhs = f"'step({current},{tgt})'"
-                rules[lhs].append((rhs, 1.0))
-                print(f"[PCFG DEBUG] forced fallback for {lhs}")
-
-        # 5) optional hard‐coded extras (unchanged)
-        hard = {
-            f'MOVESEQ_{current}_18': [f"step({current},19)","step(19,18)"],
-            f'MOVESEQ_{current}_3' : [f"step({current},5)","step(5,4)","step(4,3)"],
-        }
-        for lhs, steps in hard.items():
-            if lhs not in rules:
-                rhs = " ".join(f"'{s}'" for s in steps)
-                rules[lhs].append((rhs,1.0))
-                print(f"[PCFG DEBUG] hardcoded {lhs} -> {steps}")
-
-        # 6) Assemble PCFG
-        pcfg_lines = []
-        for lhs, prods in rules.items():
-            total_p = sum(p for _,p in prods)
-            for rhs,p in prods:
-                pcfg_lines.append(f"{lhs} -> {rhs} [{p/total_p:.4f}]")
-
-        grammar_src = "\n".join(pcfg_lines)
-        print("[PCFG DEBUG] Final grammar:\n" + grammar_src)
-        return PCFG.fromstring(grammar_src)'''
-    
+          
     def get_primitives(self, u: int, v: int) -> list[str]:
         """
         Return the best primitive sequence for traversing the edge u→v:
@@ -1602,6 +1620,110 @@ class MinigridInteraction():
         
         # Fallback to moderate progress
         return 0.5
+    '''def build_pcfg_from_memory(self):
+        mg      = self.models_manager.memory_graph
+        emap    = mg.experience_map
+        current = mg.get_current_exp_id()
+        exps_by_dist = mg.get_exps_organised(current)
+        all_exps     = emap.exps
+
+        # 1) Abstract graph & distance priors
+        graph = {e.id: [l.target.id for l in e.links] for e in all_exps}
+        print("[PCFG DEBUG] graph:", graph)
+
+        id_to_dist  = {}
+        total_weight = 0.0
+        for d in exps_by_dist:
+            dist = math.hypot(d['x'], d['y'])
+            id_to_dist[d['id']] = dist
+            total_weight += 1.0 / (dist + 1e-5)
+
+        # 2) Top‐level productions
+        rules = defaultdict(list)
+        rules['EXPLORE'].append(('NAVPLAN', 1.0))
+        for tgt, dist in id_to_dist.items():
+            p = (1.0/(dist+1e-5)) / total_weight
+            rules['NAVPLAN'].append((f'GOTO_{tgt}', p))
+            rules[f'GOTO_{tgt}'].append((f'MOVESEQ_{current}_{tgt}', 1.0))
+
+        # 3) BFS helper on abstract graph
+        def find_paths(graph, start, goal, max_depth=15, max_paths=15):
+            paths, queue = [], deque([[start]])
+            while queue and len(paths) < max_paths:
+                path = queue.popleft()
+                if path[-1] == goal:
+                    paths.append(path)
+                elif len(path) < max_depth:
+                    for nb in graph.get(path[-1], []):
+                        if nb not in path:
+                            queue.append(path + [nb])
+            return paths
+
+        # 4) MOVESEQ: only first hop uses get_primitives; rest use stored link.path_forward
+        for tgt in id_to_dist:
+            lhs = f"MOVESEQ_{current}_{tgt}"
+            prods = []
+
+            # a) try all abstract routes
+            for path in find_paths(graph, current, tgt):
+                seq = []
+                hops = list(zip(path, path[1:]))
+                # a) try all abstract routes, *prefixed* by (current→current)
+                for path in find_paths(graph, current, tgt):
+                    seq = []
+                    # force a dummy “hop” that will get you from your real pose into your canonical
+                    # current-node pose via get_primitives(current,current)
+                    hops = [(current, current)] + list(zip(path, path[1:]))
+
+                #  a.1) first hop: from real pose → first node
+                for u, v in hops:
+                    prims = self.get_primitives(u, v)
+                    if prims:
+                        seq.extend(prims)
+                    else:
+                        # fallback to a single step‐token if no stored or computed primitives
+                        seq.append(f"step({u},{v})")
+
+
+                # Flatten into a quoted‐terminals RHS
+                rhs = " ".join(f"'{tok}'" for tok in seq)
+                prods.append(rhs)
+                print(f"[PCFG DEBUG] path {path} → prims {seq}")
+
+            # b) if we got at least one flattened seq, normalize & emit
+            if prods:
+                w = 1.0/len(prods)
+                for rhs in prods:
+                    rules[lhs].append((rhs, w))
+                continue
+
+            # c) fallback if no abstract route found
+            if current != tgt:
+                rhs = f"'step({current},{tgt})'"
+                rules[lhs].append((rhs, 1.0))
+                print(f"[PCFG DEBUG] forced fallback for {lhs}")
+
+        # 5) optional hard‐coded extras (unchanged)
+        hard = {
+            f'MOVESEQ_{current}_18': [f"step({current},19)","step(19,18)"],
+            f'MOVESEQ_{current}_3' : [f"step({current},5)","step(5,4)","step(4,3)"],
+        }
+        for lhs, steps in hard.items():
+            if lhs not in rules:
+                rhs = " ".join(f"'{s}'" for s in steps)
+                rules[lhs].append((rhs,1.0))
+                print(f"[PCFG DEBUG] hardcoded {lhs} -> {steps}")
+
+        # 6) Assemble PCFG
+        pcfg_lines = []
+        for lhs, prods in rules.items():
+            total_p = sum(p for _,p in prods)
+            for rhs,p in prods:
+                pcfg_lines.append(f"{lhs} -> {rhs} [{p/total_p:.4f}]")
+
+        grammar_src = "\n".join(pcfg_lines)
+        print("[PCFG DEBUG] Final grammar:\n" + grammar_src)
+        return PCFG.fromstring(grammar_src)'''
 
 
             
