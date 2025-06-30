@@ -1,0 +1,4 @@
+[submodule "dreamer_mg"]
+	path = dreamer_mg
+	url = https://github.com/MiguelAdame98/SimpleDreamer-master.git
+	branch = minigrid-collision
