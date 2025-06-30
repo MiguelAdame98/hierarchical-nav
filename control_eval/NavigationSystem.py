@@ -10,6 +10,7 @@ import heapq
 import torch
 from collections import namedtuple
 from nltk.parse.generate import generate
+from nltk.grammar import Nonterminal, Production
 State = namedtuple("State", ["x","y","d"])
 DIR_VECS = [(1,0),(0,1),(-1,0),(0,-1)]
 ACTIONS   = ["forward","left","right"]
@@ -29,6 +30,8 @@ class NavigationSystem:
         # ─ misc state you already had ─
         self.target_node_id   = None
         self.navigation_flags = {}
+
+        self._pose_hist: deque[tuple[float,float]] = deque(maxlen=8)
         
     def get_available_nodes_with_confidence(self, min_confidence=0.5):
         """Get nodes that are viable for navigation"""
@@ -69,29 +72,61 @@ class NavigationSystem:
         self.navigation_flags.clear()  # Clear flags if everything is okay
         return True
     
-    def generate_plan_with_pcfg(self, grammar: PCFG):
-        """
-        Sample one sentence from `grammar`, tokenise it into a list
-        of (u,v) edges, reset all plan indices, and store the final
-        target node ID.  Returns the list of edge tuples.
-        """
-        sentence = random.choice(list(generate(grammar, depth=50)))  # list[str]
-        plan_str = " ".join(sentence)
+    def _weighted_prod_choice(self, prods):
+        if random.random() < 0.8:                 # ε = 0.2 exploration
+            return max(prods, key=lambda p: p.prob())
+        weights = [p.prob() for p in prods]
+        return random.choices(prods, weights=weights, k=1)[0]
 
-        # Tokenise into edge tuples
+    # ─────────────────────────────────────────────────────────────
+    # Replacement for generate_plan_with_pcfg
+    # ─────────────────────────────────────────────────────────────
+    def generate_plan_with_pcfg(self, grammar: PCFG) -> list[tuple[int, int]]:
+        """
+        Probabilistic sampler that respects the PCFG production weights.
+
+        1. Recursively expand from start symbol 'NAVPLAN'
+        2. Collect terminal tokens ('STEP_u_v')
+        3. Tokenise into edge tuples, reset indices and progress counters
+        """
+
+        agenda = [Nonterminal("NAVPLAN")]
+        sentence: list[str] = []
+
+        # --- 1. stochastic top-down expansion -------------
+        while agenda:
+            sym = agenda.pop()            # depth-first is fine
+            if isinstance(sym, Nonterminal):
+                prods = grammar.productions(lhs=sym)
+                if not prods:
+                    # non-expanded nonterminal – abort
+                    raise ValueError(f"No production for {sym}")
+                prod = self._weighted_prod_choice(prods)
+                rhs = list(reversed(prod.rhs()))   # push in reverse for L-to-R
+                agenda.extend(rhs)
+            else:
+                # terminal string
+                sentence.append(str(sym))
+
+            # safety guard
+            if len(sentence) > 200:
+                raise RuntimeError("PCFG expansion runaway (>200 terminals)")
+
+        plan_str = " ".join(sentence)
+        # --- 2. tokenise STEP_u_v → (u,v) ----------------
         self.full_plan_tokens = self._tokenize_plan(plan_str)
         self.token_idx = self.prim_idx = 0
         self.token_prims.clear()
         self.plan_progress = 0.0
 
-        # Final target node = second element of last edge
+        # --- 3. store final target node ID ---------------
         if self.full_plan_tokens:
             _, self.target_node_id = self.full_plan_tokens[-1]
         else:
-            self.target_node_id = None            # edge case: empty plan
+            self.target_node_id = None
 
-        return self.full_plan_tokens            # caller rarely needs the string
-    
+        return self.full_plan_tokens
+        
     def _tokenize_plan(self, full_plan: str) -> list[tuple[int, int]]:
         """Convert 'STEP_9_8 STEP_8_5 …' → [(9,8), (8,5), …]."""
         return [
@@ -170,9 +205,18 @@ class NavigationSystem:
                 return source_node, target_node
                 
         return None, None
-    
+    def push_pose(self, pose):
+        """pose = (x,y,θ) or dict with x,y"""
+        if pose is None:
+            return
+        if isinstance(pose, dict):
+            self._pose_hist.append((float(pose["x"]), float(pose["y"])))
+        else:
+            self._pose_hist.append((float(pose[0]), float(pose[1])))
+
     def universal_navigation(self, submode: str) -> tuple[list[str], int]:
         cur_pose = self.get_current_pose()
+        
 
         if submode == "plan_following":
             return self.step_plan()
@@ -239,18 +283,6 @@ class NavigationSystem:
                                     egocentric_process=None, num_samples=5)
         return primitives, len(primitives)
     
-    def _handle_replan(self, current_pose, objective):
-        """Handle replanning when current objective becomes unreachable"""
-        if isinstance(objective, int):
-            # Crash confidence of the problematic node
-            self._crash_node_confidence(objective)
-            
-        # Generate new plan with updated confidence values
-        grammar = self._rebuild_pcfg_with_updated_confidence()
-        new_plan = self.generate_plan_with_pcfg(grammar)
-        
-        # Execute first step of new plan
-        return self._handle_plan_following(current_pose, self.target_node_id)
     
     def _crash_node_confidence(self, node_id):
         """Reduce confidence of a problematic node"""
@@ -289,148 +321,97 @@ class NavigationSystem:
         x, y, direction = pose
         return State(int(round(x)), int(round(y)), int(direction))
     
-    def _sample_from_pcfg(self, grammar):
-        """Sample a plan from the PCFG"""
-        # Your existing PCFG sampling logic here
-        # This is a placeholder - use your actual implementation
-        pass
     
-    def _extract_target_from_plan(self, plan):
-        """Extract target node ID from sampled plan"""
-        # Parse the plan string to find the ultimate target
-        # This depends on your PCFG structure
-        pass
     
-    def _rebuild_pcfg_with_updated_confidence(self):
-        """Rebuild PCFG with updated node confidence values"""
-        # Your existing build_pcfg_from_memory but considering confidence
-        pass
-
 # Observer integration (to be added to your step function)
-    def plan_progress_placeholder(self):
+        # --------------------------------------------------------------
+    # Navigation quality metric  (0 – 1)
+    # --------------------------------------------------------------
+    def navigation_grade(self) -> float:
         """
-        Enhanced plan progress observer for HMM
+        1.0  → advancing smoothly along plan
+        0.0  → no plan or completely stalled
         """
-        if hasattr(self, 'nav_system'):
-            observer_data = self.nav_system.get_observer_data()
-            
-            # Calculate various metrics for HMM
-            progress_metrics = {
-                'plan_completion': observer_data['plan_progress'],
-                'stuck_flag': 'insufficient_nodes' in observer_data['navigation_flags'],
-                'replan_needed': 'target_became_unviable' in observer_data['navigation_flags'],
-                'no_path_flag': 'no_viable_nodes' in observer_data['navigation_flags']
-            }
-            
-            return progress_metrics
-        
-        return {'plan_completion': 0.0, 'stuck_flag': False, 'replan_needed': False, 'no_path_flag': False}
+        # --- 1. Plan progress component -------------------------
+        prog = self.plan_progress            # -1, 0-1, 1.1
+        if prog < 0 or prog > 1.05:          # no plan or finished
+            plan_part = 0.0
+        else:
+            plan_part = prog                 # already 0..1
 
-    def build_pcfg_from_memory(self):
-        mg      = self.memory_graph
-        emap    = mg.experience_map
-        current = mg.get_current_exp_id()
-        exps_by_dist = mg.get_exps_organised(current)
-        all_exps     = emap.exps
+        # --- 2. Movement component ------------------------------
+        if len(self._pose_hist) < 4:
+            move_part = 0.5                  # neutral until we have data
+        else:
+            # average step length over last N-1 segments
+            segs = [
+                math.hypot(x2 - x1, y2 - y1)
+                for (x1, y1), (x2, y2) in zip(self._pose_hist, list(self._pose_hist)[1:])
+            ]
+            avg_step = sum(segs) / len(segs)
+            # assume 0.30 cell-width per healthy step
+            move_part = max(0.0, min(1.0, avg_step / 0.30))
 
-        # 1) Abstract graph & distance priors
-        graph = {e.id: [l.target.id for l in e.links] for e in all_exps}
-        print("[PCFG DEBUG] graph:", graph)
+        # --- 3. Combine (weighted) ------------------------------
+        return round(0.6 * plan_part + 0.4 * move_part, 3)
 
-        id_to_dist  = {}
-        total_w = 0.0
-        for d in exps_by_dist:
-            dist = math.hypot(d['x'], d['y'])
-            id_to_dist[d['id']] = dist
-            total_w += 1.0/(dist + 1e-5)
+    
+    def build_pcfg_from_memory(self) -> PCFG:
+        mg    = self.memory_graph
+        emap  = mg.experience_map
+        start = mg.get_current_exp_id()
 
-        # 2) Top‐level: EXPLORE→NAVPLAN and NAVPLAN→GOTOₜ
+        # 1. adjacency list
+        graph = {e.id: [l.target.id for l in e.links] for e in emap.exps}
+
+        # 2. confidence-weighted goal prior
+        goals, total_w = {}, 0.0
+        sx, sy, _ = emap.get_pose(start)
+        for exp in emap.exps:
+            if exp.id == start:
+                continue
+            conf = getattr(exp, "confidence", 1.0)
+            dist = math.hypot(exp.x_m - sx, exp.y_m - sy) + 1e-5
+            w = conf / dist
+            goals[exp.id] = w
+            total_w += w
+
+        # 3. small BFS to list a few paths per goal
+        def paths(src, dst, k=12, depth=15):
+            out, q = [], deque([[src]])
+            while q and len(out) < k:
+                p = q.popleft()
+                if p[-1] == dst:
+                    out.append(p)
+                elif len(p) < depth:
+                    for nb in graph.get(p[-1], []):
+                        if nb not in p:
+                            q.append(p + [nb])
+            return out
+
         rules = defaultdict(list)
-        rules['EXPLORE'].append(('NAVPLAN', 1.0))
-        for tgt, dist in id_to_dist.items():
-            p = (1.0/(dist+1e-5)) / total_w
-            rules['NAVPLAN'].append((f'GOTO_{tgt}', p))
-            rules[f'GOTO_{tgt}'].append((f'MOVESEQ_{current}_{tgt}', 1.0))
+        for tgt, w in goals.items():
+            rules["NAVPLAN"].append((f"PATH_{tgt}", w / total_w))
+            for path in paths(start, tgt):
+                rhs = " ".join(f"STEP_{u}_{v}" for u, v in zip(path, path[1:]))
+                rules[f"PATH_{tgt}"].append((rhs, 1.0))  # equal weight per path
 
-        # 3) BFS helper on abstract graph
-        def find_paths(start, goal, max_depth=15, max_paths=10):
-            paths, q = [], deque([[start]])
-            while q and len(paths)<max_paths:
-                path = q.popleft()
-                if path[-1]==goal:
-                    paths.append(path)
-                elif len(path)<max_depth:
-                    for nb in graph.get(path[-1],[]):
-                        if nb not in path:
-                            q.append(path+[nb])
-            return paths
+        # 4. make every STEP symbol a terminal
+        for lhs in list(rules):
+            if lhs.startswith("PATH_"):
+                for rhs, _ in rules[lhs]:
+                    for tok in rhs.split():
+                        if tok not in rules:           # first time we see it
+                            u, v = tok.split("_")[1:3]
+                            rules[tok].append((f"'step({u},{v})'", 1.0))
 
-        # 4) Gather all abstract paths and their edges
-        hop_edges = set()
-        hopseqs   = {}
-        for tgt in id_to_dist:
-            paths = find_paths(current, tgt)
-            hopseqs[tgt] = paths
-            for path in paths:
-                for u,v in zip(path, path[1:]):
-                    hop_edges.add((u,v))
-        hop_edges.add((current, current))
-
-        # 4a) MOVESEQ_current→tgt → HOPSEQ_current→tgt
-        for tgt in id_to_dist:
-            lhs = f'MOVESEQ_{current}_{tgt}'
-            rules[lhs].append((f'HOPSEQ_{current}_{tgt}', 1.0))
-
-        # 4b) HOPSEQ_current→tgt → STEP_u_v … but *prefix* (current→current)
-        for tgt, paths in hopseqs.items():
-            lhs = f'HOPSEQ_{current}_{tgt}'
-            if not paths and current!=tgt:
-                # no path found
-                rules[lhs].append((f'STEP_{current}_{tgt}', 1.0))
-                hop_edges.add((current, tgt))
-            else:
-                w = 1.0/len(paths) if paths else 1.0
-                for path in paths:
-                    # *** here’s the dummy “first hop” ***
-                    hops = [(current, current)] + list(zip(path, path[1:]))
-                    seq = [f'STEP_{u}_{v}' for u,v in hops]
-                    rhs = " ".join(seq)
-                    rules[lhs].append((rhs, w))
-                    print(f"[PCFG DEBUG] HOPSEQ {lhs} ← {hops} → {seq}")
-
-        # 5) STEP_u_v → primitives OR fallback
-        for (u,v) in hop_edges:
-            lhs = f'STEP_{u}_{v}'
-            prims = self.get_primitives(u, v)
-            if prims:
-                rhs = " ".join(f"'{p}'" for p in prims)
-                rules[lhs].append((rhs, 1.0))
-                print(f"[PCFG DEBUG] STEP_{u}_{v} → prims {prims}")
-            else:
-                rules[lhs].append((f"'step({u},{v})'", 1.0))
-                print(f"[PCFG DEBUG] STEP_{u}_{v} → fallback 'step({u},{v})'")
-
-        # 6) Optional hard‐coded extras
-        hard = {
-        f'MOVESEQ_{current}_18': [f"step({current},19)","step(19,18)"],
-        f'MOVESEQ_{current}_3' : [f"step({current},5)","step(5,4)","step(4,3)"],
-        }
-        for lhs, steps in hard.items():
-            if lhs not in rules:
-                rhs = " ".join(f"'{s}'" for s in steps)
-                rules[lhs].append((rhs, 1.0))
-                print(f"[PCFG DEBUG] hardcoded {lhs} → {steps}")
-
-        # 7) Assemble into PCFG
-        pcfg_lines = []
+        # 5. serialise
+        lines = []
         for lhs, prods in rules.items():
-            total = sum(p for _,p in prods)
-            for rhs,p in prods:
-                pcfg_lines.append(f"{lhs} -> {rhs} [{p/total:.4f}]")
-
-        grammar_src = "\n".join(pcfg_lines)
-        print("[PCFG DEBUG] Final grammar:\n" + grammar_src)
-        return PCFG.fromstring(grammar_src)
+            Z = sum(p for _, p in prods)
+            for rhs, p in prods:
+                lines.append(f"{lhs} -> {rhs} [{p/Z:.4f}]")
+        return PCFG.fromstring("\n".join(lines))
           
     def get_primitives(self, u: int, v: int) -> list[str]:
         """
@@ -449,7 +430,7 @@ class NavigationSystem:
             return list(link.path_forward)
 
         # 1) No cache → build an A* state from our current *real* pose
-        real = self.agent_current_pose 
+        real = self.get_current_pose()
         if real is None:
             raise RuntimeError("No last_real_pose available for A* start!")
         sx, sy, sd = real
@@ -479,7 +460,7 @@ class NavigationSystem:
         """
         Scan your ExperienceMap for a u→v link; return it or None.
         """
-        emap = self.models_manager.memory_graph.experience_map
+        emap = self.memory_graph.experience_map
         for exp in emap.exps:
             if exp.id == u:
                 for link in exp.links:
@@ -578,3 +559,109 @@ class NavigationSystem:
 
         print("[A*] no path found → returning empty")
         return []
+# -----------------------------------------------------------
+# 0.  Minimal stubs for MemoryGraph / ExperienceMap
+# -----------------------------------------------------------
+class DummyLink:
+    def __init__(self, target):  self.target = target
+
+class DummyExp:
+    def __init__(self, _id, x, y, conf=1.0):
+        self.id = _id
+        self.x_m, self.y_m = x, y
+        self.confidence = conf
+        self.links = []
+
+class DummyExperienceMap:
+    def __init__(self, exps):
+        self.exps = exps
+    def get_pose(self, eid):
+        e = next(e for e in self.exps if e.id == eid)
+        return (e.x_m, e.y_m, 0)
+
+class DummyMemoryGraph:
+    def __init__(self, exps):
+        self.experience_map = DummyExperienceMap(exps)
+        self._current = 0
+    def get_current_exp_id(self):
+        return self._current
+    def set_current(self, eid):
+        self._current = eid
+
+# -----------------------------------------------------------
+# 1.  Build a tiny map: 0 ↔ 1 ↔ 2 with confidences
+# -----------------------------------------------------------
+n0, n1, n2 = DummyExp(0, 0, 0), DummyExp(1, 1, 0), DummyExp(2, 2, 0)
+n0.links.append(DummyLink(n1))
+n1.links.append(DummyLink(n0)); n1.links.append(DummyLink(n2))
+n2.links.append(DummyLink(n1))
+mem_graph = DummyMemoryGraph([n0, n1, n2])
+
+# -----------------------------------------------------------
+# 2.  Live pose variable + lambda getter
+# -----------------------------------------------------------
+current_pose = [0.0, 0.0, 0]          # mutable list so lambda sees updates
+pose_lambda  = lambda: current_pose
+
+# -----------------------------------------------------------
+# 3.  Instantiate NavigationSystem
+# -----------------------------------------------------------
+nav = NavigationSystem(mem_graph, pose_lambda)
+
+# Monkey-patch get_primitives (edge → two fake primitives)
+nav.get_primitives = lambda u, v: [f"edge({u}->{v})-a", f"edge({u}->{v})-b"]
+# Monkey-patch astar_prims (evade detour)
+nav.astar_prims   = lambda *a, **kw: ["detour-left", "detour-fwd"]
+
+# -----------------------------------------------------------
+# 4.  Build PCFG & initial plan
+# -----------------------------------------------------------
+grammar = nav.build_pcfg_from_memory()
+plan    = nav.generate_plan_with_pcfg(grammar)
+print("\n--- Sampled plan:", plan, "\n")
+
+# -----------------------------------------------------------
+# 5.  Helper to print nav state each tick
+# -----------------------------------------------------------
+def dump(prefix):
+    print(f"{prefix}  token_idx={nav.token_idx}  prim_idx={nav.prim_idx} "
+          f"progress={nav.plan_progress:.3f}  pose_hist={list(nav._pose_hist)}")
+
+# -----------------------------------------------------------
+# 6.  Simulate ticks
+# -----------------------------------------------------------
+print(">> plan_following for 4 primitives")
+for _ in range(4):
+    prims, _ = nav.universal_navigation("plan_following")
+    current_pose[0] += 0.3            # pretend we moved forward
+    nav.push_pose(tuple(current_pose))
+    dump(f"  issued {prims}")
+
+print("\n>> switch to evade for 1 tick")
+prims, _ = nav.universal_navigation("evade")
+current_pose[0] += 0.1
+nav.push_pose(tuple(current_pose))
+dump(f"  evade {prims}")
+
+print("\n>> back to plan_following for 3 primitives")
+for _ in range(3):
+    prims, _ = nav.universal_navigation("plan_following")
+    current_pose[0] += 0.3
+    nav.push_pose(tuple(current_pose))
+    dump(f"  issued {prims}")
+
+print("\n>> force replan (simulate blocked edge)")
+prims, _ = nav.universal_navigation("replan")
+dump(f"  after replan {prims}")
+
+print("\n>> finish new plan")
+while True:
+    prims, _ = nav.universal_navigation("plan_following")
+    if not prims:
+        break
+    current_pose[0] += 0.3
+    nav.push_pose(tuple(current_pose))
+    dump(f"  issued {prims}")
+
+print("\n### Final plan_progress =", nav.plan_progress,
+      "navigation_grade =", nav.navigation_grade())

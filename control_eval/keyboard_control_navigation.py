@@ -45,6 +45,7 @@ from navigation_model.visualisation_tools import (
     visualise_image,visualize_replay_buffer)
 from control_eval.HierarchicalHMMBOCPD import HierarchicalBayesianController
 from control_eval.NavigationSystem import NavigationSystem
+from gym_minigrid.minigrid import Wall 
 
 def print_keys_explanation():
     print('NOTE: the agent needs a first push forward to initialise the model with a first observation. \
@@ -119,9 +120,12 @@ class MinigridInteraction():
         self.automatic_process = False
 
         #--- ENV INIT ---#
-        self.env_name = 'MiniGrid-' + args.env + '-v0'
+        #self.env_name = 'MiniGrid-' + args.env + '-v0'
+        self.env_name= 'MiniGrid-ADRooms-Collision-v0'
         print(self.env_name)
         self.env = gym.make(self.env_name, rooms_in_row=args.rooms_in_row, rooms_in_col=args.rooms_in_col)
+        import inspect, sys
+        print("ENV CODE =", inspect.getfile(self.env.__class__))
         self.env = RGBImgPartialObsWrapper(self.env)
         self.env = ImgActionObsWrapper(self.env)
         self.window = Window(self.env_name)
@@ -131,6 +135,7 @@ class MinigridInteraction():
                 self.models_manager.memory_graph,
                 lambda: self.agent_current_pose
             )
+        self.nav_system.key=self
 
         self.reset()
 
@@ -566,6 +571,7 @@ class MinigridInteraction():
     def agent_step(self, action) -> tuple[bool,dict]:
         print('step in world:', self.step_count())
         print('action to apply:',action)
+        print("type",type(action))
         prev = self.last_pose
         #bridge = CvBridge()
         #img_msg = rospy.wait_for_message("/camera/depth_registered/rgb/image_raw", Image, timeout=10)
@@ -576,6 +582,7 @@ class MinigridInteraction():
         print(obs.keys(),obs["pose"], obs["image"].shape)
         obs = no_vel_no_action(obs)
         self.agent_current_pose=obs["pose"]
+        self.nav_system.push_pose(obs["pose"])
         pos = obs['pose']
         self.last_pose = pos
         emap = self.models_manager.memory_graph.experience_map
@@ -605,14 +612,60 @@ class MinigridInteraction():
 
         self.update_replay_buffer(current_state)
         hmm_info_gain=self.info_gain(obs['image'],obs['pose'], self.replay_buffer, self.models_manager.memory_graph)
-        hmm_plan_progress=self.plan_progress_placeholder()
+        hmm_plan_progress=self.nav_system.navigation_grade()
         current_mode,stats=self.hmm_bayes.update(self.replay_buffer,hmm_info_gain,hmm_plan_progress)
         current_mode = stats["most_likely_state"][0]
         print("############",current_mode,stats)
         self.mode_changed = (current_mode != self.prev_mode)
         self.prev_mode    = current_mode
-        #if self.step_count()>20:
-            grammar = self.build_pcfg_from_memory()
+        if self.step_count()==7:
+            #self.env.put_obj(Wall(), 14, 10) 
+            sx,sy,sd=obs["pose"]
+            gx,gy,gd=[-3,0,2]
+            start= State(int(round(sx)), int(round(sy)), int(sd))
+            goal = State(int(round(gx)), int(round(gy)), int(gd))
+            path=self.astar_prims(start,goal,self.models_manager.egocentric_process)
+            print(path)
+            gx,gy,gd=[6,2,3]
+            start= State(int(round(sx)), int(round(sy)), int(sd))
+            goal = State(int(round(gx)), int(round(gy)), int(gd))
+            path=self.astar_prims(start,goal,self.models_manager.egocentric_process)
+            print(path)
+        if self.step_count()==4:
+            sx,sy,sd=obs["pose"]
+            gx,gy,gd=[-3,0,2]
+            start= State(int(round(sx)), int(round(sy)), int(sd))
+            goal = State(int(round(gx)), int(round(gy)), int(gd))
+            path=self.astar_prims(start,goal,self.models_manager.egocentric_process)
+            print(path)
+            gx,gy,gd=[6,2,3]
+            goal = State(int(round(gx)), int(round(gy)), int(gd))
+            path=self.astar_prims(start,goal,self.models_manager.egocentric_process)
+            print(path)
+        if self.step_count()==9:
+            sx,sy,sd=obs["pose"]
+            gx,gy,gd=[-3,0,2]
+            start= State(int(round(sx)), int(round(sy)), int(sd))
+            goal = State(int(round(gx)), int(round(gy)), int(gd))
+            path=self.astar_prims(start,goal,self.models_manager.egocentric_process)
+            print(path)
+            gx,gy,gd=[6,2,3]
+            goal = State(int(round(gx)), int(round(gy)), int(gd))
+            path=self.astar_prims(start,goal,self.models_manager.egocentric_process)
+            print(path)
+        if self.step_count()==11:
+            sx,sy,sd=obs["pose"]
+            gx,gy,gd=[-3,0,2]
+            start= State(int(round(sx)), int(round(sy)), int(sd))
+            goal = State(int(round(gx)), int(round(gy)), int(gd))
+            path=self.astar_prims(start,goal,self.models_manager.egocentric_process)
+            print(path)
+            gx,gy,gd=[6,2,3]
+            goal = State(int(round(gx)), int(round(gy)), int(gd))
+            path=self.astar_prims(start,goal,self.models_manager.egocentric_process)
+            print(path)
+        
+            #grammar = self.build_pcfg_from_memory()
             #self.print_adaptive_pcfg_plans(grammar)
             
         return self.models_manager.agent_lost(), obs
@@ -621,6 +674,7 @@ class MinigridInteraction():
         motion_data = []
         agent_lost = False
         print("n_sctions",n_actions, policy,self.convert_hot_encoded_to_minigrid_action(policy[0]))
+        policy=[[1,0,0],[1,0,0],[1,0,0],[1,0,0],[0,0,1],[0,0,1],[0,0,1],[0,1,0],[1,0,0],[1,0,0]]
         for a in range(len(policy)):   
         #for a in range(n_actions):
             action = self.convert_hot_encoded_to_minigrid_action(policy[a])
@@ -795,6 +849,7 @@ class MinigridInteraction():
                 self.models_manager.reset_variable_lookahead_to_default()
 
         return policy, n_action
+        return 
     def push_explo_stm(self):
             pose_history=self.compute_pose_history()
             self.extract_past_actions(self.replay_buffer)
