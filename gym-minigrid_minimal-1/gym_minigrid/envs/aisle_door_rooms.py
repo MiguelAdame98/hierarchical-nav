@@ -341,7 +341,7 @@ class AisleDoorRoomsObstacles(MiniGridEnv):
         automatic_door=True,
         wT_around=6,
         wT_size=1,
-        obstacle_rate=0.3,          # ← 5 % of free cells become walls
+        obstacle_rate=0.15,          # ← 5 % of free cells become walls
         max_steps=100,               # ← horizon for “survival”
         debug=True,                 # ← print everything?
     ):
