@@ -2,6 +2,8 @@
 from control_eval.keyboard_control_navigation import MinigridInteraction as keyboard_interaction
 from control_eval.automatic_env_run import run_test
 from control_eval.arguments import parser
+import sys, pathlib
+
 
 
 if __name__ == "__main__":

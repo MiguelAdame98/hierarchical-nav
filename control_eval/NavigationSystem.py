@@ -1009,6 +1009,13 @@ class NavigationSystem:
         x, y, th = pose
         nx, ny, nth = self.memory_graph.experience_map.get_pose(node_id)
         return int(round(x)) == int(nx) and int(round(y)) == int(ny) 
+    def _coalesce(self, *vals):
+        """Return the first value that is not None."""
+        for v in vals:
+            if v is not None:
+                return v
+        return None
+
     def _next_hop_after(self, v: int) -> int | None:
         """Return w if the next token is v->w, else None."""
         i = int(getattr(self, "token_idx", 0))
@@ -1018,32 +1025,44 @@ class NavigationSystem:
                 return w
         return None
 
-    def _heading_from_to(self, from_id: int, to_id: int) -> int | None:
-        """Grid heading 0:E,1:N,2:W,3:S from node pose deltas (x,y only)."""
+    def _heading_from_to(self, from_id: int, to_id: int | None) -> int | None:
+        """
+        Grid heading 0:E,1:N,2:W,3:S from pose deltas (x,y only).
+        Safe when to_id is None or positions are identical (returns None).
+        """
+        if to_id is None:
+            return None
         fx, fy, _ = self.memory_graph.experience_map.get_pose(from_id)
         tx, ty, _ = self.memory_graph.experience_map.get_pose(to_id)
-        dx, dy = tx - fx, ty - fy
+        dx = int(round(tx - fx))
+        dy = int(round(ty - fy))
+        if dx == 0 and dy == 0:
+            return None
+        # Prefer axis with larger magnitude; ties fall back to x-axis
         if abs(dx) >= abs(dy):
-            if dx > 0: return 0  # east
-            if dx < 0: return 2  # west
-        if dy > 0: return 1      # north
-        if dy < 0: return 3      # south
-        return None  # same cell; keep fallback
+            return 0 if dx > 0 else 2
+        else:
+            return 1 if dy > 0 else 3
 
     def _astar_to_node(self, wm, belief, start: "State", v: int, debug: bool = False):
         """
         Run A* from 'start' to node v, picking a *preferred* goal heading:
         • face from v toward next hop (if any),
-        • else keep start.d (avoid spins at goal),
-        • else fall back to stored gd.
+        • else keep start.d (avoid gratuitous spins at final goal),
+        • else fall back to stored gd at v.
         """
         gx, gy, gd_stored = self.memory_graph.experience_map.get_pose(v)
-        goal_dir = self._heading_from_to(v, self._next_hop_after(v)) or int(start.d) % 4 or int(gd_stored) % 4
+
+        # Compute preferred heading safely (don’t use boolean `or` with ints)
+        preferred = self._heading_from_to(v, self._next_hop_after(v))
+        goal_dir = self._coalesce(preferred, int(start.d) % 4, int(gd_stored) % 4)
+        if goal_dir is None:
+            goal_dir = int(gd_stored) % 4  # super-safe fallback
+
         goal = State(int(round(gx)), int(round(gy)), int(goal_dir))
         if debug:
-            print(f"[_astar_to_node] v={v} start={start} goal={goal} (stored_gd={gd_stored})")
+            print(f"[_astar_to_node] v={v} start={start} goal={goal} (stored_gd={gd_stored}, next={self._next_hop_after(v)})")
         return self.planner.astar_prims(wm, belief, start, goal, verbose=debug)
-
 
     def universal_navigation(self, submode: str, wm, belief) -> tuple[list[str], int]:
         dbg = getattr(self, "debug_universal_navigation", False)
