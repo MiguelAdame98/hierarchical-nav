@@ -188,8 +188,8 @@ class SceneEncoder(nn.Module):
             )
 
             
-        # print('aggregated_posterior last step mean: ' + str(round(torch.mean(aggregated_posterior.mean).cpu().detach().numpy().tolist(),4)) +', std: ' +str(round(torch.mean(aggregated_posterior.stdev).cpu().detach().numpy().tolist(),4))\
-        #     + ' var:'+ str(round(torch.mean(aggregated_posterior.variance).cpu().detach().numpy().tolist(),4)))
+        #print('aggregated_posterior last step mean: ' + str(round(torch.mean(aggregated_posterior.mean).cpu().detach().numpy().tolist(),4)) +', std: ' +str(round(torch.mean(aggregated_posterior.stdev).cpu().detach().numpy().tolist(),4))\
+             #+ ' var:'+ str(round(torch.mean(aggregated_posterior.variance).cpu().detach().numpy().tolist(),4)))
      
         return aggregated_posterior
 

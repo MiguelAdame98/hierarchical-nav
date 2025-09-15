@@ -40,6 +40,90 @@ from sys import maxsize
 import math
 import heapq
 import torch
+import cv2
+# ---------- SIMPLE THETA DEBUG (toggle on/off here) ----------
+EM_THETA_DEBUG = True     # set False to silence
+EPS_TH = 1e-6
+NO_DRIFT_MODE = True  
+
+def _wrap_pi(a: float) -> float:
+    return (a + np.pi) % (2*np.pi) - np.pi
+
+def theta_snap(em, tag=""):
+    """One-liner snapshot of angles and deltas."""
+    if not EM_THETA_DEBUG: return
+    if getattr(em, "current_exp", None) is not None:
+        ax, ay, aθ = em.current_exp.x_m, em.current_exp.y_m, em.current_exp.facing_rad
+        gx = ax + em.accum_delta_x
+        gy = ay + em.accum_delta_y
+    else:
+        ax = ay = 0.0; aθ = 0.0
+        gx = em.accum_delta_x; gy = em.accum_delta_y
+    dθ  = em.accum_delta_facing
+    θw  = _wrap_pi(aθ + dθ)
+    print(f"[θ][{tag}] a={aθ:+.3f} Δ={dθ:+.3f} w={θw:+.3f} "
+          f"Δxy=({em.accum_delta_x:+.3f},{em.accum_delta_y:+.3f}) "
+          f"GP=({gx:+.3f},{gy:+.3f})")
+
+def theta_reanchor_check(em, tag=""):
+    """After (re)anchor, deltas must be exactly zero; world θ must equal anchor θ."""
+    if not EM_THETA_DEBUG: return
+    ok_xy = abs(em.accum_delta_x) <= EPS_TH and abs(em.accum_delta_y) <= EPS_TH
+    ok_dθ = abs(_wrap_pi(em.accum_delta_facing)) <= EPS_TH
+    if getattr(em, "current_exp", None) is not None:
+        θw = _wrap_pi(em.current_exp.facing_rad + em.accum_delta_facing)
+        ok_θ = abs(_wrap_pi(θw - em.current_exp.facing_rad)) <= EPS_TH
+    else:
+        ok_θ = True
+    ok = ok_xy and ok_dθ and ok_θ
+    print(f"[θ][{tag}] REANCHOR {'OK' if ok else 'PROBLEM'} "
+          f"Δxy=({em.accum_delta_x:+.3f},{em.accum_delta_y:+.3f}) Δθ={em.accum_delta_facing:+.3f}")
+
+def theta_forward_check(em, vtrans: float, prev_dx: float, prev_dy: float, tag=""):
+    """For a pure translation step, moved direction must align with world θ."""
+    if not EM_THETA_DEBUG or abs(vtrans) < EPS_TH: return
+    aθ = em.current_exp.facing_rad if getattr(em, "current_exp", None) is not None else 0.0
+    θw = _wrap_pi(aθ + em.accum_delta_facing)
+    dx = em.accum_delta_x - prev_dx
+    dy = em.accum_delta_y - prev_dy
+    # project onto heading and lateral
+    fwd =  dx*np.cos(θw) + dy*np.sin(θw)
+    lat = -dx*np.sin(θw) + dy*np.cos(θw)
+    ok  = (fwd > 0.5*vtrans) and (abs(lat) < 1e-3)
+    print(f"[θ][{tag}] MOVE {'OK' if ok else 'PROBLEM'} "
+          f"stepΔ=({dx:+.3f},{dy:+.3f}) proj_fwd={fwd:+.3f} lateral={lat:+.3f}")
+
+def theta_link_check(u, v, link, tag=""):
+    """Right after creating a link: check heading_rad & facing_rad geometry."""
+    if not EM_THETA_DEBUG: return
+    dx, dy = (v.x_m - u.x_m), (v.y_m - u.y_m)
+    abs_head = np.arctan2(dy, dx)
+    head_exp = _wrap_pi(abs_head - u.facing_rad)      # expected link.heading_rad
+    face_exp = _wrap_pi(v.facing_rad - u.facing_rad)  # expected link.facing_rad
+    dh = abs(_wrap_pi(link.heading_rad - head_exp))
+    df = abs(_wrap_pi(link.facing_rad  - face_exp))
+    ok = (dh <= 1e-6 and df <= 1e-6)
+    print(f"[θ][{tag}] LINK {u.id}->{v.id} {'OK' if ok else 'PROBLEM'} "
+          f"h(exp={head_exp:+.3f},link={link.heading_rad:+.3f},Δ={dh:.1e}) "
+          f"f(exp={face_exp:+.3f},link={link.facing_rad:+.3f},Δ={df:.1e})")
+
+def theta_gp_check(em, tag=""):
+    """Compare get_global_position() vs anchor+deltas recompute."""
+    if not EM_THETA_DEBUG: return
+    gx, gy, gθ = em.get_global_position()
+    if getattr(em, "current_exp", None) is not None:
+        ax, ay, aθ = em.current_exp.x_m, em.current_exp.y_m, em.current_exp.facing_rad
+    else:
+        ax = ay = aθ = 0.0
+    x2 = ax + em.accum_delta_x
+    y2 = ay + em.accum_delta_y
+    θ2 = _wrap_pi(aθ + em.accum_delta_facing)
+    ok = (abs(gx - x2) <= 1e-6 and abs(gy - y2) <= 1e-6 and abs(_wrap_pi(gθ - θ2)) <= 1e-6)
+    print(f"[θ][{tag}] GP {'OK' if ok else 'PROBLEM'} "
+          f"get=({gx:+.3f},{gy:+.3f},{gθ:+.3f}) "
+          f"re=({x2:+.3f},{y2:+.3f},{θ2:+.3f})")
+# ---------- END SIMPLE THETA DEBUG ----------
+
 from collections import namedtuple
 State = namedtuple("State", ["x","y","d"])
 DIR_VECS = [(1,0),(0,1),(-1,0),(0,-1)]
@@ -55,7 +139,6 @@ class Experience(object):
                  x_pc, y_pc, th_pc,
                  x_m, y_m, facing_rad,
                  view_cell, local_pose, ghost_exp,
-                 imagined_pose=None,
                  real_pose=None,
                  pose_cell_pose=None):
         '''Initializes the Experience.'''
@@ -72,10 +155,11 @@ class Experience(object):
         self.init_local_position = local_pose
 
         # New pose attributes
-        self.imagined_pose= imagined_pose
+        #self.imagined_pose= imagined_pose
         self.real_pose= real_pose
         self.pose_cell_pose= [x_pc, y_pc, th_pc]
 
+        self.confidence=1
         # Link list
         self.links = []
 
@@ -87,15 +171,20 @@ class Experience(object):
         else:
             self.id = Experience._ID
             Experience._ID += 1
+        self.place_kind = None     # "ROOM", "CORRIDOR", or "UNKNOWN"
+        self.room_color = None     # e.g., "red", "purple", or None
+        self.grid_xy    = None     # (gx, gy) in env grid coord space
+
 
         print(f"[DEBUG][Experience __init__] Created {'ghost' if ghost_exp else ''}Exp{self.id}: ")
         print(f"   pose_cell=({self.x_pc},{self.y_pc},{self.th_pc}), ")
         print(f"   map=({self.x_m:.3f},{self.y_m:.3f},{self.facing_rad:.3f}), ")
-        print(f"   imagined_pose={self.imagined_pose}, real_pose={self.real_pose}, pose_cell_pose={self.pose_cell_pose}")
+        print(f"   real_pose={self.real_pose}, pose_cell_pose={self.pose_cell_pose}")
 
     def link_to(self, target,
                 accum_delta_x, accum_delta_y, accum_delta_facing,
-                active_link, prim_path=None):
+                active_link,
+                confidence=1):
         """
         Create a directed link self → target and append it to self.links.
         Debug prints included.
@@ -103,7 +192,9 @@ class Experience(object):
         print(f"\n[DEBUG][link_to] from Exp{self.id} to Exp{target.id}")
         print(f"   deltas: dx={accum_delta_x:.3f}, dy={accum_delta_y:.3f}, dtheta={accum_delta_facing:.3f}")
         print(f"   self.map=({self.x_m:.3f},{self.y_m:.3f},{self.facing_rad:.3f}), target.map=({target.x_m:.3f},{target.y_m:.3f},{target.facing_rad:.3f})")
-
+        if target is self:
+            print(f"[WARN][link_to] ignoring self-link request {self.id}->{target.id}")
+            return None
         # geometry
         d = np.hypot(accum_delta_x, accum_delta_y)
         abs_heading = np.arctan2(accum_delta_y, accum_delta_x)
@@ -119,7 +210,8 @@ class Experience(object):
             d=d,
             heading_rad=heading_rad,
             active_link=active_link,
-            path=prim_path
+            confidence=int(confidence),
+            
         )
         self.links.append(link)
         print(f"   [DEBUG] Stored link: {link}")
@@ -151,30 +243,25 @@ class ExperienceLink(object):
     def __init__(self, parent, target,
                  facing_rad, d, heading_rad,
                  active_link,
-                 path=None):
+                 confidence=1):
         self.parent       = parent
         self.target       = target
         self.facing_rad   = facing_rad
         self.d            = d
         self.heading_rad  = heading_rad
         self.active_link  = active_link
+        self.confidence   = int(confidence) 
         # Store primitive paths
-        self.path_forward = path or []
-        self.path_reverse = []
-        for act in reversed(self.path_forward):
-            if act == 'forward':
-                self.path_reverse.append('forward')
-            elif act == 'left':
-                self.path_reverse.append('right')
-            elif act == 'right':
-                self.path_reverse.append('left')
-        print(f"[DEBUG][ExperienceLink __init__] Created link {self.parent.id}->{self.target.id}")
-        print(f"   path_forward={self.path_forward}, path_reverse={self.path_reverse}")
+        
+
+        
+        print(f"[DEBUG][ExperienceLink __init__] Created link {self.parent.id}->{self.target.id}", self.confidence)
+   
 
     def __repr__(self):
-        return (f"Link({self.parent.id}->{self.target.id}, d={self.d:.2f}, "
-                f"head={self.heading_rad:.2f}, face={self.facing_rad:.2f}, "
-                f"prims={self.path_forward}, rev={self.path_reverse})")
+        return (f"ExperienceLink({self.parent.id}->{self.target.id}, "
+                f"conf={self.confidence}, d={self.d:.2f}, "
+                f"heading={self.heading_rad:.2f}, active={self.active_link})")
 
 
 class ExperienceMap(object):
@@ -185,12 +272,14 @@ class ExperienceMap(object):
                  correction=0.5, loops=100,
                  constant_adjust=False,
                  replay_buffer=None,
+                 
                  **kwargs):
         print("[DEBUG][ExperienceMap __init__] initializing with replay_buffer=", bool(replay_buffer))
         
         self.replay_buffer = replay_buffer
         self._recent_prims: list[str] = []
-
+        self.env = kwargs.get("env", None)
+        self.area_room_threshold = kwargs.get("area_room_threshold", 12)
         self.last_link_action= None
         self.last_real_pose= None
         self.last_imagined_pose= None
@@ -201,6 +290,7 @@ class ExperienceMap(object):
         self.DELTA_PC_THRESHOLD = delta_pc_threshold
         self.CORRECTION = correction
         self.LOOPS = loops
+        print("past constant adjust", constant_adjust)
         self.constant_adjust = constant_adjust
 
         self.size = 0
@@ -210,100 +300,213 @@ class ExperienceMap(object):
         self.current_view_cell = None
         self.accum_delta_x = 0
         self.accum_delta_y = 0
-        self.accum_delta_facing = np.pi/2
-        
+        self.accum_delta_facing = 0.0
+    def set_env(self, env):
+        """Optionally attach the MiniGrid environment so new exps get annotated."""
+        self.env = env
+    
+    def rgb_to_template64(self,img, eps: float = 1e-6, device="cpu"):
+        """
+        56×56×3 or 64×64×3 RGB  →  64-D descriptor
+        • 48 dims = 16-bin histograms of L*, a*, b*
+        • 16 dims = 4×4 block-mean edge magnitudes (Sobel)
+        Returns: torch.float32 (64,)
+        """
+        import numpy as np, torch, cv2
+        print(img)
+        print(type(img))
+        # --- 0) to HWC uint8 ---
+        if torch.is_tensor(img):
+            arr = img.detach().cpu().numpy()
+            if arr.ndim == 3 and arr.shape[0] in (1,3):  # CHW -> HWC
+                arr = arr.transpose(1,2,0)
+        else:
+            arr = np.asarray(img)
+
+        assert arr.ndim == 3 and arr.shape[-1] == 3, f"expected HxWx3, got {arr.shape}"
+
+        # --- 1) resize to 56×56 (the old pipeline assumes 56 for 14×14 blocks) ---
+        if arr.shape[0] != 56 or arr.shape[1] != 56:
+            arr = cv2.resize(arr, (56,56), interpolation=cv2.INTER_AREA)
+
+        # --- 2) uint8 range ---
+        if arr.dtype != np.uint8:
+            # assume 0..1 floats or other; clamp to [0,255]
+            arr = np.clip(arr, 0, 255)
+            if arr.max() <= 1.0 + 1e-6:
+                arr = (arr * 255.0).round()
+            arr = arr.astype(np.uint8)
+
+        # --- 3) 16-bin Lab histograms (48 dims) ---
+        lab = cv2.cvtColor(arr, cv2.COLOR_RGB2Lab).astype(np.float32)
+        L   = (lab[:, :, 0] * 255.0 / 100.0).clip(0, 255)
+        a   = lab[:, :, 1] + 128.0
+        b   = lab[:, :, 2] + 128.0
+
+        bins = np.linspace(0, 256, 17, dtype=np.float32)
+        h_L, _ = np.histogram(L, bins=bins)
+        h_a, _ = np.histogram(a, bins=bins)
+        h_b, _ = np.histogram(b, bins=bins)
+
+        h48 = np.concatenate([h_L, h_a, h_b]).astype(np.float32)
+        h48 /= h48.sum() + eps
+
+        # --- 4) 4×4 Sobel-edge energy (16 dims) ---
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        mag  = cv2.magnitude(
+            cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3),
+            cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3),
+        )
+        edge16 = [
+            mag[y:y+14, x:x+14].mean()
+            for y in range(0, 56, 14)
+            for x in range(0, 56, 14)
+        ]
+        edge16 = np.asarray(edge16, np.float32)
+        edge16 /= edge16.sum() + eps
+
+        # --- 5) concat → 64-D torch.float32 ---
+        vec64 = np.concatenate([h48, edge16]).astype(np.float32)
+        return torch.from_numpy(vec64).to(device)
+
+    def rgb56_to_template64(self,
+        img,
+        eps: float = 1e-6,
+        device: torch.device = torch.device("cpu"),
+    ) -> torch.Tensor:
+        """
+        56×56×3 RGB  →  64-D descriptor
+            • 48 dims = 16-bin histograms of L*, a*, b*
+            • 16 dims = 4×4 block-mean edge magnitudes (Sobel)
+        """
+
+        # ------------------------------------------------------------------ #
+        # 1. Make sure we have HWC uint8                                     #
+        # ------------------------------------------------------------------ #
+
+
+        if torch.is_tensor(img):
+            if img.shape == (3, 56, 56):                      # CHW tensor
+                img = img.permute(1, 2, 0).contiguous().cpu().numpy()
+                
+            else:
+                img = img.cpu().numpy()
+                
+        else:
+            if img.shape == (3, 56, 56):                      # CHW numpy
+                img = np.transpose(img, (1, 2, 0))
+                
+
+        assert img.shape == (56, 56, 3), f"expected 56×56×3, got {img.shape}"
+
+        if img.dtype != np.uint8:
+            img = (img * 255.0).round().astype(np.uint8)
+            
+
+        # ------------------------------------------------------------------ #
+        # 2. 16-bin Lab histograms (48 dims)                                 #
+        # ------------------------------------------------------------------ #
+        lab = cv2.cvtColor(img, cv2.COLOR_RGB2Lab).astype(np.float32)
+        L   = (lab[:, :, 0] * 255.0 / 100.0).clip(0, 255)
+        a   = lab[:, :, 1] + 128.0
+        b   = lab[:, :, 2] + 128.0
+
+        bins = np.linspace(0, 256, 17, dtype=np.float32)
+        h_L, _ = np.histogram(L, bins=bins)
+        h_a, _ = np.histogram(a, bins=bins)
+        h_b, _ = np.histogram(b, bins=bins)
+
+        h48 = np.concatenate([h_L, h_a, h_b]).astype(np.float32)
+        h48 /= h48.sum() + eps
+
+        # ------------------------------------------------------------------ #
+        # 3. 4×4 Sobel-edge energy (16 dims)                                 #
+        # ------------------------------------------------------------------ #
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        mag  = cv2.magnitude(
+            cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3),
+            cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3),
+        )
+        edge16 = [
+            mag[y : y + 14, x : x + 14].mean()
+            for y in range(0, 56, 14)
+            for x in range(0, 56, 14)
+        ]
+        edge16 = np.asarray(edge16, np.float32)
+        edge16 /= edge16.sum() + eps
+
+        # ------------------------------------------------------------------ #
+        # 4. Concatenate → 64-D  & return torch tensor                       #
+        # ------------------------------------------------------------------ #
+        vec64 = np.concatenate([h48, edge16])
+        print("[DBG] vec64  shape", vec64.shape, " first5", vec64[:5])
+
+        return torch.from_numpy(vec64).to(device)
+
 
     def _create_exp(self, x_pc, y_pc, th_pc,
                     view_cell, local_pose):
-        imagined = tuple(self.last_imagined_pose)
         real     = tuple(self.last_real_pose)
 
         print("\n[DEBUG][_create_exp] creating new experience")
         self.size += 1
-        x_m = self.accum_delta_x + (self.current_exp.x_m if self.current_exp else 0)
-        y_m = self.accum_delta_y + (self.current_exp.y_m if self.current_exp else 0)
-        facing_rad = signed_delta_rad(self.accum_delta_facing, 0)
-
+        if self.current_exp is not None:
+            gx, gy, gth = self.get_global_position()   # (x_cur + Δx, y_cur + Δy, wrap(f_cur + Δθ))
+            x_m, y_m, facing_rad = gx, gy, gth
+        else:
+            x_m = self.accum_delta_x
+            y_m = self.accum_delta_y
+            facing_rad = clip_rad_180(self.accum_delta_facing)
+        
+        facing_rad = self._quantize_cardinal(facing_rad)
+        theta_reanchor_check(self, "after-anchor")
         print(f"   posed at cell=({x_pc},{y_pc},{th_pc}), map=({x_m:.3f},{y_m:.3f},{facing_rad:.3f})")
         print(view_cell.id)
         exp = Experience(
             x_pc, y_pc, th_pc,
             x_m, y_m, facing_rad,
             view_cell, local_pose, ghost_exp=False,
-            imagined_pose=imagined,
             real_pose=real,
             pose_cell_pose=[x_pc,y_pc,th_pc]
         )
+        if getattr(self, "env", None) is not None:
+            self._annotate_place_from_env(exp, self.env)
+        if hasattr(self, "env") and self.env is not None:
+            self._annotate_place_from_env(exp, self.env)
+        
+        e = exp
+        print(f"[PLACE] Expppppppp{e.id} at {e.grid_xy}: {e.place_kind}"
+            + (f" ({e.room_color})" if e.room_color else ""))
+        print(self.get_global_position())
+            # ------------------------------------------------------------------
+            # Handle *empty* A* result safely
+            # ------------------------------------------------------------------
         if self.current_exp is not None:
-            prim_path = self._get_recent_prims(self.current_exp.id, exp.id)
-
-            # 2) plus the last “link action” (never present in buffer yet)
-            if self.last_link_action is not None:
-                final = self._map_raw_action(self.last_link_action)
-                print(f"  [DEBUG3] appending last_link_action -> {final}")
-                prim_path.append(final)
-
-            # 3) debug print & link as before
-            print(f"   [DEBUG][_create_exp] final prim_path = {prim_path}")
-            print(f"   [DEBUG] recent prims for Exp{self.current_exp.id}->{exp.id} = {prim_path}")
-            # 1) simulate where your raw prims would have taken you
-            start_state = self.simulate_prims_to_state(prim_path,
-                            start_state=State(0, 0, 0))
-            # 2) set your goal to “back at origin + default heading”
-            goal_state  = State(0, 0, 0)
-
-            # 3) run A* over (x,y,d)-space using the same egocentric collision check
-            egocentric_process = self.manager.egocentric_process
-            prim_clean = self.astar_prims(
-                start_state,
-                goal_state,
-                egocentric_process=egocentric_process,
-                num_samples=5
-            )
-
-            print(f"[DEBUG][_create_exp]  A* → {prim_clean!r}",prim_path )
-            rev = [ {'forward':'forward','left':'right','right':'left'}[p] for p in reversed(prim_clean) ]
-            # forward link
             self.current_exp.link_to(
                 exp,
                 self.accum_delta_x,
                 self.accum_delta_y,
-                self.accum_delta_facing,
+                exp.facing_rad,
                 active_link=True,
-                prim_path=rev
+                confidence=1
             )
             # backward link
-            
             exp.link_to(
                 self.current_exp,
                 -self.accum_delta_x,
                 -self.accum_delta_y,
                 self.current_exp.facing_rad,
                 active_link=False,
-                prim_path=prim_clean
+                confidence=1
             )
+            theta_link_check(self.current_exp, exp, self.current_exp.links[-1], "create->fwd")
+            theta_link_check(exp, self.current_exp, exp.links[-1], "create->back")
         self.exps.append(exp)
         if view_cell:
             view_cell.exps.append(exp)
         print(f"[DEBUG][_create_exp] total experiences = {len(self.exps)}")
         return exp
-    def simulate_prims_to_state(self, raw_prims: list[str],
-                             start_state: State = State(0,0,0)
-                            ) -> State:
-        """
-        Runs through raw_prims (‘forward’/’left’/’right’) starting from start_state,
-        returns the final State(x,y,d).
-        """
-        x, y, d = start_state.x, start_state.y, start_state.d
-        for prim in raw_prims:
-            if prim == 'forward':
-                dx, dy = DIR_VECS[d]
-                x += dx; y += dy
-            elif prim == 'left':
-                d = (d - 1) % 4
-            elif prim == 'right':
-                d = (d + 1) % 4
-        return State(x, y, d)
+    
     
     def get_pose(self, exp_id: int) -> tuple[float, float, float]:
         """
@@ -387,48 +590,14 @@ class ExperienceMap(object):
         print(f"  [DEBUG3] collected same‐node prims = {seq}")
         return seq
 
-    def _create_ghost_exp(self, x_m, y_m, facing_rad, linked_exp = None):
-        '''Creates a new Experience object.
 
-        This method creates a new experience object, which will be a point the
-        map.
-
-        :param xm: global position x estimation in map
-        :param ym: global position y estimation in map
-        :param facing_rad: global facing estimation in map
-        :return: the new Experience object.
-        '''
-        self.size += 0
-
-
-        exp = Experience(x_pc=0, y_pc=0, th_pc=0, x_m= x_m, y_m = y_m, facing_rad = facing_rad, view_cell=None, ghost_exp=True)
-
-        if linked_exp is not None:
-            accum_delta_x = linked_exp.x_m - x_m
-            accum_delta_y = linked_exp.y_m - y_m
-            accum_delta_facing = signed_delta_rad(linked_exp.facing_rad ,facing_rad)
-            print('In ghost exp creation accum_x, y and facing',exp.id, accum_delta_x,accum_delta_y,accum_delta_facing )
-            print('Given real linked exp', [linked_exp.x_m, linked_exp.y_m,linked_exp.facing_rad], ' and ghost exp ', [exp.x_m, exp.y_m, exp.facing_rad])
-            linked_exp.link_to(
-                exp, accum_delta_x, accum_delta_y, accum_delta_facing, active_link=True)
-            exp.link_to(
-                linked_exp, accum_delta_x, accum_delta_y, accum_delta_facing, active_link=False)
-
-        self.ghost_exps.append(exp)
-
-        return exp
-
-    def update_exp_wt_view_cell(self,updated_exp,  x_pc, y_pc, th_pc, new_view_cell= None, local_pose= None):
-        view_cell_exps = updated_exp.view_cell.exps
-    
-
-        x_m = self.accum_delta_x
-        y_m = self.accum_delta_y
-        
-        facing_rad = clip_rad_180(self.accum_delta_facing)
-
-        x_m += updated_exp.x_m
-        y_m += updated_exp.y_m
+    def update_exp_wt_view_cell(self, updated_exp, x_pc, y_pc, th_pc,
+                            new_view_cell=None, local_pose=None):
+        # anchor + deltas
+        x_m = updated_exp.x_m + self.accum_delta_x
+        y_m = updated_exp.y_m + self.accum_delta_y
+        facing_rad = clip_rad_180(updated_exp.facing_rad + self.accum_delta_facing)
+        facing_rad = self._quantize_cardinal(facing_rad)  # 4 orientations
 
         updated_exp.x_pc = x_pc
         updated_exp.y_pc = y_pc
@@ -440,16 +609,23 @@ class ExperienceMap(object):
         if local_pose is not None:
             updated_exp.init_local_position = local_pose
 
-        
-
         if new_view_cell is not None:
-            for exp in view_cell_exps:
-                if exp.id == updated_exp.id:
-                    view_cell_exps.remove(exp)
+            for e in updated_exp.view_cell.exps:
+                if e.id == updated_exp.id:
+                    updated_exp.view_cell.exps.remove(e)
                     break
             updated_exp.view_cell = new_view_cell
             new_view_cell.exps.append(updated_exp)
+
+        # IMPORTANT: re-anchored → zero the odom deltas
+        self.accum_delta_x = 0.0
+        self.accum_delta_y = 0.0
+        self.accum_delta_facing = 0.0
         
+    def _quantize_cardinal(self, theta):
+        # nearest multiple of pi/2, normalized to [-pi, pi)
+        k = int(np.round(theta / (np.pi/2.0)))
+        return clip_rad_180(k * (np.pi/2.0))
     def get_exp(self, exp_id):
         '''
         Experience lookup by id - assumes ids are monotonically rising
@@ -467,22 +643,6 @@ class ExperienceMap(object):
                     index = 0
 
         return self.exps[index]
-
-    def get_ghost_exp(self, ghost_exp_id):
-        '''
-        Ghost Experience lookup by id 
-        '''
-
-        index = len(self.ghost_exps) - 1
-
-        while self.ghost_exps[index].id != ghost_exp_id:
-            if self.ghost_exps[index].id > ghost_exp_id:
-                index -= 1
-            else:
-                index += 1
-                if index == len(self.ghost_exps):
-                    index = 0
-        return self.ghost_exps[index]
 
     def get_current_exp_id(self):
         ''' where are we?'''
@@ -517,13 +677,21 @@ class ExperienceMap(object):
             experience['init_local_position'] = exp.init_local_position
             experience['observation'] = exp.view_cell.template
             experience['observation_entry_poses'] = exp.view_cell.relevant_poses
+            experience['place_kind'] = getattr(exp, 'place_kind', None)
+            experience['room_color'] = getattr(exp, 'room_color', None)
+            experience['grid_xy']    = getattr(exp, 'grid_xy', None)
+
             #experience['ob_info'] = exp.view_cell.template_info
             if wt_links == True:
                 experience['links'] = exp.links
 
             map_experiences.append(experience)
         return map_experiences
-
+    def _reanchor_to_current(self):
+        """We just committed to self.current_exp as the anchor → zero deltas."""
+        self.accum_delta_x = 0.0
+        self.accum_delta_y = 0.0
+        self.accum_delta_facing = 0.0
     def get_exp_as_dict(self, id=None):
         experience = {}
         if isinstance(id, int):
@@ -536,6 +704,9 @@ class ExperienceMap(object):
             experience['y'] = exp.y_m
             experience['facing'] = exp.facing_rad
             experience['observation'] = exp.view_cell.template
+            experience['place_kind'] = getattr(exp, 'place_kind', None)
+            experience['room_color'] = getattr(exp, 'room_color', None)
+            experience['grid_xy']    = getattr(exp, 'grid_xy', None)
             #experience['ob_info'] = exp.view_cell.template_info
             #print('exp ' + str(self.current_exp.id) +' map position x: ' + str(self.current_exp.x_m) + ' y: '+str(self.current_exp.y_m) +' facing: ' +str(self.current_exp.facing_rad))
         return experience
@@ -547,19 +718,23 @@ class ExperienceMap(object):
         else:
             delta_exp = euclidian_distance([x,y], [delta_x, delta_y]) 
             
-            #print('accumulated dist from prev exp: ' + str(accum_delta_x) + ' y: '+str(accum_delta_y) )
-            # print('current view position x: ' + str(self.current_exp.x_m) + ' y: '+str(self.current_exp.y_m) ) 
-            # print('delta_exp and th', delta_exp , self.DELTA_EXP_THRESHOLD )
-            #print ("delta exppppp", delta_exp,"x",x,"y",y,"Dx",delta_x,"Dy",delta_y )
+        
         return delta_exp   
 
     def accumulated_delta_location(self, vtrans, vrot):
-        #% integrate the delta x, y, facing
-        accum_delta_facing = clip_rad_180(self.accum_delta_facing + vrot)
-        accum_delta_x = self.accum_delta_x + vtrans * np.cos(self.accum_delta_facing)
-        accum_delta_y = self.accum_delta_y + vtrans * np.sin(self.accum_delta_facing)
-        print("accum_deltax and y",accum_delta_x, accum_delta_y,"self",self.accum_delta_x, self.accum_delta_y)
-        return accum_delta_facing, accum_delta_x, accum_delta_y
+        # Update delta heading first
+        new_delta_facing = clip_rad_180(self.accum_delta_facing + vrot)
+
+        # Heading to move along in MAP/world coordinates
+        if self.current_exp is not None:
+            theta_world = clip_rad_180(self.current_exp.facing_rad + new_delta_facing)
+        else:
+            theta_world = new_delta_facing  # no anchor yet
+
+        new_delta_x = self.accum_delta_x + vtrans * np.cos(theta_world)
+        new_delta_y = self.accum_delta_y + vtrans * np.sin(theta_world)
+
+        return new_delta_facing, new_delta_x, new_delta_y
 
     def delta_exp_above_thresold(self, delta_exp:float)->bool:
         print('delta exp and delta threshold', delta_exp, self.DELTA_EXP_THRESHOLD)
@@ -570,16 +745,18 @@ class ExperienceMap(object):
         return delta_pc > self.DELTA_PC_THRESHOLD
 
     def get_global_position(self):
-        if self.current_exp is not None:
-            current_x_m =  self.accum_delta_x + self.current_exp.x_m
-            current_y_m =  self.accum_delta_y + self.current_exp.y_m
-            print("accum",self.accum_delta_x, self.accum_delta_y,self.accum_delta_facing, "m loc",self.current_exp.x_m,self.current_exp.y_m,self.current_exp.facing_rad)
+        if self.current_exp is None:
+            return (
+                self.accum_delta_x,
+                self.accum_delta_y,
+                clip_rad_180(self.accum_delta_facing),
+            )
+        return (
+            self.current_exp.x_m + self.accum_delta_x,
+            self.current_exp.y_m + self.accum_delta_y,
+            clip_rad_180(self.current_exp.facing_rad + self.accum_delta_facing),
+        )
         
-        else:
-            current_x_m =  self.accum_delta_x
-            current_y_m =  self.accum_delta_y
-        
-        return [float(current_x_m), float(current_y_m), float(self.accum_delta_facing)]
     
     def get_exp_global_position(self, exp:object=-1)->list:
         if isinstance(exp, int):
@@ -590,6 +767,206 @@ class ExperienceMap(object):
         elif exp is None:
             raise "get_exp_global_position can't accept element" + str(exp) +'of type' + str(type(exp))
         return [exp.x_m, exp.y_m, exp.facing_rad] 
+    # ────────────────────────────── MiniGrid tagging helpers ──────────────────────
+    def _env_unwrapped(self, env):
+        # Some wrappers hide grid; unwrapped always has .grid and .agent_pos
+        return getattr(env, "unwrapped", env)
+
+    def _get_agent_floor_cell(self, env):
+        """
+        Return (cell, (gx,gy)) where cell is the WorldObj under the agent,
+        or None if out of bounds.
+        """
+        e = self._env_unwrapped(env)
+        gx, gy = map(int, map(float, e.agent_pos))   # ensure ints
+        if gx < 0 or gy < 0 or gx >= e.width or gy >= e.height:
+            return None, (gx, gy)
+        return e.grid.get(gx, gy), (gx, gy)
+
+       # ------------------ Place/Color classification helpers ------------------
+
+    def _env_unwrapped(self, env):
+        return getattr(env, "unwrapped", env)
+
+    def _neighbors4(self, x, y):
+        return ((x+1,y), (x-1,y), (x,y+1), (x,y-1))
+
+    def _is_floor(self, obj):
+        # MiniGrid WorldObj: .type ∈ {'floor', 'wall', 'door', ...}
+        return getattr(obj, "type", None) == "floor"
+
+    def _is_corridor_color_name(self, color_name: str | None) -> bool:
+        # In many ADRooms/Minigrid variants corridors are 'black', 'grey', or 'gray'
+        if not color_name:
+            return False
+        c = color_name.lower()
+        return c in ("black", "grey", "gray")
+
+    def _flood_fill_floor(self, env, start_xy, max_tiles=400):
+        """BFS over contiguous floor tiles; returns area, color histogram, and bounds."""
+        from collections import deque, Counter
+        e = self._env_unwrapped(env)
+        W, H = e.width, e.height
+        sx, sy = start_xy
+        if not (0 <= sx < W and 0 <= sy < H):
+            return {"area": 0, "colors": Counter(), "bounds": (sx, sx, sy, sy)}
+
+        seen = set()
+        q = deque([(sx, sy)])
+        colors = Counter()
+        xmin = xmax = sx
+        ymin = ymax = sy
+
+        while q and len(seen) < max_tiles:
+            x, y = q.popleft()
+            if (x, y) in seen:
+                continue
+            seen.add((x, y))
+            cell = e.grid.get(x, y)
+            if not self._is_floor(cell):
+                continue
+
+            colors[getattr(cell, "color", None)] += 1
+            if x < xmin: xmin = x
+            if x > xmax: xmax = x
+            if y < ymin: ymin = y
+            if y > ymax: ymax = y
+
+            for nx, ny in self._neighbors4(x, y):
+                if 0 <= nx < W and 0 <= ny < H and (nx, ny) not in seen:
+                    ncell = e.grid.get(nx, ny)
+                    if self._is_floor(ncell):
+                        q.append((nx, ny))
+
+        return {"area": len(seen), "colors": colors, "bounds": (xmin, xmax, ymin, ymax)}
+
+    def _classify_place_from_xy(self, env, gx, gy, *, area_room_threshold=None):
+        """Classify (ROOM/CORRIDOR/UNKNOWN, color) at a specific grid cell."""
+        e = self._env_unwrapped(env)
+        if not (0 <= gx < e.width and 0 <= gy < e.height):
+            return "UNKNOWN", None, (gx, gy)
+
+        cell = e.grid.get(gx, gy)
+        if not self._is_floor(cell):
+            return "UNKNOWN", None, (gx, gy)
+
+        color = getattr(cell, "color", None)
+        # If it is an explicitly colored floor (not corridor palette), it's a ROOM
+        if color and not self._is_corridor_color_name(color):
+            return "ROOM", color, (gx, gy)
+
+        # Otherwise use region size and dominant non-corridor color
+        region = self._flood_fill_floor(env, (gx, gy))
+        thr = self.area_room_threshold if area_room_threshold is None else area_room_threshold
+        kind = "ROOM" if region["area"] >= thr else "CORRIDOR"
+
+        # For ROOMs on neutral/black tiles, infer dominant non-corridor color in region
+        dom = None
+        if kind == "ROOM":
+            # Filter out corridor palette; keep any true colors including 'purple'
+            candidates = [(c, n) for c, n in region["colors"].items()
+                          if c and not self._is_corridor_color_name(c)]
+            if candidates:
+                dom = max(candidates, key=lambda t: t[1])[0]
+        return kind, dom, (gx, gy)
+
+    def _classify_place_from_xy(self, env, gx, gy, *, area_room_threshold=None):
+        """
+        Classify an arbitrary (gx,gy). Uses metadata first, then door/corridor,
+        then a robust bounds-based room fallback, then floor color as last resort.
+        """
+        try:
+            e = self._env_unwrapped(env)
+        except Exception:
+            e = getattr(env, "unwrapped", env)
+
+        gx = int(gx); gy = int(gy)
+
+        # 1) Exact mapping via xy_to_room
+        rid = None
+        if hasattr(e, "get_room_id_at"):
+            rid = e.get_room_id_at(gx, gy)
+        elif hasattr(e, "xy_to_room"):
+            rid = e.xy_to_room.get((gx, gy))
+        if rid is not None:
+            color = None
+            if hasattr(e, "get_room_color_by_room"):
+                color = e.get_room_color_by_room(rid)
+            elif hasattr(e, "room_meta"):
+                color = (e.room_meta.get(rid) or {}).get("color")
+            return "ROOM", color, rid
+
+        # 2) Door?
+        is_door, door_color = False, None
+        try:
+            cell = e.grid.get(gx, gy) if (0 <= gx < e.width and 0 <= gy < e.height) else None
+        except Exception:
+            cell = None
+        if cell is not None and getattr(cell, "type", None) == "door":
+            is_door, door_color = True, getattr(cell, "color", None)
+        if not is_door and hasattr(e, "door_xy"):
+            is_door = (gx, gy) in set(e.door_xy)
+        if is_door:
+            return "DOOR", door_color, (gx, gy)
+
+        # 3) Corridor?
+        if hasattr(e, "corridor_xy") and (gx, gy) in e.corridor_xy:
+            return "CORRIDOR", None, (gx, gy)
+
+        # 4) Robust bounds-based room fallback (fills any mapping holes)
+        if hasattr(e, "room_meta"):
+            for rid2, meta in e.room_meta.items():
+                b = meta.get("bounds")
+                if not b or len(b) != 4:
+                    continue
+                x1, y1, x2, y2 = map(int, b)
+                # inclusive bounds
+                if x1 <= gx <= x2 and y1 <= gy <= y2:
+                    return "ROOM", meta.get("color", None), rid2
+
+        # 5) Last resort: tile-inspection (may classify black floor as ROOM — but only if we
+        #    failed to identify corridor, which should be rare now that we register full stripes)
+        if cell is not None and getattr(cell, "type", None) == "floor":
+            return "ROOM", getattr(cell, "color", None), (gx, gy)
+
+        return "UNKNOWN", None, (gx, gy)
+    
+    def _classify_place_at_agent(self, env, *, area_room_threshold=None):
+        """
+        Returns (place_kind, color, grid_xy)
+        - place_kind ∈ {"ROOM","CORRIDOR","DOOR","UNKNOWN"}
+        - color: room color (or door color) if known
+        - grid_xy: (col,row) for ROOM (preferred) else (gx,gy)
+        """
+        try:
+            e = self._env_unwrapped(env)
+        except Exception:
+            e = getattr(env, "unwrapped", env)
+
+        try:
+            gx, gy = map(int, map(float, getattr(e, "agent_pos", (None, None))))
+        except Exception:
+            gx = gy = None
+        if gx is None or gy is None:
+            return "UNKNOWN", None, None
+
+        return self._classify_place_from_xy(env, gx, gy, area_room_threshold=area_room_threshold)
+
+
+    def _annotate_place_from_env(self, exp, env):
+        """
+        Fill exp.place_kind, exp.room_color, exp.grid_xy using env's room/corridor map
+        created at generation time. Falls back to tile-inspection if metadata is absent.
+        """
+        try:
+            kind, color, gxy = self._classify_place_at_agent(env)
+        except Exception:
+            kind, color, gxy = "UNKNOWN", None, None
+
+        exp.place_kind = kind
+        exp.room_color = color
+        exp.grid_xy    = gxy
+        return exp
         
             
 
@@ -604,8 +981,11 @@ class ExperienceMap(object):
         :param vrot: the rotation of the robot given by odometry.
         :param adjust: run the map adjustment procedure.
         '''
-
-        self.accum_delta_facing,self.accum_delta_x, self.accum_delta_y  = self.accumulated_delta_location(vtrans,vrot)
+        prev_dx, prev_dy = self.accum_delta_x, self.accum_delta_y
+        self.accum_delta_facing, self.accum_delta_x, self.accum_delta_y = self.accumulated_delta_location(vtrans, vrot)
+        theta_snap(self, "post-integrate")
+        theta_forward_check(self, vtrans, prev_dx, prev_dy, "post-integrate")
+        
         #delta_prev_exp = self.get_delta_exp(0,0,self.accum_delta_x, self.accum_delta_y)
         #print('accumulated dist from prev exp: ' + str(self.accum_delta_x) + ' y: '+str(self.accum_delta_y) )
         
@@ -669,7 +1049,7 @@ class ExperienceMap(object):
             self.current_exp = exp
             self.accum_delta_x = 0
             self.accum_delta_y = 0
-            self.accum_delta_facing = self.current_exp.facing_rad
+            self.accum_delta_facing = 0
             #self.current_exp = view_cell.exps[0]
         #if we loaded a memory map, then we need to get experience matching view cell
         elif self.current_exp is None:
@@ -682,7 +1062,7 @@ class ExperienceMap(object):
                    
 
         #We have a new view but it's close to a previous experience
-        elif len(view_cell.exps) == 0 and min_delta_GP_val < self.DELTA_EXP_THRESHOLD:
+        elif len(view_cell.exps) == 0 and min_delta_GP_val < (self.DELTA_EXP_THRESHOLD):
             print('too close from exp', min_delta_GP_id, ', dist between exp and here', min_delta_GP_val)
             print("current exp", self.current_exp)
             exp = self.get_exp(min_delta_GP_id)
@@ -709,97 +1089,36 @@ class ExperienceMap(object):
                         close_loop_exp,
                         self.accum_delta_x,
                         self.accum_delta_y,
-                        self.accum_delta_facing,
+                        close_loop_exp.facing_rad,
                         active_link=True
                     )
                     close_loop_exp.link_to(
                         self.current_exp,
-                        self.accum_delta_x,
-                        self.accum_delta_y,
-                        self.accum_delta_facing,
+                        -self.accum_delta_x,
+                        -self.accum_delta_y,
+                        self.current_exp.facing_rad,
                         active_link=False
                     )
+                    theta_link_check(self.current_exp, close_loop_exp, self.current_exp.links[-1], "match->fwd")
+                    theta_link_check(close_loop_exp, self.current_exp, close_loop_exp.links[-1], "match->back")
 
-                # re‐anchor your accumulated odometry so that you snap exactly onto close_loop_exp
-                self.accum_delta_x = (self.current_exp.x_m + self.accum_delta_x) - close_loop_exp.x_m
-                self.accum_delta_y = (self.current_exp.y_m + self.accum_delta_y) - close_loop_exp.y_m
-                # keep facing as before
-                close_loop_exp.facing_rad = self.accum_delta_facing
 
-                # switch to that experience
+                # Remember current GP BEFORE changing anchor
+                prev_gx, prev_gy, prev_gth = self.get_global_position()
+
+                # commit to new anchor
                 self.current_exp = close_loop_exp
+
+                # set residuals so GP stays the same for x, y, *and* θ
+                self.accum_delta_x = prev_gx  - close_loop_exp.x_m
+                self.accum_delta_y = prev_gy  - close_loop_exp.y_m
+                self.accum_delta_facing = clip_rad_180(prev_gth - close_loop_exp.facing_rad)
 
                 print("Global Position:", self.get_global_position(),
                     self.current_exp.x_m, self.current_exp.y_m, self.current_exp.facing_rad)
                 print('We keep current GP facing rad:', 
                     self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing)
-            '''elif len(view_cell.exps) == 0 and min_delta_GP_val < self.DELTA_EXP_THRESHOLD:
-            print('too close from exp ', min_delta_GP_id,', dist between exp and here', min_delta_GP_val)
-            print("current exp", self.current_exp)
-            exp = self.get_exp(min_delta_GP_id)
-            delta_exp_pc = np.sqrt(
-                 min_delta(self.current_exp.x_pc, exp.x_pc, self.DIM_XY)**2 +
-                 min_delta(self.current_exp.y_pc, exp.y_pc, self.DIM_XY)**2 
-                 #+ min_delta(self.current_exp.th_pc, exp.th_pc, self.DIM_TH)**2
-                 )
-            print('checking motion between two considered experiences', delta_exp_pc)
-            if min_delta_GP_id != self.current_exp.id: #delta_exp_pc > self.DELTA_PC_THRESHOLD: #if we are not considering same exp
-                print('we are close looping with exp', min_delta_GP_id,' discarding newly generated view_cell ',view_cell.id)
-                adjust_map = True
-                close_loop_exp = self.exps[min_delta_GP_id]
-                # see if the exp near by already has a link to the current exp
-                link_exists = False
-                for linked_exp in [l.target for l in self.current_exp.links]:
-                        if linked_exp == close_loop_exp:
-                            link_exists = True
-
-                if not link_exists:
-                    self.current_exp.link_to(
-                        close_loop_exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing, active_link=True)
-                    close_loop_exp.link_to(
-                        self.current_exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing, active_link=False)
-                        
-                
-                self.accum_delta_x =  (self.current_exp.x_m+self.accum_delta_x) - close_loop_exp.x_m
-                self.accum_delta_y =  (self.current_exp.y_m+self.accum_delta_y) - close_loop_exp.y_m 
-                #self.accum_delta_facing = self.current_exp.facing_rad
-                close_loop_exp.facing_rad=self.accum_delta_facing
-                self.current_exp = close_loop_exp
-                print("Global Position:", self.get_global_position(), self.current_exp.x_m, self.current_exp.y_m,self.current_exp.facing_rad)
-                print('We keep current GP facing rad, this might be an issue in real environment',self.accum_delta_x,self.accum_delta_y,self.accum_delta_facing)
-                
-                
-            else:
-                print('replacing previously generated view_cell', self.current_exp.view_cell.id,' of exp ',self.current_exp.id)
-                print('OLD current exp position x: ' + str(self.current_exp.x_m) + ' y: '+str(self.current_exp.y_m) , ' facing: '+str(self.current_exp.facing_rad) \
-                      , ' local pose: '+str(self.current_exp.init_local_position) ) 
-                self.update_exp_wt_view_cell(self.current_exp, x_pc, y_pc, th_pc, view_cell, local_pose)
-                print('NEW current exp position x: ' + str(self.current_exp.x_m) + ' y: '+str(self.current_exp.y_m) , ' facing: '+str(self.current_exp.facing_rad) \
-                      , ' local pose: '+str(self.current_exp.init_local_position)) 
-                
-
-                for link in self.current_exp.links:
-                    e1 = link.target
-                    print(current_GP)
-                    print('original link of current exp', self.current_exp.id, ' to ', e1.id, 'f,h,d:', link.facing_rad, link.heading_rad, link.d)
-                    #change link from source to linked exp
-                    self.current_exp.update_link(link, e1)
-                    print(current_GP)
-                    print('updated link of current exp', self.current_exp.id, ' to ', e1.id, 'f,h,d:', link.facing_rad, link.heading_rad, link.d)
-                    
-                    #change link from linked exp to source
-                    for l in e1.links:
-                        if l.target == self.current_exp:
-                            print()
-                            print('original link of linked exp', e1.id,' to ', l.target.id, 'f,h,d:', l.facing_rad, l.heading_rad, l.d)
-                            e1.update_link(l, self.current_exp)
-                            print('updated link of linked exp', e1.id, ' to ', l.target.id, 'f,h,d:', l.facing_rad, l.heading_rad, l.d)
-                            break
-
-                self.accum_delta_x = 0
-                self.accum_delta_y = 0
-                self.accum_delta_facing = self.current_exp.facing_rad'''
-
+            
         # if the vt is new AND the global pose x,y,th is far enough from any prev experience create a new experience
         elif len(view_cell.exps) == 0:
             #if current location is far enough from prev one, else, view cells are considered as in conflict
@@ -810,7 +1129,7 @@ class ExperienceMap(object):
             self.current_exp = exp
             self.accum_delta_x = 0
             self.accum_delta_y = 0
-            self.accum_delta_facing = self.current_exp.facing_rad
+            self.accum_delta_facing = 0
             
         
 
@@ -846,7 +1165,6 @@ class ExperienceMap(object):
                 
                 min_delta_GP_id = np.argmin(delta_view_exps)
                 min_delta_GP_val = delta_view_exps[min_delta_GP_id]
-                #NOTE: static 2* added that won't be pertinent for all environments
                 if min_delta_GP_val < self.DELTA_EXP_THRESHOLD :
                     print('the delta between exp' , view_cell.exps[min_delta_GP_id].id ,' and ' ,self.current_exp.id, ' allow for a close-loop')
                     matched_exp = view_cell.exps[min_delta_GP_id]
@@ -862,13 +1180,30 @@ class ExperienceMap(object):
                         print(current_GP)
                         print("we are linking things",matched_exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing)
                         self.current_exp.link_to(
-                            matched_exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing, active_link=True)
+                            matched_exp,
+                            self.accum_delta_x,
+                            self.accum_delta_y,
+                            matched_exp.facing_rad,        # <— target abs θ
+                            active_link=True
+                        )
                         matched_exp.link_to(
-                            self.current_exp, self.accum_delta_x, self.accum_delta_y, self.accum_delta_facing, active_link=False)
-                    self.accum_delta_x = (self.current_exp.x_m + self.accum_delta_x) - matched_exp.x_m
-                    self.accum_delta_y = (self.current_exp.y_m + self.accum_delta_y) - matched_exp.y_m
-                    self.current_exp = matched_exp
-                
+                            self.current_exp,
+                            -self.accum_delta_x,           # <— negate
+                            -self.accum_delta_y,
+                            self.current_exp.facing_rad,   # <— target abs θ
+                            active_link=False
+                        )
+                        # then snap and zero deltas
+                        # Remember current GP BEFORE changing anchor
+                        prev_gx, prev_gy, prev_gth = self.get_global_position()
+
+                        # Commit to the new anchor
+                        self.current_exp = matched_exp
+
+                        # Re-carry residuals so GP stays EXACTLY the same
+                        self.accum_delta_x      = prev_gx  - matched_exp.x_m
+                        self.accum_delta_y      = prev_gy  - matched_exp.y_m
+                        self.accum_delta_facing = clip_rad_180(prev_gth - matched_exp.facing_rad)
                 if matched_exp is None:
                     if min_delta_GP_val > self.DELTA_EXP_THRESHOLD:
                         nearest_exp   = None
@@ -880,17 +1215,68 @@ class ExperienceMap(object):
 
                         if nearest_dist < self.DELTA_EXP_THRESHOLD:
                             print(f"[EM] SNAP to exp {nearest_exp.id}  (d={nearest_dist:.2f})")
+
+                            # --- (A) Remember the old anchor and current GP before re-anchoring
+                            prev_gx, prev_gy, prev_gth = self.get_global_position()
+
+                            # --- (B) Optionally add a link old_exp -> matched_exp if it doesn't exist
+                            
+                            # before creating any link, right after computing nearest_exp / matched_exp
+                            old_exp = self.current_exp
                             matched_exp = nearest_exp
-                            self.accum_delta_x = (self.current_exp.x_m + self.accum_delta_x) - matched_exp.x_m
-                            self.accum_delta_y = (self.current_exp.y_m + self.accum_delta_y) - matched_exp.y_m
-                            self.current_exp=matched_exp
+
+                            if matched_exp is old_exp:
+                                # We are already anchored on this node → no new link, no re-anchor churn.
+                                # Optionally: keep residuals as-is, or zero them if you want strict snap.
+                                # Here I keep residuals (continuous GP policy).
+                                print(f"[EM] SNAP resolved to current exp {matched_exp.id} → no link/no-op")
+                                # If you had planned to re-anchor math here, skip it and just return to the flow.
+                            else:
+                                # link-exists check (forward direction)
+                                link_exists = any(l.target is matched_exp for l in old_exp.links)
+
+                                # amount of *translational* odometry we just accumulated
+                                d_trans = (self.accum_delta_x**2 + self.accum_delta_y**2) ** 0.5
+
+                                # Gate: only add link if (1) not already present AND (2) we actually moved a bit
+                                # You can tune eps; 1e-6 is numerically safe, 1e-3..1e-2 is pragmatic in grid envs
+                                if (matched_exp is not old_exp) and (not link_exists) and (d_trans > 1e-6):
+                                    # Forward link: old_exp -> matched_exp uses the ODOMETRY deltas
+                                    old_exp.link_to(
+                                        matched_exp,
+                                        self.accum_delta_x,
+                                        self.accum_delta_y,
+                                        matched_exp.facing_rad,   # target absolute θ (see link_to implementation)
+                                        active_link=True
+                                    )
+
+                                    # Backward link: matched_exp -> old_exp with negated deltas
+                                    matched_exp.link_to(
+                                        old_exp,
+                                        -self.accum_delta_x,
+                                        -self.accum_delta_y,
+                                        old_exp.facing_rad,       # target absolute θ
+                                        active_link=False
+                                    )
+
+                                # (Optional) tiny debug to verify internal consistency of the just-created links
+                                # theta_link_check(old_exp, matched_exp, old_exp.links[-1], "snap->fwd")
+                                # theta_link_check(matched_exp, old_exp, matched_exp.links[-1], "snap->back")
+
+                                # --- (C) Re-anchor using your *continuous* policy so GP does not jump
+                                self.current_exp = matched_exp
+                                self.accum_delta_x       = prev_gx  - matched_exp.x_m
+                                self.accum_delta_y       = prev_gy  - matched_exp.y_m
+                                self.accum_delta_facing  = clip_rad_180(prev_gth - matched_exp.facing_rad)
+
                         else:
                             print("Creating new experience because no exp within metric gate")    
                             matched_exp = self._create_exp(x_pc, y_pc, th_pc,
                                                         view_cell_copy, local_pose)
                             self.current_exp   = matched_exp
                             self.accum_delta_x = self.accum_delta_y = 0
-                        print("warning, no matched experience although matching view cell ", min_delta_GP_val, "did we enter though?",nearest_dist > self.DELTA_EXP_THRESHOLD)
+                            self.accum_delta_facing = 0.0 
+                            print("warning, no matched experience although matching view cell ", min_delta_GP_val, "did we enter though?",nearest_dist > self.DELTA_EXP_THRESHOLD)
                     '''#View_cell_copy contains the same ob as view_cell but without experience attached and with a new ID
                     #TODO: add view_cell_copy instead of view_cell
                     matched_exp = self._create_exp(
@@ -917,28 +1303,15 @@ class ExperienceMap(object):
 
             delta_x = min_delta_GP_exp.x_m - self.current_exp.x_m
             delta_y = min_delta_GP_exp.y_m - self.current_exp.y_m
+
             self.current_exp.link_to(
-                min_delta_GP_exp, delta_x, delta_y, self.current_exp.facing_rad, active_link=True)
+                min_delta_GP_exp, delta_x, delta_y, min_delta_GP_exp.facing_rad, active_link=True
+            )
             min_delta_GP_exp.link_to(
-                self.current_exp, delta_x, delta_y, self.current_exp.facing_rad, active_link=False)
+                self.current_exp, -delta_x, -delta_y, self.current_exp.facing_rad, active_link=False
+            )
 
-        #if we have ghost nodes, we check if we are moving near one
-        elif len(self.ghost_exps) > 0 :
-            delta_ghost_exps = []
-            for e in self.ghost_exps:
-                delta_ghost_exp = self.get_delta_exp(e.x_m,e.y_m,current_GP[0], current_GP[1])
-                delta_ghost_exps.append([delta_ghost_exp, e.id])
-            print('delta_ghost_exps', delta_ghost_exps)
-            closest_ghost= sorted(delta_ghost_exps, key=itemgetter(0))[0]
-            min_ghost_delta_val = closest_ghost[0]
-            min_ghost_delta_id = closest_ghost[1]
             
-            print('closest ghost node dist and id', min_ghost_delta_val, min_ghost_delta_id )
-
-            if min_ghost_delta_val <= self.DELTA_EXP_THRESHOLD:
-                ghost_exp = self.get_ghost_exp(min_ghost_delta_id)
-                self.link_exp_through_ghost(self.current_exp, ghost_exp)
-                self.ghost_exps.remove(ghost_exp)
 
         #If we replaced the view cell in same exp, we need to update the global position to match init_local_position
         if self.current_exp.view_cell.to_update:
@@ -980,63 +1353,26 @@ class ExperienceMap(object):
         print("=== END LINK DUMP ===\n")
 
         print('adjust map?', self.constant_adjust, adjust, adjust_map)
-        if not self.constant_adjust:
-            if not adjust or not adjust_map:
-                return
-
         
-        # Iteratively update the experience map with the new information
-        for i in range(0, self.LOOPS):
-            for e0 in self.exps:
-                for l in e0.links:
-                    print(e0.id, 'is linked to', l.target.id)
-                    # e0 is the experience under consideration
-                    # e1 is an experience linked from e0
-                    # l is the ACTIVE link object which contains additional heading
-                    # info
-                    if l.active_link == True:
-                        e1 = l.target
-                        print('BEFORE CORRECTION IN LOOP exp ' + str(e0.id) +' map position x: ' + str(e0.x_m) + ' y: '+str(e0.y_m) +' facing: ' +str(e0.facing_rad) \
-                            + ' Ghost?' +str(e0.ghost_exp) )
-                        print('BEFORE CORRECTION IN LOOP exp ' + str(e1.id) +' map position x: ' + str(e1.x_m) + ' y: '+str(e1.y_m) +' facing: ' +str(e1.facing_rad) \
-                            + ' Ghost?' +str(e1.ghost_exp) )
-                        # correction factor
-                        cf = self.CORRECTION
+        do_adjust = (self.constant_adjust or (adjust and adjust_map))
+        if not do_adjust:
+            return
+        if NO_DRIFT_MODE or not do_adjust:
+            # If you want GP continuity across re-anchoring (what you already do),
+            # keep the residuals as set above (prev_gx/gy/gth logic you already run).
+            # If you prefer hard snap in a perfect world, uncomment the next 3 lines:
+            # self.accum_delta_x = 0.0
+            # self.accum_delta_y = 0.0
+            # self.accum_delta_facing = 0.0
 
-                        # work out where exp0 thinks exp1 (x,y) should be based on
-                        # the stored link information
-                        lx = e0.x_m + l.d * np.cos(e0.facing_rad + l.heading_rad)
-                        ly = e0.y_m + l.d * np.sin(e0.facing_rad + l.heading_rad)
-
-                        # determine the angle between where e0 thinks e1's facing
-                        # should be based on the link information
-                        df = signed_delta_rad(e0.facing_rad + l.facing_rad,
-                                            e1.facing_rad)
-                        print('df and link facing rad', df, l.facing_rad)
-                        # correct e0 and e1 (x,y) by equal but opposite amounts
-                        # a 0.5 correction parameter means that e0 and e1 will be
-                        # fully corrected based on e0's link information
-                        #+
-                        ## correct e0 and e1 facing by equal but opposite amounts
-                        # a 0.5 correction parameter means that e0 and e1 will be
-                        # fully corrected based on e0's link information
-                        #+
-                        # If one of the exp is a ghost exp, then the ghost should not influence the real exp
-                        # #NOTE: IN OUR CONTEXT, updating facing doesn't correct any shift
-                        if e1.ghost_exp != True:
-                            print('check e0 correction', cf, lx, ly)
-                            e0.x_m = e0.x_m + (e1.x_m - lx) * cf
-                            e0.y_m = e0.y_m + (e1.y_m - ly) * cf
-                            #e0.facing_rad = clip_rad_180(e0.facing_rad + df * cf)
-                        if e0.ghost_exp != True:
-                            print('check e1 correction', cf, lx, ly)
-                            e1.x_m = e1.x_m - (e1.x_m - lx) * cf
-                            e1.y_m = e1.y_m - (e1.y_m - ly) * cf
-                            #e1.facing_rad = clip_rad_180(e1.facing_rad - df * cf)
-
-                        print('AFTER CORRECTION IN LOOP exp ' + str(e0.id) +' map position x: ' + str(e0.x_m) + ' y: '+str(e0.y_m) +' facing: ' +str(e0.facing_rad))
-                        print('AFTER CORRECTION IN LOOP exp ' + str(e1.id) +' map position x: ' + str(e1.x_m) + ' y: '+str(e1.y_m) +' facing: ' +str(e1.facing_rad))   
-                    print() 
+            theta_gp_check(self, "after-step")
+            return
+        prev_gx, prev_gy, prev_gth = self.get_global_position()
+        self.relax_graph(fixed_exp=self.current_exp, loops=self.LOOPS)
+        ax, ay, ath = self.current_exp.x_m, self.current_exp.y_m, self.current_exp.facing_rad
+        self.accum_delta_x      = prev_gx  - ax
+        self.accum_delta_y      = prev_gy  - ay
+        self.accum_delta_facing = clip_rad_180(prev_gth - ath)
         for e0 in self.exps:           
             print('aFTER CORRECTIONS  exp ' + str(e0.id) +' map position x: ' + str(e0.x_m) + ' y: '+str(e0.y_m) +' facing: ' +str(e0.facing_rad))
           
@@ -1044,152 +1380,5 @@ class ExperienceMap(object):
         #print('AFTER CORRECTION  exp ' + str(self.current_exp.id) +' map position x: ' + str(self.current_exp.x_m) + ' y: '+str(self.current_exp.y_m) +' facing: ' +str(self.current_exp.facing_rad))
         # print( )
         # print('____')
-        
+        theta_gp_check(self, "after-step")
         return
-
-
-    def create_ghost_exps(self,origin_exp:object, ghost_poses:list):
-        ''' Params:
-        exp_id: the experience the ghost is linked to
-        ghost_poses: GP of the ghost nodes to create. -
-        We create ghost nodes for all poses then check if 
-        any ghost node is near an experience to operate close looping
-        '''
-
-        #for each potential ghost pose
-        for GP_pose in ghost_poses:
-            self._create_ghost_exp(GP_pose[0], GP_pose[1], GP_pose[2], linked_exp=origin_exp)
-            
-        #--- we clean ghost node and close loop when possible
-        self.sort_ghost_exps()
-
-    def sort_ghost_exps(self):
-        """
-        Check all exps and all ghost nodes and close loop/ erase ghost nodes 
-        when a ghost node is near an experience
-        """
-        for exp in self.exps: 
-            print('exp ', exp.id, [exp.x_m, exp.y_m, exp.facing_rad])   
-            exp_GP = [exp.x_m, exp.y_m, exp.facing_rad]
-            for ghost_exp in self.ghost_exps[:]:
-                ghost_GP = [ghost_exp.x_m, ghost_exp.y_m, ghost_exp.facing_rad]
-                print('ghost exp ', ghost_exp.id, [ghost_exp.x_m, ghost_exp.y_m, ghost_exp.facing_rad])   
-                delta_exp = euclidian_distance(ghost_GP, exp_GP)
-                print('delta dist', delta_exp,  self.DELTA_EXP_THRESHOLD)
-                if self.delta_exp_above_thresold(delta_exp):
-                    self.link_exp_through_ghost(exp, ghost_exp)
-                    print('remove ghost exp as close to exp by dist = ', delta_exp)
-                self.ghost_exps.remove(ghost_exp)
-
-
-    def link_exp_through_ghost(self, exp:object, ghost_exp:object):
-        ''' 
-        Linking the ghost node origin exp to the exp measured as nearby 
-        and erasing ghost node
-        '''
-        exp_links = exp.links
-        exp_links_ids = []
-        for l in exp_links:
-            exp_links_ids.append(l.target.id)
-        for link in ghost_exp.links:
-            ghost_target_id = link.target.id
-            #If the experience do not posses a link the ghost at the same position does, then we add it
-            if ghost_target_id not in exp_links_ids and ghost_target_id != exp.id :
-                linked_exp = self.get_exp(ghost_target_id)
-                accum_delta_x = linked_exp.x_m - exp.x_m
-                accum_delta_y = linked_exp.y_m - exp.y_m
-                accum_delta_facing = signed_delta_rad(linked_exp.facing_rad ,exp.facing_rad)
-                print()
-                print('In ghost exp close looping exp id and linked exp id', exp, linked_exp.id)
-                print(' x y th of exp and linked exp',  [exp.x_m,exp.y_m, exp.facing_rad], [linked_exp.x_m, linked_exp.y_m, linked_exp.facing_rad])
-                print(' accum_x, y and facing',accum_delta_x,accum_delta_y,accum_delta_facing )
-                exp.link_to( 
-                linked_exp,accum_delta_x,accum_delta_y,accum_delta_facing, active_link=True)
-                
-                linked_exp.link_to(
-                exp,accum_delta_x,accum_delta_y,accum_delta_facing, active_link=False)
-
-    def heuristic(self, s: State, g: State) -> float:
-        # Manhattan distance + minimal turn cost
-        manh = abs(s.x - g.x) + abs(s.y - g.y)
-        turn = min((s.d - g.d) % 4, (g.d - s.d) % 4)
-        return manh + turn
-
-    def astar_prims(
-    self,
-    start: State,
-    goal:  State,
-    egocentric_process,
-    num_samples: int = 5
-    ) -> list[str]:
-        """
-        A* in (x,y,dir)-space, but we skip ANY forward candidate
-        whose entire prefix fails the egocentric collision check.
-        """
-        print(f"[A*] start={start}  goal={goal}")
-        open_pq = [(self.heuristic(start, goal), 0, start, [])]  # (f, g, state, seq)
-        g_score = { start: 0 }
-        closed   = set()
-        step = 0
-
-        # helper: pack a list of 'forward'/'left'/'right' into a (T,3) float tensor
-        def to_onehot_tensor(seq: list[str]) -> torch.Tensor:
-            mapping = {'forward': [1,0,0], 'right': [0,1,0], 'left': [0,0,1]}
-            return torch.tensor([mapping[a] for a in seq], dtype=torch.float32)
-
-        while open_pq:
-            f, g, (x,y,d), seq = heapq.heappop(open_pq)
-            print(f"[A*][{step}] POP  state={State(x,y,d)}  g={g}  f={f}  seq={seq!r}")
-            step += 1
-
-            if (x,y,d) in closed:
-                print("    SKIP (closed)")
-                continue
-            closed.add((x,y,d))
-
-            # success only if we've reached the right cell and the correct orientation
-            if (x, y, d) == (goal.x, goal.y, goal.d):
-                print(f"[A*] reached goal at step {step} → seq={seq!r}")
-                return seq
-
-            for act in ("left","right","forward"):
-                if act == "forward":
-                    dx, dy = DIR_VECS[d]
-                    nx, ny, nd = x + dx, y + dy, d
-                elif act == "left":
-                    nx, ny, nd = x, y, (d - 1) % 4
-                else:  # right
-                    nx, ny, nd = x, y, (d + 1) % 4
-
-                ns = State(nx, ny, nd)
-                print(f"    try {act!r} -> next={ns}", end="")
-
-                if (nx,ny,nd) in closed:
-                    print("   SKIP (closed)")
-                    continue
-
-                new_seq = seq + [act]
-
-                # **egocentric** collision check
-                tensor = to_onehot_tensor(new_seq)               # shape (T,3)
-                safe   = egocentric_process.egocentric_policy_assessment(
-                            tensor, num_samples=num_samples
-                        )
-                if safe.shape[0] < tensor.shape[0]:
-                    print("   SKIP (ego-collision)")
-                    continue
-
-                # accept → push into open
-                g2 = g + 1
-                h2 = self.heuristic(ns, goal)
-                f2 = g2 + h2
-                old = g_score.get(ns, float("inf"))
-                if g2 < old:
-                    g_score[ns] = g2
-                    print(f"   PUSH g={g2} h={h2} f={f2} seq={new_seq!r}")
-                    heapq.heappush(open_pq, (f2, g2, ns, new_seq))
-                else:
-                    print(f"   SKIP (worse g: {g2} ≥ {old})")
-
-        print("[A*] no path found → returning empty")
-        return []

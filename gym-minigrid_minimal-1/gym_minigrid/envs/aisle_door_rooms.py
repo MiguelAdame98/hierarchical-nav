@@ -33,7 +33,9 @@ class AisleDoorRooms(MiniGridEnv):
         corridor_length =5,
         automatic_door = True,
         wT_around = 6,
-        wT_size = 1
+        wT_size = 1,
+        obstacle_rate=0.15,          # Add this
+        debug=True
 
     ):
         self.agent_start_pos = agent_start_pos
@@ -41,6 +43,20 @@ class AisleDoorRooms(MiniGridEnv):
         self.automatic_door = automatic_door
         self.wT_around = wT_around
         self.wT_size= wT_size
+        self.obstacle_rate = obstacle_rate
+        self.debug = debug
+        self.obstacles_spawned = False  
+        self.current_obstacles = set()
+        self.color_idx = {
+            'red' : 0,
+            'green' : 1,
+            'blue'  : 2,
+            'purple': 3,
+            'white' : 4,   # keep for doors/goals
+        }
+        # Prefer not to paint rooms 'white' since doors/goals are white
+        self._room_palette = [c for c in self.color_idx.keys() if c != 'white']
+
 
         self.rooms_size = rooms_size
         
@@ -96,29 +112,28 @@ class AisleDoorRooms(MiniGridEnv):
             
         )     
 
-
+    
     def _gen_grid(self, width, height):
         print("1TFFFFFFFFF")       
-        #define the number of room in col/row
         rooms_in_row = self.rooms_in_row
         rooms_in_col = self.rooms_in_col
-
         room_w = self.rooms_size
         room_h = self.rooms_size
-       
-        # Create an empty grid
+
+        # >>> PATCH 1: initialize tracking
+        self._init_room_tracking(width, height)
+
+        # Create an empty grid ...
         self.grid = Grid(width, height)
         self.grid.grid = [Floor('black')] * width * height
 
-        # Generate the surrounding walls
-    
+        # Surrounding walls ...
         self.grid.horz_wall(0, 0)
         self.grid.horz_wall(0, height - 1)
         self.grid.vert_wall(0, 0)
         self.grid.vert_wall(width - 1, 0)
-
-        # Generate the surrounding walls
         self.grid.wall_rect(0, 0, width, height)
+
         balls_rooms = []
         while len(balls_rooms) < self.wT_around:
             col_room = self._rand_int(0, rooms_in_col)
@@ -130,92 +145,136 @@ class AisleDoorRooms(MiniGridEnv):
         pos_horz_B = [None] * rooms_in_col
         agent_pose_options = []
 
-     
         # For each row of rooms
         for row_inc in range(0, rooms_in_row):
-            # For each column
+            pos_vert_R = None
             for col_inc in range(0, rooms_in_col):
-                
                 xL = col_inc * (room_w + self.corridor_length)
                 yT = row_inc * (room_h + self.corridor_length)
                 xR = xL + room_w 
                 yB = yT + room_h
-       
-                color = list(self.color_idx.keys())[list(self.color_idx.values()).index(self._rand_int(0, 4))]
 
+                # choose color
+                if hasattr(self, "_rand_elem"):
+                    color = self._rand_elem(self._room_palette)
+                else:
+                    import random
+                    color = random.choice(self._room_palette)
+                # >>> PATCH 2: map room area + store meta (color, bounds)
+                self._register_room_area(col_inc, row_inc, xL, yT, xR, yB, color)
+
+                # fill interior with colored floor (your existing loop)
                 for b in range(xL+1, xR):
-                    for c in range(yT+1,yB):
-                        self.put_obj(Floor(color),b, c)
+                    for c in range(yT+1, yB):
+                        self.put_obj(Floor(color), b, c)
 
-                #upper wall and door
+                # ----- LEFT neighbor connection (upper wall/door in your terms) -----
                 if col_inc > 0:
                     self.grid.vert_wall(xL, yT, room_h+1)
-                    self.grid.set(xL,pos_vert_R[1], Floor('black'))
-                    self.put_obj(Door(color='white'), xL-int(self.corridor_length/2), pos_vert_R[1] )
+                    self.grid.set(xL, pos_vert_R[1], Floor('black'))
+
+                    # door between left room and current corridor
+                    door_x = xL - int(self.corridor_length/2)
+                    door_y = pos_vert_R[1]
+                    self.put_obj(Door(color='black'), door_x, door_y)
+
+                    self._register_door(door_x, door_y, roomA=(col_inc-1, row_inc), roomB=(col_inc, row_inc))
+                    self._register_corridor_run(
+                        range(max(0, xL - self.corridor_length), xL),  # full length, clamped at 0
+                        [door_y]
+                    )
+
                     corridor_depth = self._rand_int(0, 2)
-                    agent_pose_options.append((xL-int(self.corridor_length/2)-corridor_depth,pos_vert_R[1],0))
-    
-                # Bottom wall and door
+                    agent_pose_options.append((door_x - corridor_depth, door_y, 0))
+
+                # ----- RIGHT neighbor preparation (creates corridor to the right) -----
                 if col_inc + 1 < rooms_in_col:
                     self.grid.vert_wall(xR, yT, room_h+1)
                     pos_vert_R = (xR, self._rand_int(yT + 1, yB))
                     self.grid.set(*pos_vert_R, Floor('black'))
+
+                    # walls above/below corridor; walkable stripe at y=pos_vert_R[1]
                     self.grid.horz_wall(xR, pos_vert_R[1]-1, self.corridor_length)  
                     self.grid.horz_wall(xR, pos_vert_R[1]+1, self.corridor_length)
-                    corridor_depth = self._rand_int(0, 2)
-                    agent_pose_options.append((xR+int(self.corridor_length/2)+corridor_depth, pos_vert_R[1],2))  
 
+                    # >>> PATCH 3b: record corridor run to the right
+                    self._register_corridor_run(range(xR, xR + self.corridor_length), [pos_vert_R[1]])
+
+                    corridor_depth = self._rand_int(0, 2)
+                    agent_pose_options.append((xR + int(self.corridor_length/2) + corridor_depth, pos_vert_R[1], 2))
+
+                # ----- TOP neighbor connection -----
                 if row_inc > 0:
                     self.grid.horz_wall(xL, yT, room_w+1)
-                    self.grid.set(pos_horz_B[col_inc][0],yT, Floor('black'))
-                    self.put_obj(Door(color='white'), pos_horz_B[col_inc][0] , yT-int(self.corridor_length/2))
+                    self.grid.set(pos_horz_B[col_inc][0], yT, Floor('black'))
+
+                    door_x = pos_horz_B[col_inc][0]
+                    door_y = yT - int(self.corridor_length/2)
+                    self.put_obj(Door(color='black'), door_x, door_y)
+
+                    # >>> PATCH 3c: record doorway + corridor stripe up
+                    self._register_door(door_x, door_y, roomA=(col_inc, row_inc-1), roomB=(col_inc, row_inc))
+                    self._register_corridor_run(
+                        [door_x],
+                        range(max(0, yT - self.corridor_length), yT)  # full length, clamped
+                    )
+
                     corridor_depth = self._rand_int(0, 2)
-                    agent_pose_options.append((pos_horz_B[col_inc][0],yT-int(self.corridor_length/2)-corridor_depth,1))
-                   
-                # Bottom wall and door
+                    agent_pose_options.append((door_x, door_y - corridor_depth, 1))
+
+                # ----- BOTTOM neighbor preparation -----
                 if row_inc + 1 < rooms_in_row:
                     self.grid.horz_wall(xL, yB, room_w+1)
                     pos_horz_B[col_inc] = (self._rand_int(xL + 1, xR), yB)
                     self.grid.set(*pos_horz_B[col_inc], Floor('black'))
+
+                    # corridor vertical walls; walkable stripe at x=pos_horz_B[col_inc][0]
                     self.grid.vert_wall(pos_horz_B[col_inc][0]-1, yB, self.corridor_length)  
-                    self.grid.vert_wall(pos_horz_B[col_inc][0]+1, yB, self.corridor_length)  
+                    self.grid.vert_wall(pos_horz_B[col_inc][0]+1, yB, self.corridor_length)
+
+                    # >>> PATCH 3d: record corridor run downward
+                    cx = pos_horz_B[col_inc][0]
+                    self._register_corridor_run([cx], range(yB, yB + self.corridor_length))
+                    
+
                     corridor_depth = self._rand_int(0, 2)
-                    
-                    agent_pose_options.append((pos_horz_B[col_inc][0], yB+int(self.corridor_length/2)+corridor_depth, 3))  
+                    agent_pose_options.append((cx, yB + int(self.corridor_length/2) + corridor_depth, 3))
 
-
-                if [col_inc, row_inc] in balls_rooms:
-                    
-                    ##1 by 1 wT
+                # Goals in selected rooms (unchanged)
+                """if [col_inc, row_inc] in balls_rooms:
                     if self.wT_size == 1:
                         x, y = self._rand_int(xL+1, xR), self._rand_int(yT+1, yB)
-                        self.put_obj(Goal('white'), x,y)
-                        self.goal = (color, x,y)
-                        #print('goal x,y', x,y)
-                      
-                    ##4 by 4 wTiles
+                        self.put_obj(Goal('white'), x, y)
+                        self.goal = (color, x, y)
                     else:
                         x = self._rand_int(xL+1, xR-1)
                         y = self._rand_int(yT+1, yB-1)
                         self.put_obj(Goal('white'), x, y)
                         self.put_obj(Goal('white'), x+1, y)
                         self.put_obj(Goal('white'), x, y+1)
-                        self.put_obj(Goal('white'), x+1, y+1)
-            
-        
-        # Place the agent 
+                        self.put_obj(Goal('white'), x+1, y+1)"""
+
+        # Place the agent (unchanged)
         if self.agent_start_pos == None:
-            index= self._rand_int(0, len(agent_pose_options))
+            index = self._rand_int(0, len(agent_pose_options))
             self.starting_agent_pos = np.array([agent_pose_options[index][0], agent_pose_options[index][1]])
             self.agent_start_dir = agent_pose_options[index][2]
-
             self.agent_pos = self.starting_agent_pos   
             self.agent_dir = self.agent_start_dir
-     
         else:
             self.agent_pos = np.asarray(self.agent_start_pos)
             self.agent_dir = self.agent_start_dir
-         
+
+        # >>> PATCH 4: seed visit tracker with starting location
+        self._last_room_id = self.get_room_id_at(self.agent_pos[0], self.agent_pos[1])
+        if self._last_room_id is not None and self._last_room_id not in self._visited_rooms_set:
+            self._visited_rooms_set.add(self._last_room_id)
+            self.visited_rooms_order.append({
+                'room': self._last_room_id,
+                'color': self.get_room_color_by_room(self._last_room_id),
+                'entered_at_step': 0,
+                'entry_xy': (int(self.agent_pos[0]), int(self.agent_pos[1])),
+            })
         
         self.vel_ob = [0,0]
         self.encoded_action = None      
@@ -232,9 +291,9 @@ class AisleDoorRooms(MiniGridEnv):
         
         #self.grid.set(14, 10, Wall)
         #self.grid.set(3,4,Wall)
-        self.grid.vert_wall(21, 11, 1)
-        self.grid.vert_wall(22, 11, 1)
-        self.grid.vert_wall(20, 11, 1)
+        #self.grid.vert_wall(21, 11, 1)
+        #self.grid.vert_wall(22, 11, 1)
+        #self.grid.vert_wall(20, 11, 1)
         # self.put_obj(Goal(),self.agent_pos[0]+1, self.agent_pos[1])
         self.mission = "Motion in color distinct rooms environment"
 
@@ -257,10 +316,227 @@ class AisleDoorRooms(MiniGridEnv):
             real_action = obs['action'].copy()
 
         self.current_pose = self.action_to_pose(real_action, self.current_pose) 
-        
+        try:
+            self._mark_room_visit(self.agent_pos[0], self.agent_pos[1])
+        except Exception:
+            pass
         obs['pose'] = self.current_pose
         return obs, reward, done, info
     
+    def _init_room_tracking(self, width: int, height: int):
+        """Call at the very start of _gen_grid()."""
+        # Per-room metadata
+        self.room_meta = {}             # dict[(col,row)] -> {'bounds':(x1,y1,x2,y2), 'color':str, 'doorways':[(x,y),...]}
+        # Reverse index: grid cell -> room id
+        self.xy_to_room = {}            # dict[(x,y)] -> (col,row)
+        # Corridor and door coordinates
+        self.corridor_xy = set()        # set[(x,y)]
+        self.door_xy = []               # list[(x,y)]
+        # Visit tracking (discovery order)
+        self.visited_rooms_order = []   # list[{'room':(col,row), 'color':str, 'entered_at_step':int, 'entry_xy':(x,y)}]
+        self._visited_rooms_set = set()
+        self._last_room_id = None
+
+    def _register_room_area(self, col: int, row: int, xL: int, yT: int, xR: int, yB: int, color: str):
+        """
+        Record per-room metadata and map interior floor cells (exclude walls).
+        xL,yT inclusive left/top; xR,yB exclusive right/bottom boundary used by your code.
+        """
+        # Interior floor (exclude the 1-cell walls you build around)
+        x1, y1 = xL + 1, yT + 1
+        x2, y2 = xR - 1, yB - 1
+        self.room_meta[(col, row)] = {
+            'bounds': (x1, y1, x2, y2),
+            'color':  color,
+            'doorways': []
+        }
+        for x in range(x1, xR):
+            for y in range(y1, yB):
+                self.xy_to_room[(x, y)] = (col, row)
+
+    def _register_door(self, x: int, y: int, roomA: tuple[int,int] | None = None, roomB: tuple[int,int] | None = None):
+        self.door_xy.append((x, y))
+        # track discovered doorway cells; also mark as corridor for indexing
+        self.corridor_xy.add((x, y))
+        # Optional: attach doorway to adjacent rooms if provided
+        if roomA in self.room_meta:
+            self.room_meta[roomA]['doorways'].append((x, y))
+        if roomB in self.room_meta:
+            self.room_meta[roomB]['doorways'].append((x, y))
+
+    def _register_corridor_run(self, xs: range | list[int], ys: range | list[int]):
+        """Mark a corridor 'walkable stripe' we created between rooms."""
+        for x in (xs if isinstance(xs, range) else list(xs)):
+            for y in (ys if isinstance(ys, range) else list(ys)):
+                self.corridor_xy.add((x, y))
+
+    def _mark_room_visit(self, x: int, y: int):
+        """
+        Call after agent position is updated (each step). Uses self.step_count if available.
+        Detects transitions and logs first-time visits.
+        """
+        rid = self.xy_to_room.get((int(x), int(y)))  # (col,row) or None (corridor)
+        # Transition detection
+        if rid != self._last_room_id:
+            if rid is not None and rid not in self._visited_rooms_set:
+                self._visited_rooms_set.add(rid)
+                color = self.room_meta.get(rid, {}).get('color', 'gray')
+                step_no = int(getattr(self, 'step_count', 0))
+                self.visited_rooms_order.append({
+                    'room': rid,
+                    'color': color,
+                    'entered_at_step': step_no,
+                    'entry_xy': (int(x), int(y)),
+                })
+        self._last_room_id = rid
+
+    # --- Convenience getters (useful for plotting and EMAP color bridging) -----
+
+    def get_room_id_at(self, x: int, y: int):
+        return self.xy_to_room.get((int(x), int(y)))
+
+    def get_room_color_by_room(self, room: tuple[int,int] | None):
+        if room is None: return None
+        meta = self.room_meta.get(room)
+        return meta['color'] if meta else None
+
+    def get_room_color_by_xy(self, x: int, y: int):
+        return self.get_room_color_by_room(self.get_room_id_at(x, y))
+
+    def get_visited_rooms_order(self) -> list[tuple[int,int]]:
+        """Return discovery order as list of (col,row)."""
+        return [rec['room'] for rec in self.visited_rooms_order]
+
+    def get_rooms_layout_summary(self) -> dict:
+        """Lightweight summary for debugging/visuals."""
+        return {
+            'rooms_in_row': self.rooms_in_row,
+            'rooms_in_col': self.rooms_in_col,
+            'n_rooms': len(self.room_meta),
+            'n_corridor_cells': len(self.corridor_xy),
+            'n_doors': len(self.door_xy),
+            'first_visits': self.visited_rooms_order[:5]
+        }
+    # ---- END: room/corridor instrumentation helpers ---------------------------
+    
+    def Spawn_Obstacles(self, obstacle_rate= None):
+        """
+        Spawn grey 1×1 walls on coloured-room floor tiles while
+        • leaving every corridor endpoint + its moat free,
+        • ensuring the current agent corridor can still reach another corridor tile,
+        • **never touching the agent's current position.**
+        """
+        print("DIS WHE")
+        
+        if obstacle_rate is None:
+            obstacle_rate = self.obstacle_rate
+        
+        dirs = ((1, 0), (-1, 0), (0, 1), (0, -1))
+
+        # ───────── collect room & corridor tiles ───────────────────────────
+        coloured_floor, corridor_cells = [], []
+        for x in range(1, self.grid.width - 1):
+            for y in range(1, self.grid.height - 1):
+                cell = self.grid.get(x, y)
+                if isinstance(cell, Floor):
+                    (corridor_cells if cell.color == "black" else coloured_floor).append((x, y))
+
+        assert len(corridor_cells) >= 2, "environment must contain corridors"
+
+        # ───────── build protected set: corridor endpoints + moat ───────────
+        def degree(coord):
+            x, y = coord
+            return sum(((x + dx, y + dy) in corridor_cells) for dx, dy in dirs)
+
+        protected = {c for c in corridor_cells if degree(c) == 1}          # endpoints
+        for x, y in list(protected):                                        # 1-tile moat
+            protected.update({(x + dx, y + dy) for dx, dy in dirs})
+
+        # Protect the agent's CURRENT position (not spawn position)
+        protected.add(tuple(self.agent_pos))
+
+        # remove protected tiles from candidate list
+        coloured_floor = [c for c in coloured_floor if c not in protected]
+
+        # ───────── identify current agent corridor tile (for connectivity test) ─────
+        ax, ay = self.agent_pos
+        current_corridor = min(corridor_cells, key=lambda c: abs(c[0] - ax) + abs(c[1] - ay))
+        
+        # ───── helper: can current corridor still reach another corridor? ────
+        def corridor_reachable(blocked: set) -> bool:
+            q = deque([current_corridor])
+            visited = {current_corridor}
+
+            while q:
+                x, y = q.popleft()
+                for dx, dy in dirs:
+                    nx, ny = x + dx, y + dy
+                    if (nx, ny) in visited or (nx, ny) in blocked:
+                        continue
+                    if 0 <= nx < self.grid.width and 0 <= ny < self.grid.height:
+                        cell = self.grid.get(nx, ny)
+                        passable = (
+                            cell is None
+                            or (hasattr(cell, "can_overlap") and cell.can_overlap())
+                            or isinstance(cell, Door)
+                        )
+                        if passable:
+                            if (nx, ny) in corridor_cells and (nx, ny) != current_corridor:
+                                return True       # found another corridor tile
+                            visited.add((nx, ny))
+                            q.append((nx, ny))
+            return False                          # current corridor isolated
+
+        # ───────────────────── greedy obstacle insertion ───────────────────
+        random.shuffle(coloured_floor)
+        target_n = int(len(coloured_floor) * obstacle_rate)
+        new_obstacles = set()
+
+        for (x, y) in coloured_floor:
+            if len(new_obstacles) >= target_n:
+                break
+            candidate = self.current_obstacles | new_obstacles | {(x, y)}
+            if corridor_reachable(candidate):
+                new_obstacles.add((x, y))
+
+        # ─────────────────────────── render walls ──────────────────────────
+        for x, y in new_obstacles:
+            self.grid.vert_wall(x, y, 1)
+        
+        # Update tracking
+        self.current_obstacles.update(new_obstacles)
+
+        if self.debug:
+            print(f"Placed {len(new_obstacles)} new grey obstacles "
+                f"(target {target_n}) – current corridor reachable & endpoints clear")
+            print(f"Total obstacles now: {len(self.current_obstacles)}")
+    def Remove_Obstacles(self):
+        """Remove all current obstacles from the grid"""
+        for x, y in self.current_obstacles:
+            # Get the original floor color for this position
+            # Find which room this position belongs to
+            rooms_in_row = self.rooms_in_row
+            rooms_in_col = self.rooms_in_col
+            room_w = self.rooms_size
+            room_h = self.rooms_size
+            
+            # Find which room this obstacle is in
+            for row_inc in range(rooms_in_row):
+                for col_inc in range(rooms_in_col):
+                    xL = col_inc * (room_w + self.corridor_length)
+                    yT = row_inc * (room_h + self.corridor_length)
+                    xR = xL + room_w 
+                    yB = yT + room_h
+                    
+                    if xL < x < xR and yT < y < yB:
+                        # This obstacle is in this room, restore original color
+                        color = list(self.color_idx.keys())[self._rand_int(0, 4)]
+                        self.put_obj(Floor(color), x, y)
+                        break
+        
+        self.current_obstacles.clear()
+        if self.debug:
+            print("Removed all obstacles")     
     def action_to_pose(self,action,current_pose):
         
         if action[0] == 1:
@@ -274,7 +550,7 @@ class AisleDoorRooms(MiniGridEnv):
 
 
 class AisleDoorFourTilesRoomsE(AisleDoorRooms):
-    def __init__(self, size=120, rooms_size=5, rooms_in_row = 3, rooms_in_col = 3,  wT_around = 1, wT_size=1, agent_start_pos=None, corridor_length=4, max_steps = 400):
+    def __init__(self, size=120, rooms_size=5, rooms_in_row = 3, rooms_in_col = 3,  wT_around = 1, wT_size=1, agent_start_pos=None, corridor_length=4, max_steps = 4000):
         super().__init__(size=size, rooms_size=rooms_size, rooms_in_row = rooms_in_row, rooms_in_col = rooms_in_col,  wT_around = wT_around, wT_size=wT_size, agent_start_pos=agent_start_pos, corridor_length=corridor_length, max_steps = max_steps) #random_corridor_length if corridor_length 0 or not int
 class AisleDoorFiveTilesRoomsE(AisleDoorRooms):
     def __init__(self,size=120, rooms_size=6, rooms_in_row = 3, rooms_in_col = 3,  wT_around = 1, wT_size=1, agent_start_pos=None, 

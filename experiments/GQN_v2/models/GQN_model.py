@@ -126,9 +126,11 @@ class GQNModel(torch.nn.Module):
         if place is not None :
             if type(place) == torch.Tensor:
                 if place.shape[-1] == self._observations['z_size']:
+                    print("what the fuck is z size ",self._observations['z_size'] )
                     self._post =  place
                     self._state = self._post.sample()
                 else:
+                    print("what the fuck is z size 2222 ",self._observations['z_size'] )
                     self._post =  MultivariateNormal(place[:,:,:int(place.shape[-1] / 2)],place[:,:,int(place.shape[-1] / 2):])
                     self._state = place
             else:

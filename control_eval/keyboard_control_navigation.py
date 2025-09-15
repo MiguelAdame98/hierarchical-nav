@@ -25,6 +25,7 @@ from nltk import PCFG
 from nltk.parse.generate import generate
 from gym_minigrid.wrappers import ImgActionObsWrapper, RGBImgPartialObsWrapper
 from gym_minigrid.window import Window
+from gym_minigrid.envs.aisle_door_rooms import AisleDoorRooms
 from collections import deque
 from copy import deepcopy
 from control_eval.input_output import *
@@ -33,6 +34,7 @@ from navigation_model.Processes.motion_path_modules import action_to_pose
 
 from env_specifics.minigrid_maze_wt_aisles_doors.minigrid_maze_modules import (
     is_agent_at_door, set_door_view_observation)
+
 from navigation_model.Processes.AIF_modules import mse_elements
 from navigation_model.Processes.exploitative_behaviour import \
     Goal_seeking_Minigrid
@@ -43,10 +45,12 @@ from navigation_model.Services.model_modules import no_vel_no_action
 from navigation_model.visualisation_tools import (
     convert_tensor_to_matplolib_list, transform_policy_from_hot_encoded_to_str,
     visualise_image,visualize_replay_buffer)
-from control_eval.HierarchicalHMMBOCPD import HierarchicalBayesianController
 from control_eval.NavigationSystem import NavigationSystem
 from gym_minigrid.minigrid import Wall 
-
+from dreamer_mg.world_model_utils import DictResizeObs ,WMPlanner
+from control_eval.HierarchicalHMMBOCPD import HierarchicalBayesianController
+from control_eval.NavigationSystem import NavigationSystem
+from torchvision.utils import save_image
 def print_keys_explanation():
     print('NOTE: the agent needs a first push forward to initialise the model with a first observation. \
           So please press up arrow at least once to start well')
@@ -77,16 +81,31 @@ class MinigridInteraction():
         self.goal_test = []
         self.replay_buffer = []  # List to store recent state dictionaries.
         self.agent_current_pose=None
-        self.buffer_size = 600
+        self.buffer_size = 60
         ###3META
         self.hmm_bayes = HierarchicalBayesianController()
         self.hmm_bayes.key=self
         self.current_plan = []
         self.plan_step_idx = 0
         self.last_pose = None
-        self.prev_mode: str | None = None          # last HMM mode we saw
-        self.mode_changed: bool   = False 
        
+        # ── HMM / meta-controller bookkeeping ─────────────────────────────
+        self.current_mode: str      = "EXPLORE"        # start state
+        self.current_submode: str   = "ego_allo"
+        self.prev_mode: str | None  = None             # nothing to compare yet
+        self.prev_submode: str | None = None
+        self.mode_changed: bool     = False
+        self.submode_changed: bool  = False
+        self.hmm_stats: dict | None = None             # last update payload
+
+        ###WMPLANNER
+        '''CKPT = "dreamer_mg/dreamer/runs/mg_collision/20250704-220917/ckpt/iter00800.pt"'''
+        CKPT ="dreamer_mg/runs/mg_collision/20250704-220917/ckpt/iter00800.pt"
+        self.planner = WMPlanner(CKPT)
+        print("✓ world-model loaded")
+        self.wm=self.planner.wm
+        self.belief=None
+        self.prev_onehot=None
         #TODO: ALLOW USER TO SET ITS PREFERRED OB WTOUT ACCESSING CODE
         #Since 255 is the max value of any colour, we don't care about the above value of white
         self.preferred_colour_range = np.array([[235,235,235], [275,275,275]])
@@ -120,8 +139,8 @@ class MinigridInteraction():
         self.automatic_process = False
 
         #--- ENV INIT ---#
-        #self.env_name = 'MiniGrid-' + args.env + '-v0'
-        self.env_name= 'MiniGrid-ADRooms-Collision-v0'
+        self.env_name = 'MiniGrid-' + args.env + '-v0'
+        #self.env_name= 'MiniGrid-ADRooms-Collision-v0'
         print(self.env_name)
         self.env = gym.make(self.env_name, rooms_in_row=args.rooms_in_row, rooms_in_col=args.rooms_in_col)
         import inspect, sys
@@ -133,7 +152,8 @@ class MinigridInteraction():
 
         self.nav_system = NavigationSystem(
                 self.models_manager.memory_graph,
-                lambda: self.agent_current_pose
+                lambda: self.agent_current_pose,
+                planner=self.planner
             )
         self.nav_system.key=self
 
@@ -512,7 +532,7 @@ class MinigridInteraction():
         scored.sort(key=lambda x: (x[0],              # 1️⃣ low penalty
                            np.linalg.norm(embed_fn(x[1]["poses"])[:2] - current_xy)))
 
-        ALPHA = 60.0         # weight for recency‑penalty
+        ALPHA = 6.0         # weight for recency‑penalty
         BETA  = 0.5         # weight for outward distance (tweak!)
 
         best_branch = None
@@ -566,7 +586,15 @@ class MinigridInteraction():
             pose_history.append(current_pose.copy())
         
         return pose_history
+    def action_to_str(self,a):
+        if hasattr(a, "value"):
+            a = int(a.value)
 
+        mapping = {0: "left", 1: "right", 2: "forward"}
+        try:
+            return mapping[a]
+        except KeyError:
+            raise ValueError("action must be 0, 1, or 2 (left, right, forward)")
 
     def agent_step(self, action) -> tuple[bool,dict]:
         print('step in world:', self.step_count())
@@ -578,9 +606,19 @@ class MinigridInteraction():
         #img_bgr = bridge.imgmsg_to_cv2(img_msg, desired_encoding='passthrough')
         #print(img_msg)
         #print(bridge,img_msg,img_bgr.shape)
+        if self.belief==None:
+            img0 = self.env.render(mode="rgb_array")
+            obs = {"image":img0}  
+            self.belief=self.planner.update_belief_from_obs(obs,self.belief,self.prev_onehot)
         obs, _, _, _ = self.env.step(action)
         print(obs.keys(),obs["pose"], obs["image"].shape)
         obs = no_vel_no_action(obs)
+        act_wm=self.action_to_str(action)
+        self.prev_onehot=self.planner.onehot(act_wm,self.wm)
+        with torch.no_grad(): 
+            self.belief=self.planner.update_belief_from_obs(obs,self.belief,self.prev_onehot)
+            path2=[]
+            decoded_image=self.planner.render_plan(self.wm,self.belief, path2, include_last=True)
         self.agent_current_pose=obs["pose"]
         self.nav_system.push_pose(obs["pose"])
         pos = obs['pose']
@@ -592,6 +630,7 @@ class MinigridInteraction():
         prim = emap._map_raw_action(action)
         emap._recent_prims.append(prim)
         self.models_manager.digest(obs)
+        self.belief=self.planner.update_belief_from_obs(obs,self.belief,self.prev_onehot)
         is_agent_at_door(self.models_manager,obs["image"], sensitivity=0.18)
         print("is agent at door",is_agent_at_door(self.models_manager,obs["image"], sensitivity=0.18))
         if self.models_manager.agent_lost():
@@ -611,82 +650,69 @@ class MinigridInteraction():
         'place_doubt_step_count':self.models_manager.allocentric_process.place_doubt_step_count()}
 
         self.update_replay_buffer(current_state)
+        #####HIDDEN MARKOV####
         hmm_info_gain=self.info_gain(obs['image'],obs['pose'], self.replay_buffer, self.models_manager.memory_graph)
-        hmm_plan_progress=self.nav_system.navigation_grade()
+        raw_plan_prog=self.nav_system.navigation_grade()
+        hmm_plan_progress = max(0.0, min(1.0, 0.5 if raw_plan_prog == -1 else float(raw_plan_prog)))
         current_mode,stats=self.hmm_bayes.update(self.replay_buffer,hmm_info_gain,hmm_plan_progress)
-        current_mode = stats["most_likely_state"][0]
         print("############",current_mode,stats)
-        self.mode_changed = (current_mode != self.prev_mode)
-        self.prev_mode    = current_mode
-        if self.step_count()==7:
-            #self.env.put_obj(Wall(), 14, 10) 
-            sx,sy,sd=obs["pose"]
-            gx,gy,gd=[-3,0,2]
-            start= State(int(round(sx)), int(round(sy)), int(sd))
-            goal = State(int(round(gx)), int(round(gy)), int(gd))
-            path=self.astar_prims(start,goal,self.models_manager.egocentric_process)
-            print(path)
-            gx,gy,gd=[6,2,3]
-            start= State(int(round(sx)), int(round(sy)), int(sd))
-            goal = State(int(round(gx)), int(round(gy)), int(gd))
-            path=self.astar_prims(start,goal,self.models_manager.egocentric_process)
-            print(path)
-        if self.step_count()==4:
-            sx,sy,sd=obs["pose"]
-            gx,gy,gd=[-3,0,2]
-            start= State(int(round(sx)), int(round(sy)), int(sd))
-            goal = State(int(round(gx)), int(round(gy)), int(gd))
-            path=self.astar_prims(start,goal,self.models_manager.egocentric_process)
-            print(path)
-            gx,gy,gd=[6,2,3]
-            goal = State(int(round(gx)), int(round(gy)), int(gd))
-            path=self.astar_prims(start,goal,self.models_manager.egocentric_process)
-            print(path)
-        if self.step_count()==9:
-            sx,sy,sd=obs["pose"]
-            gx,gy,gd=[-3,0,2]
-            start= State(int(round(sx)), int(round(sy)), int(sd))
-            goal = State(int(round(gx)), int(round(gy)), int(gd))
-            path=self.astar_prims(start,goal,self.models_manager.egocentric_process)
-            print(path)
-            gx,gy,gd=[6,2,3]
-            goal = State(int(round(gx)), int(round(gy)), int(gd))
-            path=self.astar_prims(start,goal,self.models_manager.egocentric_process)
-            print(path)
-        if self.step_count()==11:
-            sx,sy,sd=obs["pose"]
-            gx,gy,gd=[-3,0,2]
-            start= State(int(round(sx)), int(round(sy)), int(sd))
-            goal = State(int(round(gx)), int(round(gy)), int(gd))
-            path=self.astar_prims(start,goal,self.models_manager.egocentric_process)
-            print(path)
-            gx,gy,gd=[6,2,3]
-            goal = State(int(round(gx)), int(round(gy)), int(gd))
-            path=self.astar_prims(start,goal,self.models_manager.egocentric_process)
-            print(path)
+        print("############",stats)
+        new_mode, new_submode = stats['most_likely_state']
+        self.prev_mode = getattr(self, "current_mode", None)
+        self.prev_submode = getattr(self, "current_submode", None)
+        self.current_mode = new_mode
+        self.current_submode = new_submode
+        self.mode_changed = (new_mode != self.prev_mode)
+        self.submode_changed = (new_submode != self.prev_submode)
+        self.hmm_stats = stats  # For debugging, analysis
+
+        print(f"🧠 [HMM] mode: {new_mode} → {new_submode}  | changed? {self.mode_changed}")
         
             #grammar = self.build_pcfg_from_memory()
             #self.print_adaptive_pcfg_plans(grammar)
-            
-        return self.models_manager.agent_lost(), obs
+        # --------------------------------------------------------------------------
+        # ❸  BUILD A NEW obs DICT FOR DOWN-STREAM PLOTTING
+        # --------------------------------------------------------------------------
+        new_obs              = dict(obs)        # shallow copy of the env observation
+        new_obs["decoded"]   = decoded_image    # you already add this
+
+        # ---- NEW: attach everything the video overlay needs --------------------
+        new_obs["recommended_mode"]     = new_mode
+        new_obs["recommended_submode"]  = new_submode
+        new_obs["mode_confidence"]      = stats.get("mode_probabilities",
+                                                    {}).get(new_mode)
+        sub_conf = None
+        sub_probs = stats.get("submode_probabilities", {})
+        if isinstance(sub_probs, dict):
+            sub_conf = sub_probs.get(new_mode, {}).get(new_submode)
+        new_obs["submode_confidence"] = sub_conf  
+        new_obs["uncertainty"]          = stats.get("state_entropy") \
+                                            or stats.get("uncertainty")
+        new_obs["changepoint_mass"]     = stats.get("changepoint_probability")
+        '''if self.step_count() == 400:
+            print("DIS WHE ")
+            self.env.Spawn_Obstacles(obstacle_rate=0.15)'''
+        
+
+        return self.models_manager.agent_lost(), new_obs, self.mode_changed or self.submode_changed
     
     def apply_policy(self, policy:list, n_actions:int, collect_data:bool=False)->tuple[list,bool]:
         motion_data = []
         agent_lost = False
         print("n_sctions",n_actions, policy,self.convert_hot_encoded_to_minigrid_action(policy[0]))
-        policy=[[1,0,0],[1,0,0],[1,0,0],[1,0,0],[0,0,1],[0,0,1],[0,0,1],[0,1,0],[1,0,0],[1,0,0]]
+        #policy=[[1,0,0],[1,0,0],[1,0,0],[1,0,0],[0,0,1],[1,0,0],[1,0,0],[0,1,0],[1,0,0],[1,0,0]]
         for a in range(len(policy)):   
         #for a in range(n_actions):
             action = self.convert_hot_encoded_to_minigrid_action(policy[a])
-            agent_lost, obs = self.agent_step(action)
+            agent_lost, obs, change = self.agent_step(action)
             world_img = self.redraw()
             if collect_data:
-                data = self.collect_data_models()
+                data = self.collect_data_models(obs)
                 data['env_image'] = world_img
                 data['ground_truth_ob'] = obs['image']
                 motion_data.append(data)
         
-            if self.mode_changed:
+            if change:
                 print(f"Stopping policy: {self.prev_mode}")
                 return motion_data, True
         return motion_data, agent_lost
@@ -696,8 +722,16 @@ class MinigridInteraction():
         policy, n_actions = self.apply_exploration()
         motion_data,agent_lost = self.apply_policy(policy, n_actions, collect_data)
         return motion_data, agent_lost
-    
-    
+    @staticmethod   
+    def to_onehot_list(act: str) -> list[int]:
+        """'left'/'right'/'forward' → [0,0,1] / [0,1,0] / [1,0,0] (Python list)"""
+        mapping = {
+            'forward': [1, 0, 0],
+            'right'  : [0, 1, 0],
+            'left'   : [0, 0, 1],
+        }
+        return mapping[act]
+
     def apply_exploration(self) -> tuple[list, int]:
         """
         Unified high-level controller.
@@ -707,7 +741,6 @@ class MinigridInteraction():
         • Falls back to the legacy “while-loop” exploration when inside
         EXPLORE/ego_allo-family sub-modes.
         • Preserves *all* previous side-effects (prints, counters, resets …).
-
         Returns
         -------
         (policy, n_actions)
@@ -719,10 +752,11 @@ class MinigridInteraction():
         # 0. Read current HMM state (defaults are safe for the very 1st call)
         # ------------------------------------------------------------------ #
         mode, submode = (
-            getattr(self, "prev_mode", None)     or "EXPLORE",
-            getattr(self, "prev_submode", None)  or "ego_allo",
+            getattr(self, "current_mode", None)     or "EXPLORE",
+            getattr(self, "current_submode", None)  or "ego_allo",
         )
-        print(f"[HMM] mode={mode}  submode={submode}")
+        print(f"🧠 [HMM] mode:{mode}  submode={submode}", self.step_count())
+        print(self.step_count())
 
         # ------------------------------------------------------------------ #
         # 1. RECOVER  –— was: “agent lost”
@@ -738,27 +772,46 @@ class MinigridInteraction():
             elif submode == "backtrack_safe":
                 print("Recover ➜ backtrack to known safe node")
                 # TODO: implement/back‐hook a back-tracking routine
-                return [], []  # placeholder
+                fallback = [self.to_onehot_list(random.choice(["right", "left"]))]
+                print(f"[NAVIGATE] STALL → issuing {fallback}")
+                return fallback, 1
 
         # ------------------------------------------------------------------ #
         # 2. NAVIGATE –— path-following & exploitation
         # ------------------------------------------------------------------ #
         if mode == "NAVIGATE":
 
+            print(f"[NAVIGATE] submode={submode}  "
+                f"plan_progress={self.nav_system.progress_scalar():.3f}")
+
             # ---------- 1. Early feasibility gate ----------
             if not self.nav_system.check_navigation_feasibility():
-                # HMM will see the flags and flip out of NAVIGATE
+                print(f"[NAVIGATE] infeasible — flags={self.nav_system.navigation_flags}")
                 self.navigation_flags = self.nav_system.navigation_flags
-                return [], []
+                fallback = [self.to_onehot_list(random.choice(["right", "left"]))]
+                print(f"[NAVIGATE] STALL → issuing {fallback}")
+                return fallback, 1
 
             # ---------- 2. Build first plan if none ----------
-            #   progress_scalar() < 0  ➜  no plan loaded yet
             if self.nav_system.progress_scalar() < 0.0:
-                grammar = self.build_pcfg_from_memory()
+                print("[NAVIGATE] no plan yet → building PCFG plan")
+                grammar = self.nav_system.build_pcfg_from_memory()
                 self.nav_system.generate_plan_with_pcfg(grammar)
+                print(f"[NAVIGATE] new plan tokens={self.nav_system.full_plan_tokens}")
 
             # ---------- 3. Delegate to sub-mode handler ----------
-            primitives, n_actions = self.nav_system.universal_navigation(submode)
+            primitives, n_actions = self.nav_system.universal_navigation(
+                submode, self.wm, self.belief
+            )
+
+            # ---------- 4. Stall safeguard ----------
+            if n_actions == 0 or not primitives:
+                fallback = [self.to_onehot_list(random.choice(["right", "left"]))]
+                print(f"[NAVIGATE] universal_navigation returned empty "
+                    f"→ STALL issuing {fallback}")
+                return fallback, 1
+
+            print(f"[NAVIGATE] primitives={primitives}  n_actions={n_actions}")
             return primitives, n_actions
         # ------------------------------------------------------------------ #
         # 3. TASK_SOLVING –— goal-directed behaviour
@@ -766,18 +819,27 @@ class MinigridInteraction():
         if mode == "TASK_SOLVING":
             if submode == "goal_directed":
                 print("Task-solving ➜ explicit goal search")
-                # TODO
-                return [], []
+                fallback = [self.to_onehot_list(random.choice(["right", "left"]))]
+                print(f"[NAVIGATE] universal_navigation returned empty "
+                    f"→ STALL issuing {fallback}")
+                return fallback, 1
 
             elif submode == "systematic_search":
                 print("Task-solving ➜ systematic sweep")
                 # TODO
-                return [], []
+                fallback = [self.to_onehot_list(random.choice(["right", "left"]))]
+                print(f"[NAVIGATE] universal_navigation returned empty "
+                    f"→ STALL issuing {fallback}")
+                return fallback, 1
 
             elif submode == "task_completion":
                 print("Task-solving ➜ finalising task")
                 # TODO
-                return [], []
+                allback = [self.to_onehot_list(random.choice(["right", "left"]))]
+                print(f"[NAVIGATE] universal_navigation returned empty "
+                    f"→ STALL issuing {fallback}")
+                return fallback, 1
+        
             
         # ------------------------------------------------------------------ #
         # 4. EXPLORE  –– handled by sub-modes
@@ -819,7 +881,10 @@ class MinigridInteraction():
         elif submode == "astar_directed":
             print("astar_directed: frontier-directed exploration (placeholder)")
             # TODO: implement an A* or frontier planner that returns (policy, n_actions)
-            policy, n_action = [], []
+            fallback = [self.to_onehot_list(random.choice(["right", "left"]))]
+            print(f"[NAVIGATE] universal_navigation returned empty "
+            "→ STALL issuing {fallback}")
+            policy, n_action = fallback, 1
 
         else:
             print(f"[WARN] unknown EXPLORE sub-mode: {submode} – defaulting to ego_allo")
@@ -849,20 +914,13 @@ class MinigridInteraction():
                 self.models_manager.reset_variable_lookahead_to_default()
 
         return policy, n_action
-        return 
     def push_explo_stm(self):
             pose_history=self.compute_pose_history()
             self.extract_past_actions(self.replay_buffer)
-            a=self.extract_past_poses(self.replay_buffer)
-            b=self.extract_past_real_poses(self.replay_buffer)
             #print("nnn",a)
             #print(b)
             max_depth = 6
             tree_all = self.build_decision_tree_all(self.replay_buffer[-1]["imagined_pose"], 0, max_depth)
-            '''def print_tree(node, indent=0):
-                print(" " * indent, f"Depth: {node['depth']}, Pose: {node['pose']}, Action: {node['action']}")
-                for child in node["children"]:
-                    print_tree(child, indent + 2)'''
     
             paths=self.extract_branch_paths(tree_all)
             n_branches = len(paths)
@@ -886,66 +944,6 @@ class MinigridInteraction():
             print(top_diverse)
             print(top_diverse.tolist(),len(top_diverse))
             return top_diverse.tolist(),len(top_diverse)        
-    '''def apply_exploration(self)->tuple[list,int]:
-        print('====================================================explo')
-        if self.models_manager.agent_lost():
-            print('Agent lost, trying to determine best place hypothesis')
-            policy, n_action = self.explorative_behaviour.solve_doubt_over_place(self.models_manager)
-            print("solve doubt over place", policy, n_action)
-            return policy, n_action
-        
-        ongoing_exploration_option = 'explore'
-        print('exploring')
-        if self.explorative_behaviour.is_agent_exploring(): #agent_exploring return the latest computed value
-            policy, n_action = self.explorative_behaviour.one_step_ego_allo_exploration(self.models_manager)
-            print("is agent exploring?",self.explorative_behaviour.is_agent_exploring())
-            print(policy, n_action )
-        else:
-            policy, n_action = [],[]
-        
-              
-        while len(policy) == 0:    
-            print('++++++++++++++++++++++++ while len policy =0')   
-            print('trying to increase lookahead by 1 to increase exploration range')
-            lookahead_increased = self.models_manager.increase_lookahead(max=5)   
-            if not lookahead_increased:
-                print('lookahead at max value, search to return to another place')
-                ongoing_exploration_option = 'change_memory_place'
-              
-            if ongoing_exploration_option == 'change_memory_place':
-                print('Searching for another place to go to')
-                print("this time for real",self.step_count())
-                policy, n_action= self.push_explo_stm()  
-                print('this time ++++++++++++++++++++++++',self.step_count()) 
-                if place_to_go:
-                    print('Searching How to go to the other place')
-                    print("where are we going?",place_to_go['current_exp_door_pose'],place_to_go)
-                    policy, n_action = self.exploitative_behaviour.go_to_given_place(\
-                    self.models_manager,place_to_go['current_exp_door_pose'])
-                
-                else:
-                    print('No place found to return to, using ego model')
-                    ongoing_exploration_option = 'push_from_comfort_zone
-                
-            elif ongoing_exploration_option == 'explore':
-                print('Exploring with allo model')
-                policy, n_action = self.explorative_behaviour.one_step_ego_allo_exploration(self.models_manager)
-
-            if ongoing_exploration_option == 'push_from_comfort_zone':
-                print('Using ego model to push exploration')
-                policy, n_action = self.explorative_behaviour.one_step_egocentric_exploration(self.models_manager)
-
-        print('++++++++0 policy should be before this++++++++++++++++++++++++') 
-        policy_G = self.explorative_behaviour.get_latest_policy_EFE(reset_EFE=True)
-        print("policyG",policy_G ,self.explorative_behaviour.is_agent_exploring())
-         #we get policy_G and then erase it from memory
-        if policy_G is not None: 
-            info_gain_coeff = self.explorative_behaviour.rolling_coeff_info_gain()
-            print("info gain coeff", info_gain_coeff)
-            if self.explorative_behaviour.define_is_agent_exploring(info_gain_coeff, policy_G, threshold=1):
-                self.models_manager.reset_variable_lookahead_to_default()
-        print('++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++')            
-        return policy, n_action''' 
 
     def agent_seeks_goal(self, collect_data:bool=False)->tuple[list,bool]:
         motion_data, agent_lost = self.apply_goal_seeking(collect_data)
@@ -1015,23 +1013,25 @@ class MinigridInteraction():
         motion_data,agent_lost = self.apply_policy(policy, n_actions, collect_data)
         return motion_data,agent_lost 
         
-    def collect_data_models(self)->dict:
+    def collect_data_models(self,obs)->dict:
         """collect latest data from manager """
         ''' this is for visualisation purposes only '''
         data = {}
         place_description = self.models_manager.get_best_place_hypothesis()
-        data.update(place_description)
+        data.update({k: v for k, v in place_description.items() if k != "pose"})
         if 'post' in data:
             del data['post']
 
-        if 'image_predicted' in data and data['image_predicted'] is not None:
-        #convert to numpy for data visualisation
-            data['image_predicted'] = convert_tensor_to_matplolib_list(data['image_predicted'])
-
-        #----- just PLOT DATA -----#
+        if "decoded" in obs and obs["decoded"] is not None:
+            if isinstance(obs["decoded"], (list, tuple)):
+                data["decoded"] = obs["decoded"]          # list is already fine for plotting
+            else:
+                data["decoded"] = convert_tensor_to_matplolib_list(obs["decoded"])
+                if "decoded" in obs and obs["decoded"] is not None:
+                    data["decoded"] = convert_tensor_to_matplolib_list(obs["decoded"])
+                #----- just PLOT DATA -----#
         data['GP'] = self.models_manager.memory_graph.get_global_position() 
         data['exp'] = self.models_manager.memory_graph.get_current_exp_id()
-
         if 'mse' not in data :
             data['mse'] = -1
         if 'kl' not in data :
@@ -1042,6 +1042,29 @@ class MinigridInteraction():
         # exp_ids, probs = self.exp_visualisation_proba(place_descriptors)
         # data['exp_ids'] = [exp_ids]
         # data['exp_prob'] = [probs]
+        p = obs["pose"]
+
+        # make an immutable copy
+        if isinstance(p, np.ndarray):
+            data['pose'] = p.copy()
+        elif isinstance(p, list):
+            data['pose'] = p[:]            # shallow copy of list
+        else:                               # tuple or something immutable
+            data['pose'] = tuple(p)
+        p = obs["pose"]
+        data['pose'] = p.copy() if hasattr(p, "copy") else p[:]
+        print("[DBG collect] live pose", data['pose'])
+        for key in ("recommended_mode", "recommended_submode",
+            "mode_confidence", "submode_confidence",
+            "uncertainty", "changepoint_mass"):
+            if key in obs and obs[key] is not None:
+                val = obs[key]
+                if isinstance(val, np.ndarray):
+                    data[key] = val.copy()
+                elif isinstance(val, list):
+                    data[key] = val[:]           # shallow copy of list
+                else:                            # str, float, tuple … already immutable
+                    data[key] = val
 
         return data
     
@@ -1778,8 +1801,185 @@ class MinigridInteraction():
 
         grammar_src = "\n".join(pcfg_lines)
         print("[PCFG DEBUG] Final grammar:\n" + grammar_src)
-        return PCFG.fromstring(grammar_src)'''
+        return PCFG.fromstring(grammar_src)
 
+        
+        def apply_exploration(self)->tuple[list,int]:
+        print('====================================================explo')
+        if self.models_manager.agent_lost():
+            print('Agent lost, trying to determine best place hypothesis')
+            policy, n_action = self.explorative_behaviour.solve_doubt_over_place(self.models_manager)
+            print("solve doubt over place", policy, n_action)
+            return policy, n_action
+        
+        ongoing_exploration_option = 'explore'
+        print('exploring')
+        if self.explorative_behaviour.is_agent_exploring(): #agent_exploring return the latest computed value
+            policy, n_action = self.explorative_behaviour.one_step_ego_allo_exploration(self.models_manager)
+            print("is agent exploring?",self.explorative_behaviour.is_agent_exploring())
+            print(policy, n_action )
+        else:
+            policy, n_action = [],[]
+        
+              
+        while len(policy) == 0:    
+            print('++++++++++++++++++++++++ while len policy =0')   
+            print('trying to increase lookahead by 1 to increase exploration range')
+            lookahead_increased = self.models_manager.increase_lookahead(max=5)   
+            if not lookahead_increased:
+                print('lookahead at max value, search to return to another place')
+                ongoing_exploration_option = 'change_memory_place'
+              
+            if ongoing_exploration_option == 'change_memory_place':
+                print('Searching for another place to go to')
+                print("this time for real",self.step_count())
+                policy, n_action= self.push_explo_stm()  
+                print('this time ++++++++++++++++++++++++',self.step_count()) 
+                if place_to_go:
+                    print('Searching How to go to the other place')
+                    print("where are we going?",place_to_go['current_exp_door_pose'],place_to_go)
+                    policy, n_action = self.exploitative_behaviour.go_to_given_place(\
+                    self.models_manager,place_to_go['current_exp_door_pose'])
+                
+                else:
+                    print('No place found to return to, using ego model')
+                    ongoing_exploration_option = 'push_from_comfort_zone
+                
+            elif ongoing_exploration_option == 'explore':
+                print('Exploring with allo model')
+                policy, n_action = self.explorative_behaviour.one_step_ego_allo_exploration(self.models_manager)
+
+            if ongoing_exploration_option == 'push_from_comfort_zone':
+                print('Using ego model to push exploration')
+                policy, n_action = self.explorative_behaviour.one_step_egocentric_exploration(self.models_manager)
+
+        print('++++++++0 policy should be before this++++++++++++++++++++++++') 
+        policy_G = self.explorative_behaviour.get_latest_policy_EFE(reset_EFE=True)
+        print("policyG",policy_G ,self.explorative_behaviour.is_agent_exploring())
+         #we get policy_G and then erase it from memory
+        if policy_G is not None: 
+            info_gain_coeff = self.explorative_behaviour.rolling_coeff_info_gain()
+            print("info gain coeff", info_gain_coeff)
+            if self.explorative_behaviour.define_is_agent_exploring(info_gain_coeff, policy_G, threshold=1):
+                self.models_manager.reset_variable_lookahead_to_default()
+        print('++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++')            
+        return policy, n_action
+
+
+
+
+if self.step_count()==7:
+            #self.env.put_obj(Wall(), 14, 10) 
+            sx,sy,sd=obs["pose"]
+            gx,gy,gd=[-3,0,2]
+            start= State(int(round(sx)), int(round(sy)), int(sd))
+            print("START",start)
+            goal = State(int(round(gx)), int(round(gy)), int(gd))
+            path=self.planner.astar_prims(self.wm,self.belief, start, goal, verbose=True)
+            print("PATHdbg/demo_rollout1.png",path)
+            # ------------ render imagined rollout ------------------------------
+            frames = self.planner.render_plan(self.wm,self.belief, path, include_last=True)
+            Path("dbg").mkdir(exist_ok=True, parents=True)
+            save_image(torch.stack(frames),
+                    "dbg/demo_rollout1.png", nrow=len(frames),
+                    normalize=True, scale_each=False)
+            print("saved dbg/demo_rollout1.png.png")
+            path2=self.astar_prims(start,goal,self.models_manager.egocentric_process)
+            print("PATH",path,path2)
+            gx,gy,gd=[6,2,3]
+            start= State(int(round(sx)), int(round(sy)), int(sd))
+            goal = State(int(round(gx)), int(round(gy)), int(gd))
+            path=self.planner.astar_prims(self.wm,self.belief, start, goal, verbose=True)
+            # ------------ render imagined rollout ------------------------------
+            frames = self.planner.render_plan(self.wm,self.belief, path, include_last=True)
+            Path("dbg").mkdir(exist_ok=True, parents=True)
+            save_image(torch.stack(frames),
+                    "dbg/demo_rollout2.png", nrow=len(frames),
+                    normalize=True, scale_each=False)
+            print("dbg/demo_rollout2.png",path)
+            path2=self.astar_prims(start,goal,self.models_manager.egocentric_process)
+            print(path,path2)
+        if self.step_count()==4:
+            sx,sy,sd=obs["pose"]
+            gx,gy,gd=[-3,0,2]
+            start= State(int(round(sx)), int(round(sy)), int(sd))
+            print("START",start)
+            goal = State(int(round(gx)), int(round(gy)), int(gd))
+            path=self.planner.astar_prims(self.wm,self.belief, start, goal, verbose=True)
+            # ------------ render imagined rollout ------------------------------
+            frames = self.planner.render_plan(self.wm,self.belief, path, include_last=True)
+            Path("dbg").mkdir(exist_ok=True, parents=True)
+            save_image(torch.stack(frames),
+                    "dbg/demo_rollout3.png", nrow=len(frames),
+                    normalize=True, scale_each=False)
+            print("PATHdbg/demo_rollout3.png",path)
+            path2=self.astar_prims(start,goal,self.models_manager.egocentric_process)
+            print("PATH",path,path2)
+            gx,gy,gd=[6,2,3]
+            start= State(int(round(sx)), int(round(sy)), int(sd))
+            goal = State(int(round(gx)), int(round(gy)), int(gd))
+            path=self.planner.astar_prims(self.wm,self.belief, start, goal, verbose=True)
+            # ------------ render imagined rollout ------------------------------
+            frames = self.planner.render_plan(self.wm,self.belief, path, include_last=True)
+            Path("dbg").mkdir(exist_ok=True, parents=True)
+            save_image(torch.stack(frames),
+                    "dbg/demo_rollout4.png", nrow=len(frames),
+                    normalize=True, scale_each=False)
+            print("START",start)
+            print("PATHdbg/demo_rollout4.png",path)
+            path2=self.astar_prims(start,goal,self.models_manager.egocentric_process)
+            print("PATH",path,path2)
+        if self.step_count()==9:
+            sx,sy,sd=obs["pose"]
+            gx,gy,gd=[-3,0,2]
+            start= State(int(round(sx)), int(round(sy)), int(sd))
+            goal = State(int(round(gx)), int(round(gy)), int(gd))
+            path=self.planner.astar_prims(self.wm,self.belief, start, goal, verbose=False)
+            # ------------ render imagined rollout ------------------------------
+            frames = self.planner.render_plan(self.wm,self.belief, path, include_last=True)
+            Path("dbg").mkdir(exist_ok=True, parents=True)
+            save_image(torch.stack(frames),
+                    "dbg/demo_rollout5.5.png", nrow=len(frames),
+                    normalize=True, scale_each=False)
+            print("START",start)
+            print("dbg/demo_rollout5.5.png",path)
+            path2=self.astar_prims(start,goal,self.models_manager.egocentric_process)
+            print(path,path2)
+            gx,gy,gd=[6,2,3]
+            start= State(int(round(sx)), int(round(sy)), int(sd))
+            goal = State(int(round(gx)), int(round(gy)), int(gd))
+            path=self.planner.astar_prims(self.wm,self.belief, start, goal, verbose=True)
+            # ------------ render imagined rollout ------------------------------
+            frames = self.planner.render_plan(self.wm,self.belief, path, include_last=True)
+            Path("dbg").mkdir(exist_ok=True, parents=True)
+            save_image(torch.stack(frames),
+                    "dbg/demo_rollout5.png", nrow=len(frames),
+                    normalize=True, scale_each=False)
+            print("START",start)
+            print("dbg/demo_rollout5.png",path)
+            path2=self.astar_prims(start,goal,self.models_manager.egocentric_process)
+            print(path,path2)
+        if self.step_count()==11:
+            sx,sy,sd=obs["pose"]
+            gx,gy,gd=[-3,0,2]
+            start= State(int(round(sx)), int(round(sy)), int(sd))
+            goal = State(int(round(gx)), int(round(gy)), int(gd))
+            path=self.planner.astar_prims(self.wm,self.belief, start, goal, verbose=False)
+            # ------------ render imagined rollout ------------------------------
+            frames = self.planner.render_plan(self.wm,self.belief, path, include_last=True)
+            Path("dbg").mkdir(exist_ok=True, parents=True)
+            save_image(torch.stack(frames),
+                    "dbg/demo_rollout6.png", nrow=len(frames),
+                    normalize=True, scale_each=False)
+            print("dbg/demo_rollout6.png",path)
+            path2=self.astar_prims(start,goal,self.models_manager.egocentric_process)
+            print(path,path2)
+            gx,gy,gd=[6,2,3]
+            start= State(int(round(sx)), int(round(sy)), int(sd))
+            goal = State(int(round(gx)), int(round(gy)), int(gd))
+            path=self.planner.astar_prims(self.wm,self.belief, start, goal, verbose=False)
+            path2=self.astar_prims(start,goal,self.models_manager.egocentric_process)
+            print(path,path2) '''
 
             
 

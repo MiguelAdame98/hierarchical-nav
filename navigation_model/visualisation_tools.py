@@ -46,7 +46,57 @@ def transform_policy_from_hot_encoded_to_str(policy:list) -> list:
                 str_policy.append('X')
         return str_policy
 
+import numpy as np, torch
+
+def prepare_for_imshow(img):
+    import numpy as np, torch
+
+    # --- to numpy --------------------------------------------------
+    if torch.is_tensor(img):
+        img = img.detach().cpu().numpy()
+    if isinstance(img, (list, tuple)):
+        img = np.asarray(img)
+
+    # ---- squeeze sequence / batch dims ---------------------------
+    if img.ndim == 5:                    # (T,B,3,H,W) or (B,T,3,H,W)
+        img = img[0]                    # take first imagined frame
+    if img.ndim == 4 and img.shape[0] == 1:
+        img = img[0]                    # (1,3,H,W) -> (3,H,W)
+
+    # ---- to H×W×3 -------------------------------------------------
+    if img.ndim == 3 and img.shape[0] == 3:
+        img = img.transpose(1, 2, 0)    # (3,H,W) -> (H,W,3)
+
+    # ---- scale range ---------------------------------------------
+    raw_min, raw_max = img.min(), img.max()
+    print(f"[DBG prepare] raw  min={raw_min:.3f}  max={raw_max:.3f}")
+
+    if raw_max > 1.5:                   # 0-255
+        img = img / 255.0
+    elif raw_min < -0.9:                # -1…1 tanh
+        img = (img + 1.0) / 2.0
+    elif raw_min < -0.1:                # -0.5…0.5
+        img = img + 0.5
+
+    img = np.clip(img, 0.0, 1.0)
+    print(f"[DBG prepare] scaled min={img.min():.3f}  max={img.max():.3f}")
+
+    return img.astype(np.float32)
 #=============================== VIDEO METHODS ===========================================
+def dbg_stats(name, arr):
+        import numpy as np, torch
+        if arr is None:                      # skip empty placeholders
+            print(f"[DBG] {name:<15} is  None")
+            return
+
+        if isinstance(arr, (list, tuple)):
+            arr = np.asarray(arr)
+        if torch.is_tensor(arr):
+            arr = arr.detach().cpu().numpy()
+
+        print(f"[DBGGGGGG] {name:<15} dtype={arr.dtype}  shape={arr.shape}  "
+            f"min={arr.min():.3f}  max={arr.max():.3f}  mean={arr.mean():.3f}")
+
 
 def record_video_frames(data:dict, env_definition:dict, agent_lost:bool, visited_rooms:list, memory_map_data:dict, step_count:int) -> np.ndarray:
     ''' we create a full frame ready to be added to a video or displayed'''
@@ -57,51 +107,53 @@ def record_video_frames(data:dict, env_definition:dict, agent_lost:bool, visited
 
     #-- WORLD--#
     ax1 = fig.add_subplot(s[:2, :2])
+    dbg_stats("env_image", data['env_image']) 
     ax1 = get_image_plot(ax1, data['env_image'], 'World')
 
     #-- GT OBSERVATION--#
     ax2 = fig.add_subplot(s[:1, 2:3])
+    dbg_stats("ground_truth_ob", data['ground_truth_ob'])  
     ax2 = get_image_plot(ax2, data['ground_truth_ob'], 'GT OB')
    
-     #-- PREDICTED OBSERVATIONS--#
-    if 'image_predicted' in data and data['image_predicted']is not None:
+    # PREDICTED OBSERVATIONS -------------------------------------------
+    if 'image_predicted' in data and data['image_predicted'] is not None:
+        pred_img = prepare_for_imshow(data['image_predicted'])
         ax3 = fig.add_subplot(s[:2, 3])
-        ax3 = get_image_plot(ax3, data['image_predicted'], 'Predicted ob')
+        ax3 = get_image_plot(ax3, pred_img, 'Predicted ob')
 
-   #-- INFO GAIN (NOT IMP) ---#
-    ax2_bis = fig.add_subplot(s[1:2, 2:3])
-    if "info_gain" in data and data["info_gain"] is not None:
-        info_gain_value = data["info_gain"]
-        # Check if it's already a 3D array:
-        if hasattr(info_gain_value, "shape") and len(info_gain_value.shape) == 3:
-            img = vis_image(info_gain_value, show=False, fmt="numpy")
-            ax2_bis = get_image_plot(ax2_bis, img, "Place_info_gain")
-        else:
-            # info_gain is likely a float (or something not a 3D image),
-            # so either skip plotting or convert to a mock image, e.g.:
-            
-            # Skip plotting:
-            pass
-            
-            # OR turn it into a small image:
-            import numpy as np
-            mock_img = np.full((50, 50, 3), info_gain_value, dtype=np.float32)
-            img = vis_image(mock_img, show=False, fmt="numpy")
-            ax2_bis = get_image_plot(ax2_bis, img, "Place_info_gain")
-
-
+    # DECODED IMAGE -----------------------------------------------------
+    if 'decoded' in data and data['decoded'] is not None:
+        dec_img = prepare_for_imshow(data['decoded'])
+        ax_dec = fig.add_subplot(s[1:2, 2:3])
+        ax_dec = get_image_plot(ax_dec, dec_img, 'Decoded ob')
+    
     #-- MAPS OF VISITED ROOMS --#
     ax4 = fig.add_subplot(s[2:4, :2])
     ax4 = plot_visited_rooms(ax4,visited_rooms, env_definition)
 
     #-- DESIRED OBJECTIVE --#
-    if 'goal' in data:
-        ax5 = fig.add_subplot(s[2:4, 2:4])
-        if len(data['goal'].shape)>3:
-            data['goal'] = torch.mean(data['goal'], dim=list(range(len(data['goal'].shape)-3)))
-        print("data['goal'] shape", data['goal'].shape)
-        img =  vis_image(data['goal'], show=False, fmt="numpy")
-        ax5 = get_image_plot(ax5, img, 'Imagined desired objective')
+    # --  HIGH-LEVEL STATE  (previously "goal") --------------------------
+    if 'recommended_mode' in data:
+        mode_line = f"mode={data['recommended_mode']}   " \
+                f"submode={data['recommended_submode']}"
+        ax_state = fig.add_subplot(s[2:4, 2:4])
+        txt = []
+
+        # single-line headline
+        txt.append(f"► MODE :  {data['recommended_mode']} "
+                f"({data.get('mode_confidence',0):.2f})")
+        txt.append(f"► SUB  :  {data['recommended_submode']} "
+                f"({data.get('submode_confidence',0):.2f})")
+
+        # optional extras
+        if 'uncertainty' in data:
+            txt.append(f"entropy={data['uncertainty']:.2f}   "
+                    f"changepoint P={data.get('changepoint_mass',0):.2f}")
+
+        ax_state.text(0.0, 1.0, "\n".join(txt),
+                    fontsize=10, va="top", ha="left",
+                    family="monospace")
+        ax_state.set_axis_off()
 
     #-- PRED/OB MSE ---#
     ax6 = fig.add_subplot(s[:2, 4])
@@ -111,7 +163,7 @@ def record_video_frames(data:dict, env_definition:dict, agent_lost:bool, visited
     ax7= plot_memory_map(ax7, memory_map_data)
 
     ax8 = fig.add_subplot(s[:2, 5])
-    ax8 = print_positions(ax8, data['GP'], data['pose'], step_count)
+    ax8 = print_positions(ax8, data['GP'], data['pose'], step_count, mode_str=mode_line)
     
 
     fig = plt.gcf()
@@ -398,7 +450,7 @@ def plot_memory_map(ax, memory_map_data, *, dbg=False):
     return ax
 
 
-def print_positions(ax, GP, pose, step_count):
+'''def print_positions(ax, GP, pose, step_count):
     current_gp = [float(x) for x in np.around(np.array(GP), 2)]
     s1 = 'Global Position [x,y,th]: ' 
     ax.text(-0.3, 0.9, s1, fontsize=10, color='black')
@@ -410,8 +462,29 @@ def print_positions(ax, GP, pose, step_count):
     ax.set_axis_off()
     s0 = 'Step: ' + str(step_count) 
     ax.text(-0.3,1.1, s0, fontsize=10, color='black')
-    return ax
+    return ax'''
+def print_positions(ax, GP, pose, step_count, mode_str=None):
+    """Draw global/local pose and optional mode string."""
+    current_gp = [float(x) for x in np.around(np.array(GP), 2)]
 
+    s0 = f"Step: {step_count}"
+    s1 = "Global Position [x,y,th]:"
+    s2 = str(current_gp)
+    s3 = "Local Position  [x y th]:"
+    s4 = str(pose)
+
+    ax.text(-0.3, 1.05, s0, fontsize=10, color="black")
+    ax.text(-0.3, 0.90, s1, fontsize=10, color="black")
+    ax.text( 0.0, 0.80, s2, fontsize=10, color="black")
+    ax.text(-0.3, 0.60, s3, fontsize=10, color="black")
+    ax.text( 0.0, 0.50, s4, fontsize=10, color="black")
+
+    # -------------- NEW: mode / sub-mode line -----------------------
+    if mode_str:
+        ax.text(-0.3, 0.30, mode_str, fontsize=10, color="blue")
+
+    ax.set_axis_off()
+    return ax
 #=============================== OTHER METHODS ===========================================
 def plot_pose_cube(memory_graph:object):
     """ plot CAN pose cell gradual motion"""

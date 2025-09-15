@@ -47,6 +47,7 @@ def setup_memory_config(memory_config:str)-> dict:
         memory_config = yaml.safe_load(Path(memory_config).read_text())
     except Exception as e:
         raise Exception(e)
+    print("this is the memory config", memory_config)
     return memory_config
 
 def load_memory(models_manager:object, old_memory:str) -> None:
@@ -68,10 +69,10 @@ def save_memory(models_manager:object, saving_directory:str)-> None:
 #TODO:MAKE THIS MORE MODULAR
 def create_saving_directory(directory:str)-> str:
     """NOTE TIS IS PARTICULAR TO ONE INDIVIDUAL"""
-    if os.path.exists('/app/Summaries/'):
-        dir = '/app/Summaries/' 
+    if os.path.exists('/Users/lab25/hierarchical-nav'):
+        dir = '/Users/lab25/hierarchical-nav' 
     else:
-        dir = '/app/Summaries/' 
+        dir = '/Users/lab25/hierarchical-nav' 
 
     home_dir = dir + directory 
            
