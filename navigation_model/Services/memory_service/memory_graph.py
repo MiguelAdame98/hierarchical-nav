@@ -47,7 +47,7 @@ import dill
 import cv2
 import numpy as np
 from .odometry import VisualOdometry,\
-    PoseOdometry, ActionOdometry, Odometry, HotEncodedActionOdometry
+    PoseOdometry, ActionOdometry, Odometry, HotEncodedActionOdometry, MinigridActionPoseOdometry
 from .view_cells import  TorchedViewCells, TorchedViewCell
 from .pose_cells import PoseCells
 from .experience_map import Experience, ExperienceMap
@@ -80,11 +80,12 @@ class MemoryGraph(object):
         if odom == "odom":
             self.odom = Odometry()
         elif odom == "action":
-            self.odom = ActionOdometry()
+            self.odom = MinigridActionPoseOdometry()
         elif odom == "HEaction":
-            self.odom = HotEncodedActionOdometry()
+            self.odom = MinigridActionPoseOdometry()
         elif odom == "pose":
-            self.odom = PoseOdometry()
+            self.odom = MinigridActionPoseOdometry()
+        elif odom == "minigrid": self.odom = MinigridActionPoseOdometry() 
         else:
             self.odom = VisualOdometry(observation)
 
@@ -127,8 +128,19 @@ class MemoryGraph(object):
                                                   
         self.observation = observations[self.observation_key]
         print("wtf is happening here",self.observation,observations[self.odometry_key])
+        print("DO WE HAVE POSE?", observations["pose"])
         action_ob = observations[self.odometry_key]
-        
+        pose_ob   = observations.get("pose", None)  # (x, y, th), th can be {0..3} or radians
+
+        # New call signature accepts pose_ob; if odom != "minigrid", extra arg is ignored (or you can gate on hasattr)
+        try:
+            vtrans, vrot = self.odom(action_ob, dt, pose_ob)
+            print("vtrans, vrot from odom with pose", vtrans, vrot)
+        except TypeError:
+            # For older odometry classes that only accept (action, dt)
+            vtrans, vrot = self.odom(action_ob, dt)
+
+        x, y, th = self.odom.odometry # global odometry
         kwargs = {}
         kwargs['KL'] = observations.get('KL',None)
         if self.local_position:
@@ -147,9 +159,6 @@ class MemoryGraph(object):
         #if no observation, we consider previous one
         # if self.observation is None:
         #     self.observation = self.view_cells.prev_cell.template
-        # get odom estimations
-        vtrans, vrot = self.odom(action_ob, dt)
-        x, y, th = self.odom.odometry
         print("odom", x, y, th)
 
         #TODO: TEMPO SIMPLIFICQTION

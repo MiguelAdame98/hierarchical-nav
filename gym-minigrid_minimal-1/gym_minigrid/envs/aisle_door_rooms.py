@@ -418,7 +418,250 @@ class AisleDoorRooms(MiniGridEnv):
             'first_visits': self.visited_rooms_order[:5]
         }
     # ---- END: room/corridor instrumentation helpers ---------------------------
-    
+    def MutateConnectivity(
+            self,
+            cutoff_rooms_rate: float = 0.0,
+            front_obstacle_rate: float = 0.0,
+            avoid_agent_blocking: bool = True,
+            seed: int | None = None,
+        ):
+        """
+        Two primitives over existing map:
+        (A) 'cut'   – hard-disconnect: block full corridors at BOTH ends
+        (B) 'front' – soft nuisance: put one wall 1 tile *inside* a room (two steps in from corridor),
+                        so the entrance remains passable
+
+        Args
+        ----
+        cutoff_rooms_rate : fraction (0..1) of *rooms* to fully isolate by cutting *all* their incident corridors.
+                            Each cut corridor is blocked at both ends so neither side can traverse it.
+        front_obstacle_rate : fraction (0..1) of the remaining (uncut) corridors to receive ONE front obstacle
+                            (randomly on one side), 1 tile away from the corridor entrance (never blocking).
+        avoid_agent_blocking : if True, we refuse to place a wall on the agent's current cell, and we
+                            avoid cutting a corridor if the agent currently stands on one of its end cells.
+        seed : optional RNG seed (deterministic selection if provided).
+        """
+        import random
+        rng = random.Random(seed)
+
+        # ---------- tiny helpers ----------
+        def _in_bounds(x, y):
+            return 0 <= x < self.grid.width and 0 <= y < self.grid.height
+
+        def _is_corridor_xy(x, y):
+            # corridor set already includes the door tile via _register_door, but be robust:
+            if (x, y) in getattr(self, "corridor_xy", set()):
+                return True
+            cell = self.grid.get(x, y)
+            return isinstance(cell, Door) or (isinstance(cell, Floor) and getattr(cell, "color", None) == "black")
+
+        def _neighbors4(x, y):
+            return [(x+1,y), (x-1,y), (x,y+1), (x,y-1)]
+
+        def _place_wall(x, y):
+            # single-cell wall; track for removal
+            if (x, y) == tuple(self.agent_pos):
+                return False
+            if not _in_bounds(x, y):
+                return False
+            # don't overwrite doors
+            cell = self.grid.get(x, y)
+            if isinstance(cell, Door):
+                return False
+            # record original to allow precise restoration later (optional, but safer)
+            if not hasattr(self, "_obstacle_restore"):
+                self._obstacle_restore = {}
+            if (x, y) not in self._obstacle_restore:
+                self._obstacle_restore[(x, y)] = cell  # may be Floor('black') or colored Floor
+            # place wall (length-1 vertical wall is a single Wall())
+            self.grid.vert_wall(x, y, 1)
+            self.current_obstacles.add((x, y))
+            return True
+
+        def _step_until_end(start_xy, step_vec):
+            """From a corridor/door tile, walk along axis until the *last* corridor tile before leaving."""
+            cx, cy = start_xy
+            sx, sy = step_vec
+            last = (cx, cy)
+            while True:
+                nx, ny = cx + sx, cy + sy
+                if not _in_bounds(nx, ny):
+                    break
+                if not _is_corridor_xy(nx, ny):
+                    break
+                last = (nx, ny)
+                cx, cy = nx, ny
+            return last
+
+        def _axis_from_door(dx, dy):
+            # look for corridor continuation left/right or up/down
+            h = _is_corridor_xy(dx-1, dy) or _is_corridor_xy(dx+1, dy)
+            v = _is_corridor_xy(dx, dy-1) or _is_corridor_xy(dx, dy+1)
+            if h and not v:
+                return "h"
+            if v and not h:
+                return "v"
+            # fallbacks—prefer the more populated direction
+            h_count = sum(_is_corridor_xy(dx + k, dy) for k in (-1, 1))
+            v_count = sum(_is_corridor_xy(dx, dy + k) for k in (-1, 1))
+            return "h" if h_count >= v_count else "v"
+
+        def _extract_corridors_index():
+            """
+            Build a list of straight corridors keyed by their (single) Door tile.
+            Each item: {
+            'door': (dx,dy),
+            'axis': 'h'|'v',
+            'ends': [(ex1,ey1), (ex2,ey2)],            # last corridor cells near each room wall opening
+            'entrances': [(ix1,iy1), (ix2,iy2)],       # first room interior tiles adjacent to the corridor
+            'deeper': [(fx1,fy1), (fx2,fy2)],          # two-steps-in tiles (front-obstacle placement target)
+            'rooms': [rid1, rid2],                     # (col,row) for each side
+            }
+            """
+            corridors = []
+            seen_doors = set()
+            for dxy in getattr(self, "door_xy", []):
+                if dxy in seen_doors:
+                    continue
+                dx, dy = dxy
+                if not _in_bounds(dx, dy):
+                    continue
+                if not isinstance(self.grid.get(dx, dy), Door):
+                    # robust: skip if someone mutated the tile
+                    continue
+
+                axis = _axis_from_door(dx, dy)
+                step_pos = (1, 0) if axis == "h" else (0, 1)
+                step_neg = (-step_pos[0], -step_pos[1])
+
+                end_neg = _step_until_end((dx, dy), step_neg)
+                end_pos = _step_until_end((dx, dy), step_pos)
+
+                # find entrance (first room interior) adjacent to each end
+                entrances, deeper, rooms = [], [], []
+                for ex, ey in (end_neg, end_pos):
+                    # try the four neighbors; the interior one is the neighbor with a valid room id
+                    ent = None
+                    for nx, ny in _neighbors4(ex, ey):
+                        if not _in_bounds(nx, ny):
+                            continue
+                        # entrance must NOT be a corridor tile
+                        if _is_corridor_xy(nx, ny):
+                            continue
+                        rid = self.get_room_id_at(nx, ny)
+                        if rid is not None:
+                            ent = (nx, ny)
+                            rooms.append(rid)
+                            break
+                    if ent is None:
+                        # Occasionally, an opening can be exactly on the wall cell. Fall back: step once more
+                        # perpendicular to axis to look for the interior.
+                        if axis == "h":
+                            cand = [(ex, ey-1), (ex, ey+1)]
+                        else:
+                            cand = [(ex-1, ey), (ex+1, ey)]
+                        ent = next(((nx, ny) for (nx, ny) in cand
+                                    if _in_bounds(nx, ny) and self.get_room_id_at(nx, ny) is not None
+                                    and not _is_corridor_xy(nx, ny)), None)
+                        if ent is None:
+                            # Give up on this corridor end (should be rare)
+                            entrances.append(None)
+                            deeper.append(None)
+                            rooms.append(None)
+                            continue
+
+                    entrances.append(ent)
+                    # "Front" tile is one step deeper into the room along the (ent - end) vector
+                    vx, vy = ent[0] - ex, ent[1] - ey
+                    fx, fy = ent[0] + vx, ent[1] + vy
+                    deeper.append((fx, fy))
+
+                corridors.append({
+                    "door": (dx, dy),
+                    "axis": axis,
+                    "ends": [end_neg, end_pos],
+                    "entrances": entrances,
+                    "deeper": deeper,
+                    "rooms": rooms,
+                })
+                seen_doors.add(dxy)
+            return corridors
+
+        # ---------- build index ----------
+        corridors = _extract_corridors_index()
+        if not corridors:
+            if self.debug:
+                print("[MutateConnectivity] No corridors found; nothing to mutate.")
+            return
+
+        # Map room -> incident corridor indices (by side)
+        room2corr = {}
+        for idx, c in enumerate(corridors):
+            for rid in c["rooms"]:
+                if rid is None:
+                    continue
+                room2corr.setdefault(rid, set()).add(idx)
+
+        # ---------- (A) SELECT rooms to hard-cut ----------
+        all_rooms = [rid for rid in self.room_meta.keys() if room2corr.get(rid)]
+        n_cut_rooms = int(round(len(all_rooms) * max(0.0, min(1.0, cutoff_rooms_rate))))
+        rng.shuffle(all_rooms)
+        rooms_to_cut = set(all_rooms[:n_cut_rooms])
+
+        # Corridors to hard-cut = union of incident corridors of those rooms
+        corridors_to_cut = set()
+        for rid in rooms_to_cut:
+            corridors_to_cut |= room2corr.get(rid, set())
+
+        # ---------- (B) SELECT corridors for front obstacles (exclude already cut) ----------
+        remaining_corr_idxs = [i for i in range(len(corridors)) if i not in corridors_to_cut]
+        n_front = int(round(len(remaining_corr_idxs) * max(0.0, min(1.0, front_obstacle_rate))))
+        rng.shuffle(remaining_corr_idxs)
+        corridors_for_front = set(remaining_corr_idxs[:n_front])
+
+        # ---------- APPLY MUTATIONS ----------
+        placed_cut, placed_front = 0, 0
+
+        # (A) Cut: for each corridor, place walls at *both* end corridor tiles
+        for idx in corridors_to_cut:
+            c = corridors[idx]
+            ends = c["ends"]
+            # option: avoid cutting if agent is exactly on an end tile
+            if avoid_agent_blocking and (tuple(self.agent_pos) in ends):
+                continue
+            ok1 = _place_wall(*ends[0])
+            ok2 = _place_wall(*ends[1])
+            if ok1 or ok2:
+                placed_cut += (1 if ok1 else 0) + (1 if ok2 else 0)
+
+        # (B) Front obstacle: choose a random side (0 or 1) and drop at 'deeper' (two steps inside room)
+        for idx in corridors_for_front:
+            c = corridors[idx]
+            side = rng.choice([0, 1])
+            fx, fy = c["deeper"][side] if c["deeper"][side] is not None else (None, None)
+            if fx is None:
+                # try the other side if one was undefined
+                other = 1 - side
+                if c["deeper"][other] is not None:
+                    fx, fy = c["deeper"][other]
+                else:
+                    continue  # skip
+            # must be inside room and not agent/door
+            if not _in_bounds(fx, fy):
+                continue
+            if avoid_agent_blocking and (fx, fy) == tuple(self.agent_pos):
+                continue
+            cell = self.grid.get(fx, fy)
+            # Only drop front obstacle onto *room floor* (colored Floor), never on black corridor, walls, or goals/doors.
+            if isinstance(cell, Floor) and getattr(cell, "color", None) != "black":
+                if _place_wall(fx, fy):
+                    placed_front += 1
+
+        if self.debug:
+            print(f"[MutateConnectivity] cut_rooms={len(rooms_to_cut)}/{len(all_rooms)} "
+                f"→ cut_walls_placed={placed_cut}  |  front_corridors={len(corridors_for_front)} "
+                f"→ front_walls_placed={placed_front}")
+
     def Spawn_Obstacles(self, obstacle_rate= None):
         """
         Spawn grey 1×1 walls on coloured-room floor tiles while
@@ -510,33 +753,27 @@ class AisleDoorRooms(MiniGridEnv):
             print(f"Placed {len(new_obstacles)} new grey obstacles "
                 f"(target {target_n}) – current corridor reachable & endpoints clear")
             print(f"Total obstacles now: {len(self.current_obstacles)}")
+    
     def Remove_Obstacles(self):
-        """Remove all current obstacles from the grid"""
-        for x, y in self.current_obstacles:
-            # Get the original floor color for this position
-            # Find which room this position belongs to
-            rooms_in_row = self.rooms_in_row
-            rooms_in_col = self.rooms_in_col
-            room_w = self.rooms_size
-            room_h = self.rooms_size
-            
-            # Find which room this obstacle is in
-            for row_inc in range(rooms_in_row):
-                for col_inc in range(rooms_in_col):
-                    xL = col_inc * (room_w + self.corridor_length)
-                    yT = row_inc * (room_h + self.corridor_length)
-                    xR = xL + room_w 
-                    yB = yT + room_h
-                    
-                    if xL < x < xR and yT < y < yB:
-                        # This obstacle is in this room, restore original color
-                        color = list(self.color_idx.keys())[self._rand_int(0, 4)]
-                        self.put_obj(Floor(color), x, y)
-                        break
-        
+        """Precisely restore any cells we replaced with walls via Spawn_Obstacles/MutateConnectivity."""
+        restored = 0
+        if hasattr(self, "_obstacle_restore"):
+            for (x, y), orig_cell in self._obstacle_restore.items():
+                # If a wall is currently there, restore the original cell object; else leave as-is
+                cur = self.grid.get(x, y)
+                from gym_minigrid.minigrid import Wall as _Wall
+                if isinstance(cur, _Wall):
+                    # None means empty; otherwise the saved Floor/Door/whatever instance
+                    self.grid.set(x, y, orig_cell)
+                    restored += 1
+            self._obstacle_restore.clear()
+
         self.current_obstacles.clear()
         if self.debug:
-            print("Removed all obstacles")     
+            print(f"[Remove_Obstacles] Restored {restored} cells.")
+
+            if self.debug:
+                print("Removed all obstacles")     
     def action_to_pose(self,action,current_pose):
         
         if action[0] == 1:

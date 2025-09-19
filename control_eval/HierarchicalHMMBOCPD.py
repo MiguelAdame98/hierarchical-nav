@@ -371,69 +371,202 @@ class TrueHierarchicalHMMWithBOCPD:
             print(f"[EMIT] state={state}  logL={log_ll:.3f}  lik={lik:.3e}  contribs={contrib_dbg}")
 
         return lik
+    def bind_env(self, env):
+        """Call this once after you create the HMM (e.g., after gym.make)."""
+        self._bound_env = env
+        # optional reset state on new env:
+        self._coverage_hist = None
+        self.task_external_ready = False
+
+    def _env_room_metrics(self, env):
+        """
+        Return (coverage in [0,1], complete flag) using the env’s own room bookkeeping.
+        Works with aisle_door_rooms.* which expose:
+        - get_visited_rooms_order(): [{'room': (col,row), ...}, ...]
+        - rooms_in_row, rooms_in_col
+        """
+        e = getattr(env, "unwrapped", env)
+
+        visited_ids = set()
+        # Authoritative history (ordered)
+        try:
+            for rec in list(e.get_visited_rooms_order()):
+                rid = rec.get("room")
+                if isinstance(rid, (tuple, list)) and len(rid) == 2:
+                    visited_ids.add((int(rid[0]), int(rid[1])))
+        except Exception:
+            pass
+
+        # Optional fast path: fuse any private visited set, if present
+        try:
+            vset = getattr(e, "_visited_rooms_set", None)
+            if isinstance(vset, set):
+                visited_ids |= {tuple(v) if isinstance(v, (list, tuple)) else v for v in vset}
+        except Exception:
+            pass
+
+        # Target total rooms from env metadata
+        try:
+            n_row = int(getattr(e, "rooms_in_row"))
+            n_col = int(getattr(e, "rooms_in_col"))
+            total = max(1, n_row * n_col)
+        except Exception:
+            # Last resort: avoid deadlock if metadata is missing
+            total = max(1, len(visited_ids))
+
+        visited = len(visited_ids)
+        coverage = min(1.0, visited / float(total))
+        complete = (visited >= total)
+        return coverage, complete
+
+    def _update_task_flag_from_env(self):
+        """
+        Decides when to raise `task_external_ready` using only env coverage.
+        Primary rule: arm when rooms are complete.
+        Optional fallback: arm on saturation (coverage stops increasing while revisits are high).
+        """
+        env = getattr(self, "_bound_env", None)
+        if env is None:
+            return None, False  # no env bound
+
+        cov, complete = self._env_room_metrics(env)
+
+        # Expose simple rolling history for a saturation fallback (optional)
+        import collections
+        if not hasattr(self, "_coverage_hist") or self._coverage_hist is None:
+            self._coverage_hist = collections.deque(maxlen=int(getattr(self, "coverage_saturation_k", 20)))
+        self._coverage_hist.append(float(cov))
+
+        # Config knobs
+        cov_arm_thresh   = float(getattr(self, "coverage_arm_threshold", 1.0))   # usually 1.0 (all rooms)
+        sat_eps          = float(getattr(self, "coverage_saturation_eps", 0.002))# “no growth” band
+        sat_rev_thresh   = float(getattr(self, "coverage_saturation_rev", 0)) # “we churn” threshold
+
+        # Pull revisit intensity if available
+        mean_rev = float(getattr(self, "_last_known_revisit_rate", 0.0))  # we'll set this below
+
+        # Primary: exact completion (preferred)
+        if complete or cov >= cov_arm_thresh:
+            print("ARMED",complete,cov,cov_arm_thresh)
+            self.task_external_ready = True
+            return cov, True
+
+        
+
+        # Otherwise not armed
+        return cov, False
     
-    def _extract_place_ids_from_entries(self, recent_entries, positions=None,
-                                    window: int = 64,
-                                    key_candidates = ('node_id', 'place_id', 'exp_id'),
-                                    dedup_consecutive: bool = True):
+    def _apply_post_nav_grace(self, evidence: dict, movement_metrics: dict | None = None, dbg: bool = False) -> None:
         """
-        Pull a clean, chronological list of place-node IDs from the newest `window`
-        entries. Robust to None, numpy scalars, nested meta, etc.
-        NOTE: This is *not* used for the revisit gap logic anymore (we need step indices),
-        but we keep it for consistency and optional debugging.
+        Arm and apply a 'post-navigation grace' window based on sustained low
+        navigation_progress while the HMM believes we are in NAVIGATE.
+        Mutates `evidence` in-place. Safe to call every step.
         """
-        entries = list(recent_entries)[-int(window):]
 
-        place_ids = []
+        # ---- knobs (instance-overridable) ----
+        nav_done_low_threshold = float(getattr(self, 'nav_done_low_threshold', 0.15))  # nav considered "low"
+        nav_done_low_steps     = int(getattr(self,  'nav_done_low_steps',     2))      # sustain low K steps (while in NAV)
+        post_nav_grace_steps   = int(getattr(self,  'post_nav_grace_steps',   15))     # grace length (applies in any mode)
 
-        def coerce_to_int(v):
+        grace_kr_scale         = float(getattr(self, 'post_nav_grace_kr_scale', 0.0))  # damp revisit pressure
+        grace_nav_cap          = float(getattr(self, 'post_nav_grace_nav_cap',  0.20)) # cap nav_progress
+        grace_ig_floor         = float(getattr(self, 'post_nav_grace_info_gain',0.45)) # boost IG
+        grace_stag_cap         = float(getattr(self, 'post_nav_grace_stag_cap', 0.45)) # reduce stagnation
+        # --------------------------------------
+
+        # Robust mode read: prefer evidence['mode'] if you pass it; else use attribute
+        mode_now = (evidence.get('mode')
+                    or getattr(self, 'current_mode', 'EXPLORE'))
+        in_nav   = (str(mode_now).upper() == 'NAVIGATE')
+
+        # grade is already clamped {0,1} in your runner
+        nav_prog = float(evidence.get('navigation_progress', 0.0))
+
+        # Stateful counters (persist across steps)
+        if not hasattr(self, '_nav_low_age'):
+            self._nav_low_age = 0
+        if not hasattr(self, '_post_nav_grace_left'):
+            self._post_nav_grace_left = 0
+        if not hasattr(self, '_last_mode'):
+            self._last_mode = mode_now
+
+        # ========= ARMER (while in NAV only) =========
+        if in_nav:
+            if nav_prog <= nav_done_low_threshold:
+                self._nav_low_age += 1
+            else:
+                if self._nav_low_age and dbg:
+                    print(f"[HMM-GRACE] reset: nav_prog={nav_prog:.2f} > thr={nav_done_low_threshold:.2f} (age was {self._nav_low_age})")
+                self._nav_low_age = 0
+
+            if (self._post_nav_grace_left == 0) and (self._nav_low_age >= nav_done_low_steps):
+                self._post_nav_grace_left = post_nav_grace_steps
+                self._nav_low_age = 0  # optional: clear once armed
+                if dbg:
+                    print(f"[HMM-GRACE] ARMED (in NAV): ttl={self._post_nav_grace_left} "
+                        f"(nav_prog≤{nav_done_low_threshold:.2f} for {nav_done_low_steps} steps)")
+        else:
+            # Outside NAV we do *not* increment or reset the detector.
+            # But we *do* allow already-armed grace to continue counting down.
+            pass
+
+        # ========= OPTIONAL: instant arm on explicit finish flag =========
+        # If you later decide to pass a boolean like evidence['nav_plan_finished'], this will arm immediately.
+        if (self._post_nav_grace_left == 0) and evidence.get('nav_plan_finished', False):
+            self._post_nav_grace_left = post_nav_grace_steps
+            self._nav_low_age = 0
+            if dbg:
+                print(f"[HMM-GRACE] ARMED (finish flag): ttl={self._post_nav_grace_left}")
+
+        # ========= APPLY GRACE (in any mode, once armed) =========
+        if self._post_nav_grace_left > 0:
+            self._post_nav_grace_left -= 1
+
+            # capture pre-values for debug
+            _kr0   = evidence.get('known_revisit_rate', None)
+            _nav0  = evidence.get('navigation_progress', None)
+            _ig0   = evidence.get('info_gain', None)
+            _stag0 = evidence.get('stagnation', None)
+
+            # 1) Dampen revisit pressure so EXPLORE isn’t crushed near the goal
+            if 'known_revisit_rate' in evidence and _kr0 is not None:
+                evidence['known_revisit_rate'] = float(_kr0) * grace_kr_scale
+
+            # 2) Cap nav signal so NAV loses emission dominance during grace
+            if 'navigation_progress' in evidence and _nav0 is not None:
+                evidence['navigation_progress'] = min(float(_nav0), grace_nav_cap)
+
+            # 3) Make EXPLORE attractive for a short burst
+            if 'info_gain' in evidence and _ig0 is not None:
+                evidence['info_gain'] = max(float(_ig0), grace_ig_floor)
+            if 'stagnation' in evidence and _stag0 is not None:
+                evidence['stagnation'] = min(float(_stag0), grace_stag_cap)
+
+            # 4) Keep derived feature consistent
             try:
-                if hasattr(v, "item"):
-                    v = v.item()  # numpy / torch scalar
-                return int(v)
+                expl_factor = float((movement_metrics or {}).get('exploration_factor', 0.5))
             except Exception:
-                try:
-                    import numpy as _np
-                    return int(_np.asarray(v).item())
-                except Exception:
-                    return None
+                expl_factor = 0.5
+            evidence['exploration_productivity'] = (
+                float(evidence.get('info_gain', 0.0)) * (1.0 - float(evidence.get('stagnation', 0.0))) * expl_factor
+            )
 
-        for e in entries:
-            pid = None
+            if dbg:
+                print(f"[HMM-GRACE] ACTIVE ttl={self._post_nav_grace_left} in_nav={in_nav} | "
+                    f"KR {None if _kr0 is None else f'{float(_kr0):.2f}'}→{evidence.get('known_revisit_rate','∅')}  "
+                    f"NAV {None if _nav0 is None else f'{float(_nav0):.2f}'}→{evidence.get('navigation_progress','∅')}  "
+                    f"IG  {None if _ig0  is None else f'{float(_ig0):.2f}'}→{evidence.get('info_gain','∅')}  "
+                    f"STG {None if _stag0 is None else f'{float(_stag0):.2f}'}→{evidence.get('stagnation','∅')}")
+        else:
+            # Only clear detector when grace has finished AND we're no longer in NAV.
+            # (If we’re still in NAV we want to keep counting consecutive low steps.)
+            if (not in_nav) and (self._nav_low_age != 0):
+                if dbg:
+                    print(f"[HMM-GRACE] detector cleared outside NAV (age was {self._nav_low_age})")
+                self._nav_low_age = 0
 
-            # direct keys
-            for k in key_candidates:
-                if k in e and e[k] is not None:
-                    pid = e[k]
-                    break
+        self._last_mode = mode_now
 
-            # nested meta/info if not found
-            if pid is None:
-                meta = e.get('meta') or e.get('info') or {}
-                if isinstance(meta, dict):
-                    for k in key_candidates:
-                        if meta.get(k) is not None:
-                            pid = meta[k]
-                            break
-
-            if pid is None:
-                continue
-
-            pid = coerce_to_int(pid)
-            if pid is None:
-                continue
-
-            if dedup_consecutive and len(place_ids) > 0 and pid == place_ids[-1]:
-                # same as last → skip dwell
-                continue
-
-            place_ids.append(pid)
-
-        if getattr(self, 'debug_evidence', False):
-            tail_preview = place_ids[-10:] if len(place_ids) > 10 else place_ids
-            print(f"[EVD] extracted place_ids (len={len(place_ids)}): tail10={tail_preview}")
-
-        return place_ids
 
     def extract_evidence_from_replay_buffer(self, replay_buffer, external_info_gain=None, external_plan_progress=None):
         """
@@ -582,6 +715,7 @@ class TrueHierarchicalHMMWithBOCPD:
         if dbg:
             print(f"[EVD] revisit_metrics: recent_known_switch={evidence['recent_known_switch']}  "
                 f"known_revisit_rate={evidence['known_revisit_rate']:.2f}")
+        self._last_known_revisit_rate = float(evidence['known_revisit_rate'])
         # Universal evidence
         evidence['agent_lost'] = self._determine_agent_lost(
             current_doubt_count, movement_metrics, position_metrics
@@ -639,6 +773,14 @@ class TrueHierarchicalHMMWithBOCPD:
             evidence['task_progress'] = estimated_progress
             if dbg:
                 print(f"[EVD] progress source: INTERNAL_ESTIMATE  value={round(float(estimated_progress),3)}")
+                
+                # --- NAV→EXPLORE GRACE: when NAV is effectively done, ease back into EXPLORE ---
+        # Detect "NAV finished" by sustained low nav_progress while in NAVIGATE, then for a few
+        # steps suppress revisit penalty and cap nav so EXPLORE can win. Also reset NAV quickstart.
+        # BEFORE: you’ve already filled `evidence` and computed movement_metrics
+        self._apply_post_nav_grace(evidence, movement_metrics=movement_metrics, dbg=True)
+        
+        
                 # --- One-shot NAV quickstart on revisit while we are in EXPLORE ---
         # Fire once per revisit event; we disarm if no revisit this step or we leave EXPLORE.
                 # --- Growing NAV quickstart while in EXPLORE and revisit evidence persists ---
@@ -676,7 +818,9 @@ class TrueHierarchicalHMMWithBOCPD:
             accum = 0.0
 
         self._rev_quick_accum = accum
+
         # --- RECOVER bail-out with EXPLORE pivot ---
+
         try:
             mode = getattr(self, 'current_mode', 'EXPLORE')
         except Exception:
@@ -748,33 +892,41 @@ class TrueHierarchicalHMMWithBOCPD:
             # reset counter when we leave RECOVER
             self._recover_age = 0
                 # ---------- TASK gate (external flag only) ----------
-        # Until an external controller sets `self.task_external_ready = True`,
-        # keep TASK completely decoupled (task_progress = 0.0).
-        # Optional: `task_require_external_flag` (defaults True) lets you bypass the gate if needed.
+        # --- Map coverage as a separate input: arm an external-style task flag ---
+        cov = None
+        try:
+            cov, done = self._update_task_flag_from_env()
+        except Exception:
+            done = False
 
+        if cov is not None:
+            evidence['room_coverage'] = float(cov)    # for telemetry; not used in emissions directly
+        evidence['_rooms_complete'] = bool(done)      # ditto
+
+        # --- Decoupled task gate: "external flag only" (what you asked for) ---
         require_flag = bool(getattr(self, 'task_require_external_flag', True))
-        flag_ok      = bool(getattr(self, 'task_external_ready', False))
+        armed       = bool(getattr(self, 'task_external_ready', False))  # set by _update_task_flag_from_env()
 
-        if require_flag:
-            if flag_ok:
-                # Arm TASK: mirror plan_progress (or nav if plan missing)
-                evidence['task_progress'] = float(
-                    evidence.get('plan_progress', evidence.get('navigation_progress', 0.0))
-                )
-                self._task_armed = True
-            else:
-                evidence['task_progress'] = 0.0
-                self._task_armed = False
+        if require_flag and not armed:
+            # keep task_progress silent until the flag is set
+            evidence['task_progress'] = 0.0
         else:
-            # Gate disabled: allow TASK to track plan_progress
-            evidence['task_progress'] = float(
-                evidence.get('plan_progress', evidence.get('navigation_progress', 0.0))
-            )
-            self._task_armed = True
-
+            # when armed, let task progress track plan progress
+            evidence['task_progress'] = float(evidence.get('plan_progress', 0.0))
         if dbg:
-            print(f"[EVD] task gate (flag): require={require_flag} ready={flag_ok} "
-                  f"task_progress={evidence['task_progress']:.2f} armed={getattr(self, '_task_armed', False)}")
+            print(f"[EVD] task gate (flag): require={require_flag} ready={armed} "
+                  f"task_progress={evidence['_rooms_complete'] :.2f} armed={evidence['room_coverage']}")
+        # When armed, softly mute NAV so TASK wins emissions in the HMM,
+        # and (optionally) lower exploration productivity a bit to avoid EXPLORE re-winning.
+        if armed:
+            nav_cap   = float(getattr(self, 'task_nav_cap_when_armed', 0.20))  # cap NAV progress
+            task_floor= float(getattr(self, 'task_progress_floor_when_armed', 0.60))  # make TASK attractive
+            evidence['navigation_progress'] = min(float(evidence.get('navigation_progress', 0.0)), nav_cap)
+            evidence['task_progress']       = max(float(evidence.get('task_progress', 0.0)), task_floor)
+
+            damp_explore = bool(getattr(self, 'task_damp_explore_when_armed', True))
+            if damp_explore:
+                evidence['exploration_productivity'] = 0.8 * float(evidence.get('exploration_productivity', 0.0))
 
         # Recovery effectiveness using centralized metrics (agent_lost passed for gating inside the function)
         evidence['recovery_effectiveness'] = self._calculate_recovery_effectiveness_centralized(
@@ -845,28 +997,31 @@ class TrueHierarchicalHMMWithBOCPD:
     
     def _calculate_revisit_metrics(self, recent_entries, positions):
         """
-        Revisit detection with global node memory (v5-intensity):
-        - A transition happens only when node_id changes.
-        - A *revisit* happens when we enter a node seen before AND the step-gap >= min_gap.
-        - known_revisit_rate is now a decayed *intensity* (not a normalized ratio):
-            intensity = 1 - exp(-beta * sum(decay^age * revisit_weight))
-        so single/recent revisits give a meaningful signal, repeated revisits saturate.
+        Revisit detection with global node memory (v5-intensity) + NEW 'new-node grace':
+        • If the current transition enters a truly new node (visits_prior == 0),
+            suppress the revisit penalty for a short TTL (grace).
+        • Grace continues while dwelling in that new node and refreshes if you
+            keep chaining into other new nodes.
+        • Entering a known node cancels grace immediately (penalty resumes).
 
-        Persistent state (created lazily):
-        _rev_step:                 int, global step counter (ticks per evidence call)
-        _rev_last_id:              last node id seen
-        _rev_last_seen_step:       {node_id -> last step index visited}
-        _rev_visit_count:          {node_id -> number of *entries* into that node} (dwell deduped)
-        _rev_recent_transitions:   deque[(is_revisit:bool, node_id:int, visits_before:int)]
+        Return keys remain the same:
+        {'recent_known_switch': bool, 'known_revisit_rate': float in [0,1]}
         """
         import collections, math
-        # ---- knobs you can tune on the instance ----
-        min_gap   = int(getattr(self, 'revisit_min_gap', 10))       # steps between visits to count as revisit
-        win_trans = int(getattr(self, 'revisit_window',  60))       # how many recent transitions we remember
-        alpha     = float(getattr(self, 'revisit_weight_alpha', 0.25))  # weight bump per prior visit (>1 revisits)
-        gamma     = float(getattr(self, 'revisit_decay_gamma', 0.90))   # per-transition temporal decay (0.8..0.95)
-        beta      = float(getattr(self, 'revisit_intensity_beta', 0.60))# saturation strength (0.3..0.8)
-        # --------------------------------------------
+
+        # ---- original knobs (unchanged) ----
+        min_gap   = int(getattr(self, 'revisit_min_gap', 10))
+        win_trans = int(getattr(self, 'revisit_window', 60))
+        alpha     = float(getattr(self, 'revisit_weight_alpha', 0.25))
+        gamma     = float(getattr(self, 'revisit_decay_gamma', 0.90))
+        beta      = float(getattr(self, 'revisit_intensity_beta', 0.60))
+
+        # ---- NEW knobs (override on instance if desired) ----
+        # How many evidence steps to keep revisit penalty softened after entering a new node.
+        newnode_grace_steps = int(getattr(self, 'new_node_revisit_free_steps', 10))
+        # Multiply the intensity during grace (0.0 = fully suppress; 0.25 = soften)
+        newnode_grace_scale = float(getattr(self, 'new_node_revisit_free_scale', 0.0))
+        # -----------------------------------------------------
 
         # ---------- lazy init of persistent state ----------
         if not hasattr(self, '_rev_step'):               self._rev_step = 0
@@ -874,16 +1029,22 @@ class TrueHierarchicalHMMWithBOCPD:
         if not hasattr(self, '_rev_last_seen_step'):     self._rev_last_seen_step = {}
         if not hasattr(self, '_rev_visit_count'):        self._rev_visit_count = {}
         if not hasattr(self, '_rev_recent_transitions'): self._rev_recent_transitions = collections.deque(maxlen=max(8, win_trans))
+        # NEW: track whether we are currently on a node that was first entered as "new",
+        # and how many steps of grace remain.
+        if not hasattr(self, '_rev_curr_node_is_new'):   self._rev_curr_node_is_new = False
+        if not hasattr(self, '_rev_new_grace_left'):     self._rev_new_grace_left = 0
         # ---------------------------------------------------
 
         # ---- pull the current node_id from the newest entry ----
         def _get_id(e):
             for k in ('node_id', 'place_id', 'exp_id'):
-                if k in e and e[k] is not None: return e[k]
+                if k in e and e[k] is not None:
+                    return e[k]
             meta = e.get('meta') or e.get('info') or {}
             if isinstance(meta, dict):
                 for k in ('node_id', 'place_id', 'exp_id'):
-                    if meta.get(k) is not None: return meta[k]
+                    if meta.get(k) is not None:
+                        return meta[k]
             return None
 
         def _as_int(v):
@@ -908,37 +1069,54 @@ class TrueHierarchicalHMMWithBOCPD:
         last_id = self._rev_last_id
         recent_known_switch = False
 
+        # Track whether THIS step entered a brand-new node
+        entered_new_node_this_step = False
+
         if curr_id is None:
-            # no node this step: compute intensity from what we have
+            # no node this step
             tail = list(self._rev_recent_transitions)
         else:
-            # decide on transition/revisit first, then update memory
             if last_id is None:
                 # first ever node
                 self._rev_visit_count[curr_id] = self._rev_visit_count.get(curr_id, 0) + 1
                 self._rev_last_seen_step[curr_id] = step
                 self._rev_last_id = curr_id
+                # First ever counts as new
+                entered_new_node_this_step = True
+                self._rev_curr_node_is_new = True
+                self._rev_new_grace_left = max(self._rev_new_grace_left, newnode_grace_steps)
             elif curr_id != last_id:
-                # we have a transition last_id -> curr_id
-                visits_prior = self._rev_visit_count.get(curr_id, 0)          # before this entry
-                last_seen    = self._rev_last_seen_step.get(curr_id, None)     # historical last time at curr_id
+                # transition last_id -> curr_id
+                visits_prior = self._rev_visit_count.get(curr_id, 0)      # before this entry
+                last_seen    = self._rev_last_seen_step.get(curr_id, None) # historical last time at curr_id
                 is_revisit   = (last_seen is not None) and ((step - last_seen) >= min_gap)
                 # record (for rolling intensity)
                 self._rev_recent_transitions.append((bool(is_revisit), int(curr_id), int(visits_prior)))
-                # now update counters/last-seen
+                # update counters
                 self._rev_visit_count[curr_id] = visits_prior + 1
                 self._rev_last_seen_step[curr_id] = step
                 self._rev_last_seen_step[last_id] = step - 1
                 self._rev_last_id = curr_id
+
+                if visits_prior == 0:
+                    # NEW node: start/refresh grace and mark current node as new
+                    entered_new_node_this_step = True
+                    self._rev_curr_node_is_new = True
+                    self._rev_new_grace_left = max(self._rev_new_grace_left, newnode_grace_steps)
+                else:
+                    # KNOWN node: cancel grace immediately; penalty should apply
+                    self._rev_curr_node_is_new = False
+                    self._rev_new_grace_left = 0
+
                 recent_known_switch = bool(is_revisit)
             else:
-                # dwell on the same node → keep last-seen fresh
+                # dwell on the same node -> keep last-seen fresh
                 self._rev_last_seen_step[curr_id] = step
             tail = list(self._rev_recent_transitions)
 
-        # ----- decayed, non-normalized intensity mapped to [0,1] -----
+        # ----- original decayed intensity mapped to [0,1] (unchanged) -----
         if not tail:
-            known_revisit_rate = 0.0
+            intensity_raw = 0.0
         else:
             L = len(tail)
             sum_w = 0.0
@@ -948,23 +1126,33 @@ class TrueHierarchicalHMMWithBOCPD:
                 age = (L - 1 - i)                       # newer transitions have smaller age
                 prior_boost = (1.0 + alpha * max(0, visits_before - 1))
                 sum_w += (gamma ** age) * prior_boost
-            # saturation: big sum_w → approach 1; one good revisit already ~0.4 with beta≈0.6
-            known_revisit_rate = float(1.0 - math.exp(-beta * sum_w))
+            intensity_raw = float(1.0 - math.exp(-beta * sum_w))
+
+        # ----- NEW: suppress/soften intensity while we are on / just entered a NEW node -----
+        intensity = intensity_raw
+        if self._rev_curr_node_is_new and self._rev_new_grace_left > 0:
+            intensity = float(intensity_raw) * float(newnode_grace_scale)
+            self._rev_new_grace_left -= 1
+            # If grace expired while dwelling, drop the 'curr_node_is_new' flag so normal penalty resumes next step
+            if self._rev_new_grace_left <= 0:
+                self._rev_curr_node_is_new = False
 
         if getattr(self, 'debug_evidence', False):
             dbg_tail = tail[-min(10, len(tail)):]
             dbg_flags  = [f for (f, n, vb) in dbg_tail]
             dbg_nodes  = [n for (f, n, vb) in dbg_tail]
             dbg_visits = [vb for (f, n, vb) in dbg_tail]
-            print(f"[EVD] revisit[v5-intensity]: last_id={last_id} -> curr_id={curr_id}  "
-                f"recent_switch={recent_known_switch}  intensity={known_revisit_rate:.2f}  "
-                f"min_gap={min_gap}  tail_flags={dbg_flags} nodes={dbg_nodes} visits_before={dbg_visits}")
+            print(f"[EVD] revisit[v6-intensity+newnode-grace]: "
+                f"last_id={last_id} -> curr_id={curr_id}  recent_switch={recent_known_switch}  "
+                f"raw={intensity_raw:.2f} → out={intensity:.2f}  "
+                f"min_gap={min_gap}  tail_flags={dbg_flags} nodes={dbg_nodes} visits_before={dbg_visits}  "
+                f"entered_new={entered_new_node_this_step} curr_new={self._rev_curr_node_is_new} "
+                f"grace_left={self._rev_new_grace_left}")
 
         return {
             'recent_known_switch': bool(recent_known_switch),
-            'known_revisit_rate':  known_revisit_rate,   # remains in [0,1], now a saturating intensity
+            'known_revisit_rate':  float(intensity),
         }
-
 
 
     def _calculate_position_metrics(self, positions, recent_entries):

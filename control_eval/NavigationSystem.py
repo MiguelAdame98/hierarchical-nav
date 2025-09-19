@@ -107,6 +107,193 @@ class NavigationSystem:
         mapping = {'forward': [1,0,0], 'right': [0,1,0], 'left': [0,0,1]}
         return mapping[act]
     
+
+    # ---------------------------------------------------------------------
+    # Mission helpers
+    # ---------------------------------------------------------------------
+    def task_solve_mission(self) -> str | None:
+        """
+        Return the mission string, e.g., "go to red room".
+        First tries an attribute you can set externally (self.task_mission),
+        then a generic fallback.
+        """
+        ms = getattr(self, "task_mission", None)
+        if isinstance(ms, str) and ms.strip():
+            return ms
+        # Fallback – you can replace this if your env feeds a mission string elsewhere
+        return "go to red room"
+
+    def _parse_color_from_mission(self, mission: str | None) -> str | None:
+        """
+        Extract a MiniGrid color token from free text. Returns UPPERCASE or None.
+        """
+        if not mission:
+            return None
+        # canonical MiniGrid palette (+ a few aliases)
+        canon = {
+            "RED":"RED", "GREEN":"GREEN", "BLUE":"BLUE",
+            "YELLOW":"YELLOW", "PURPLE":"PURPLE", "GREY":"GREY", "GRAY":"GREY",
+            "BROWN":"BROWN", "ORANGE":"ORANGE"
+        }
+        m = re.search(r"\b(red|green|blue|yellow|purple|grey|gray|brown|orange)\b", mission, re.I)
+        return canon.get(m.group(0).upper(), None) if m else None
+
+    # ---------------------------------------------------------------------
+    # Task-specific PCFG (target room by COLOR)
+    # ---------------------------------------------------------------------
+    def build_task_pcfg_from_memory(self, mission_color: str, debug: bool = True) -> PCFG:
+        """
+        Build a PCFG that targets the NEAREST REACHABLE node whose exp.room_color
+        matches mission_color. Structure is kept identical to build_pcfg_from_memory:
+        NAVPLAN -> PATH_goal ; PATH_goal -> 'STEP_u_v' ... terminals.
+
+        Side-effects (same as your default PCFG builder):
+        - self.link_blacklist: set of undirected edges permanently blacklisted
+        - self.goal_node_id: chosen goal node id (first candidate)
+        - self.graph_used_for_pcfg: adjacency actually used
+        """
+        mg   = self.memory_graph
+        emap = mg.experience_map
+        start = mg.get_current_exp_id()
+
+        if not hasattr(self, "link_blacklist") or self.link_blacklist is None:
+            self.link_blacklist = set()
+
+        # ---------- B) nodes ----------
+        exps = list(getattr(emap, "exps", []))
+        if len(exps) == 0:
+            raise RuntimeError("No experiences in experience_map")
+        id2exp = {e.id: e for e in exps}
+
+        # ---------- C) adjacency (respect link confidence + inferred links) ----------
+        graph = self._pcfg_build_adjacency_with_confidence_and_inferred(
+            exps=exps,
+            start_id=start,
+            blacklist=self.link_blacklist,
+            infer_link_max_dist=float(getattr(self, "infer_link_max_dist", 3.4)),
+            debug=debug
+        )
+        self.graph_used_for_pcfg = graph
+        if debug:
+            print("[TASK PCFG] adjacency:", {k: sorted(v) for k, v in graph.items()})
+
+        # ---------- D) candidate goals by color ----------
+        target_color = str(mission_color).upper().strip()
+        cand_ids = []
+        for e in exps:
+            if getattr(e, "place_kind", None) == "ROOM":
+                c = getattr(e, "room_color", None)
+                if c is not None and str(c).upper() == target_color:
+                    cand_ids.append(e.id)
+
+        if debug:
+            print(f"[TASK PCFG] mission_color={target_color}  candidates={sorted(cand_ids)}")
+
+        # Fallback to your normal heuristic if no color candidates exist
+        if not cand_ids:
+            if debug:
+                print("[TASK PCFG] No color-matching nodes; falling back to build_pcfg_from_memory().")
+            return self.build_pcfg_from_memory(debug=debug)
+
+        # ---------- E) choose nearest reachable candidate ----------
+        def _bfs_all_dists(adj: dict[int, list[int]], src: int) -> dict[int, int]:
+            d = {src: 0}
+            q = deque([src])
+            while q:
+                u = q.popleft()
+                for v in adj.get(u, ()):
+                    if v not in d:
+                        d[v] = d[u] + 1
+                        q.append(v)
+            return d
+
+        dists = _bfs_all_dists(graph, start)
+        reachable = [(nid, dists[nid]) for nid in cand_ids if nid in dists]
+        if not reachable:
+            if debug:
+                print("[TASK PCFG] Color nodes exist but none reachable; falling back to default PCFG.")
+            return self.build_pcfg_from_memory(debug=debug)
+
+        # pick the nearest (break ties by larger id to be deterministic)
+        goal = min(reachable, key=lambda kv: (kv[1], -kv[0]))[0]
+        self.goal_node_id = goal
+        if debug:
+            print(f"[TASK PCFG] chosen goal node={goal}")
+
+        # ---------- F) enumerate k candidate paths to goal (same pattern) ----------
+        def all_paths(src, dst, k=16, depth=50):
+            out, q = [], deque([[src]])
+            seen_paths = set()
+            while q and len(out) < k:
+                p = q.popleft()
+                u = p[-1]
+                if u == dst:
+                    tup = tuple(p)
+                    if tup not in seen_paths:
+                        out.append(p); seen_paths.add(tup)
+                    continue
+                if len(p) >= depth:
+                    continue
+                for nb in graph.get(u, ()):
+                    if nb not in p:
+                        q.append(p + [nb])
+            return out
+
+        sp = self._pcfg_shortest_path(graph, start, goal)
+        if debug:
+            print(f"[TASK PCFG] shortest path edges: {(len(sp)-1) if sp else None}")
+
+        k_paths   = int(getattr(self, "pcfg_k_paths", 26))
+        margin    = int(getattr(self, "pcfg_depth_margin", 4))
+        if getattr(self, "pcfg_depth_cap", None):
+            depth_cap = int(self.pcfg_depth_cap)
+        else:
+            depth_cap = ((len(sp)-1) + max(margin, 1)) if sp else (len(exps) + max(margin, 1))
+
+        paths = []
+        if sp:
+            paths.append(sp)
+        extras = all_paths(start, goal, k=k_paths, depth=depth_cap)
+        for p in extras:
+            if not sp or p != sp:
+                paths.append(p)
+        if debug:
+            print(f"[TASK PCFG] depth_cap={depth_cap}  total_paths={len(paths)}")
+
+        if not paths:
+            paths = [[start]]
+
+        # ---------- G) grammar identical to your default builder ----------
+        rules = defaultdict(list)
+        rules["NAVPLAN"].append((f"PATH_{goal}", 1.0))
+
+        for path in paths:
+            step_tokens = []
+            if start != goal and not self._at_node_exact(start):
+                step_tokens.append(f"STEP_{start}_{start}")
+            step_tokens += [f"STEP_{u}_{v}" for u, v in zip(path, path[1:])]
+            rhs = " ".join(step_tokens) if step_tokens else f"STEP_{start}_{start}"
+            rules[f"PATH_{goal}"].append((rhs, 1.0))
+
+        for lhs in list(rules.keys()):
+            if lhs.startswith("PATH_"):
+                for rhs, _ in rules[lhs]:
+                    for tok in rhs.split():
+                        if tok not in rules:
+                            rules[tok].append((f"'{tok}'", 1.0))
+
+        lines = []
+        for lhs, prods in rules.items():
+            Z = sum(p for _, p in prods) or 1.0
+            for rhs, p in prods:
+                lines.append(f"{lhs} -> {rhs} [{p/Z:.6f}]")
+
+        grammar_src = "\n".join(lines)
+        if debug:
+            print("[TASK PCFG] Final grammar:\n" + grammar_src)
+
+        return PCFG.fromstring(grammar_src)
+
     def _pcfg_shortest_path(self, graph: dict[int, list[int]], start: int, goal: int):
         """Return one shortest path [start,...,goal] in edge-count metric, or None."""
         if start == goal:
@@ -359,7 +546,7 @@ class NavigationSystem:
             links and inferred links (does *not* mutate the blacklist).
         """
         # Read toggles with safe defaults
-        treat_all = bool(getattr(self, "pcfg_treat_all_links_confident", True))
+        treat_all = bool(getattr(self, "pcfg_treat_all_links_confident", False))
         no_infer  = bool(getattr(self, "pcfg_disable_inferred_links", False))
         ign_bl    = bool(getattr(self, "pcfg_ignore_blacklist", True))
 
