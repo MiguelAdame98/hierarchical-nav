@@ -462,6 +462,18 @@ class ExperienceMap(object):
         theta_reanchor_check(self, "after-anchor")
         print(f"   posed at cell=({x_pc},{y_pc},{th_pc}), map=({x_m:.3f},{y_m:.3f},{facing_rad:.3f})")
         print(view_cell.id)
+        if self.current_exp is None:  # first anchor
+            try:
+                real = tuple(self.last_real_pose)  # already present above
+            except Exception:
+                real = None
+            if real is not None:
+                off_x = x_m - real[0]
+                off_y = y_m - real[1]
+                print(f"[TRIAGE][EM.ANCHOR0] first anchor map=({x_m:.3f},{y_m:.3f}) "
+                    f"vs real=({real[0]:.3f},{real[1]:.3f}) "
+                    f"→ origin_offset=(+{off_x:.3f}x, +{off_y:.3f}y)")
+
         exp = Experience(
             x_pc, y_pc, th_pc,
             x_m, y_m, facing_rad,
@@ -991,7 +1003,6 @@ class ExperienceMap(object):
         
         #delta_exp_above_thresold = self.delta_exp_above_thresold(delta_prev_exp)
         adjust_map = False
-
         if self.current_exp != None:
         
             #approximate curent position
@@ -1000,7 +1011,7 @@ class ExperienceMap(object):
             print('CHECK CURRENT GP X,Y,TH', current_GP )
             print("EXPS IN VIEW CELL", view_cell.exps, "CURRENT CELL",self.current_exp )
             print("VIEW CELL ID",view_cell.id, "CURRENT EXP VIEW CELL ID",self.current_exp.view_cell.id)
-        
+
             delta_exps = []
         
             for e in self.exps:

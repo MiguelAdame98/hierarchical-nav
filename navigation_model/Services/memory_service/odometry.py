@@ -113,6 +113,13 @@ class MinigridActionPoseOdometry:
         self.odometry = [0.0, 0.0, 0.0]   # (x, y, th_rad)
         self._prev_pose = None            # last observed (x, y, th_rad)
 
+    def bootstrap(self, pose0):
+        """Seed odometry with the reset pose so the first step has a previous."""
+        x0, y0, th0 = float(pose0[0]), float(pose0[1]), _encode_heading_to_rad(pose0[2])
+        self._prev_pose = (x0, y0, th0)
+        self.odometry   = [x0, y0, th0]
+        print(f"[ODO][BOOT] seeded prev_pose={self._prev_pose}")
+
     def _parse_action(self, a):
         """
         Accept either:

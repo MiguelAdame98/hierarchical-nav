@@ -11,6 +11,7 @@ import heapq
 import torch
 from collections import namedtuple
 from nltk.parse.generate import generate
+
 from nltk.grammar import Nonterminal, Production
 # --- optional dreamer_mg import (safe for test harness) ---
 try:
@@ -26,6 +27,445 @@ except Exception:
 State = namedtuple("State", ["x","y","d"])
 DIR_VECS = [(1,0),(0,1),(-1,0),(0,-1)]
 ACTIONS   = ["forward","left","right"]
+def _vec(a, b):
+    return (b[0]-a[0], b[1]-a[1])
+
+def _norm(v):
+    import math
+    d = math.hypot(v[0], v[1])
+    return (v[0]/d, v[1]/d) if d > 1e-9 else (0.0, 0.0)
+
+def _dot(a,b): return a[0]*b[0] + a[1]*b[1]
+
+def _edge_features(emap, a_id, b_id):
+    ax, ay, _ = emap.get_pose(a_id)
+    bx, by, _ = emap.get_pose(b_id)
+    mid = ((ax+bx)*0.5, (ay+by)*0.5)
+    dirv = _vec((ax,ay), (bx,by))
+    return (ax, ay), (bx, by), mid, dirv
+
+def _angdiff(u, v):
+    import math
+    nu, nv = _norm(u), _norm(v)
+    dp = max(-1.0, min(1.0, _dot(nu, nv)))
+    return math.degrees(math.acos(dp))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Lightweight run exporter for hierarchical plans (JSON + FoV images)
+# Paste near the top of control_eval/NavigationSystem.py (after imports).
+# ──────────────────────────────────────────────────────────────────────────────
+import os, json, time, math, datetime
+from typing import Any
+
+class PlanRunExporter:
+    VALID_MODES = {"NAVIGATE", "TASK_SOLVING"}
+
+    def __init__(self, root: str = "rans/plan_exports"):
+        self.root = root
+        self.run_dir: str | None = None
+        self.events: list[dict[str, Any]] = []
+        self.plan: dict[str, Any] = {}
+        self._last_flush = 0.0
+        self._step_counts: dict[tuple[int|None,int|None], int] = {}
+        self._images_dir_name = "images"
+        # NEW: optional hard override via env without touching any caller
+        self._force_mode = os.environ.get("PLAN_EXPORT_FORCE_MODE", "").strip().upper() or None
+
+        self._global_step = 0
+        self.mode_session_idx = 1
+        self.run_tag = "NAV1"  # default; will be set in .begin()
+
+    # NEW: normalize any non-nav-ish mode to NAVIGATE
+    def _normalize_mode(self, mode: str | None) -> str:
+        m = str(mode or "NAVIGATE").upper()
+        if self._force_mode in self.VALID_MODES:
+            return self._force_mode
+        return m if m in self.VALID_MODES else "NAVIGATE"
+
+    # ---- public API ----------------------------------------------------------
+    def begin(self, *, mode: str, mg, graph, inferred_pairs, tokens, goal_id, start_id, mode_session_idx: int | None = None) -> None:
+        os.makedirs(self.root, exist_ok=True)
+        mode = self._normalize_mode(mode)
+
+        self.mode_session_idx = int(mode_session_idx or 1)
+        short = "TS" if mode == "TASK_SOLVING" else "NAV"
+        self.run_tag = f"{short}{self.mode_session_idx}"
+
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.run_dir = os.path.join(self.root, mode, stamp)
+        os.makedirs(self.run_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.run_dir, self._images_dir_name), exist_ok=True)
+        self._global_step = 0
+
+        
+        nodes = self._snapshot_nodes(mg)
+        self.plan = {
+            "version": "1.0",
+            "created_utc": time.time(),
+            "mode": mode,  # now guaranteed NAVIGATE or TASK_SOLVING
+            "start_exp_id": int(start_id) if start_id is not None else None,
+            "goal_node_id": int(goal_id) if goal_id is not None else None,
+            "tokens": [list(map(int, t)) for t in (tokens or [])],
+            "adjacency": {int(u): [int(v) for v in vs] for u,vs in (graph or {}).items()},
+            "inferred_pairs": [list(map(int, p)) for p in (inferred_pairs or [])],
+            "nodes": nodes,
+            "nodes_media": self.plan.get("nodes_media", {}),
+            "events": self.events,
+        }
+        # NEW: plan versioning (v0 = initial plan)
+        self.plan["versions"] = [{
+            "id": 0,
+            "time": time.time(),
+            "mode": mode,
+            "run_tag": self.run_tag,
+            "tokens": [list(map(int, t)) for t in (tokens or [])],
+            "reason": {"kind": "initial"},
+        }]
+        self.plan["current_version"] = 0
+        self._flush_json()
+
+        # ---------- helpers ----------
+    def _edge_key_tuple(self, edge):
+        if not edge: return (None, None)
+        try:
+            u, v = edge
+            return (int(u), int(v))
+        except Exception:
+            return (None, None)
+
+    def _save_image_named(self, rel_subdir: str, filename: str, img) -> str | None:
+        """
+        Save under run_dir/<images>/<rel_subdir>/<filename>.png and return RELATIVE path.
+        Accepts numpy HWC uint8, PIL.Image, or torch [3,H,W]/[H,W,3] in 0..1 or 0..255.
+        """
+        try:
+            from PIL import Image
+            import numpy as np, os
+            sub = os.path.join(self.run_dir, self._images_dir_name, rel_subdir)
+            os.makedirs(sub, exist_ok=True)
+            path = os.path.join(sub, f"{filename}.png")
+
+            # normalize to numpy uint8 HWC
+            arr = img
+            try:
+                import torch
+                if "torch" in str(type(arr)):
+                    arr = arr.detach().cpu().numpy()
+                    if arr.ndim == 3 and arr.shape[0] in (1,3):  # CHW -> HWC
+                        arr = arr.transpose(1,2,0)
+                    if arr.dtype != np.uint8:
+                        arr = (arr * 255.0).clip(0,255).astype("uint8")
+            except Exception:
+                pass
+
+            if "PIL" in str(type(arr)):
+                arr.save(path)
+            else:
+                arr = np.asarray(arr)
+                if arr.dtype != np.uint8:
+                    arr = (arr * 255.0).clip(0,255).astype("uint8")
+                Image.fromarray(arr).save(path)
+            self._maybe_flush(force=True)
+            return os.path.relpath(path, self.run_dir)
+            
+        except Exception:
+            return None
+    
+    def bump_plan_version(self, *, prev_tokens: list[tuple[int,int]] | list[list[int]],
+                        new_tokens: list[tuple[int,int]] | list[list[int]],
+                        reason: dict | None = None) -> int:
+        # normalize
+        def _norm(tt):
+            out = []
+            for t in (tt or []):
+                if isinstance(t, (list, tuple)) and len(t) == 2:
+                    out.append((int(t[0]), int(t[1])))
+            return out
+        prev = _norm(prev_tokens)
+        new  = _norm(new_tokens)
+
+        # edge diffs for the visualizer
+        prev_set = set(prev)
+        new_set  = set(new)
+        removed  = sorted(list(prev_set - new_set))
+        added    = sorted(list(new_set  - prev_set))
+
+        ver_id = int(self.plan.get("current_version", 0)) + 1
+        entry = {
+            "id": ver_id,
+            "time": time.time(),
+            "mode": self.plan.get("mode", "NAVIGATE"),
+            "run_tag": self.run_tag,
+            "tokens": [list(t) for t in new],
+            "reason": reason or {"kind": "replan"},
+            "diff": {"removed": [list(t) for t in removed], "added": [list(t) for t in added]},
+        }
+        self.plan.setdefault("versions", []).append(entry)
+        self.plan["current_version"] = ver_id
+
+        # convenient event for timelines
+        self.log_event("replan_version", id=ver_id, reason=reason, added=entry["diff"]["added"], removed=entry["diff"]["removed"])
+        self._maybe_flush(force=True)
+        return ver_id
+
+
+    # ---------- public: per-step FoV ----------
+    def step_obs(self, *, edge: tuple[int,int] | None, token_idx: int,
+                 pose: tuple[float,float,float] | None,
+                 action: str | None,
+                 image) -> None:
+        """
+        Save FoV for the current step grouped by edge, and log a 'step_obs' event.
+        """
+        # Optional throttle knobs (env or attribute)
+        stride = int(getattr(self, "export_fov_stride", int(os.environ.get("PLAN_EXPORT_FOV_STRIDE", 1))))
+        max_per_edge = int(getattr(self, "export_fov_max_per_edge", int(os.environ.get("PLAN_EXPORT_FOV_MAX_PER_EDGE", 999999))))
+
+        ek = self._edge_key_tuple(edge)
+        self._step_counts[ek] = self._step_counts.get(ek, 0) + 1
+        seq = self._step_counts[ek]
+
+        # throttle
+        if (seq % max(1, stride)) != 0:
+            return
+        if seq > max_per_edge:
+            return
+
+        self._global_step += 1
+
+        # folder name per-edge (or "phantom" when no edge)
+        rel_subdir = "phantom" if ek == (None, None) else f"edge_{ek[0]}_{ek[1]}"
+        # Example: TS1_step00012_tok0007_seq0003_forward
+        fname = f"{self.run_tag}_step{self._global_step:05d}_tok{token_idx:04d}_seq{seq:04d}" + (f"_{action}" if action else "")
+        rel = self._save_image_named(rel_subdir, fname, image) if image is not None else None
+        # …log_event unchanged…
+        info = {
+            "token_idx": int(token_idx),
+            "edge": list(ek) if ek != (None, None) else None,
+            "pose": [float(p) for p in pose] if pose else None,
+            "action": action,
+            "image": rel,
+        }
+        self.log_event("step_obs", **info)
+
+    # ---------- public: node media (snapshot + enhanced preds) ----------
+    def node_created(self, *, node_id: int, snapshot_img, enhanced_pred_imgs: dict | list | tuple | None) -> dict:
+        """
+        Save creation-time snapshot and the 4 enhanced predictions for this node.
+        Returns dict of relative paths and stores them under plan['nodes_media'][node_id].
+        """
+        if not self.run_dir:
+            try:
+                # Surface the mistake instead of silently returning None paths
+                raise RuntimeError("PlanRunExporter.begin() was not called before node_created()")
+            except Exception as e:
+                # best-effort event
+                try: self.log_event("node_media_attached_error", node_id=int(node_id), err=str(e))
+                except Exception: pass
+            return {"snapshot": None, "enhanced": {}}
+        node_id = int(node_id)
+        rels = {"snapshot": None, "enhanced": {}}
+
+        # 1) snapshot
+        if snapshot_img is not None:
+            rel_snap = self._save_image_named(f"node_{node_id:05d}", "created_view", snapshot_img)           
+            rels["snapshot"] = rel_snap
+            # NEW: absolute
+            rels["snapshot_abs"] = os.path.join(self.run_dir, rel_snap)
+        
+        # 2) enhanced (accept list[img] or dict[label->img])
+        labels_default = ["L", "R", "LL", "RR"]
+        if enhanced_pred_imgs:
+            if isinstance(enhanced_pred_imgs, dict):
+                items = enhanced_pred_imgs.items()
+            else:
+                items = zip(labels_default, list(enhanced_pred_imgs))
+            for lab, im in items:
+                rels["enhanced"][str(lab)] = self._save_image_named(f"node_{node_id:05d}", f"pred_{lab}", im)
+
+        self.plan.setdefault("nodes_media", {})
+        self.plan["nodes_media"][str(node_id)] = rels
+        self._maybe_flush(force=True)
+        self.log_event("node_media_attached", node_id=node_id, media=rels)
+        return rels# ---------- public: node media (snapshot + enhanced preds) ----------
+    
+    def node_created(self, *, node_id: int, snapshot_img, enhanced_pred_imgs: dict | list | tuple | None) -> dict:
+        """
+        Save creation-time snapshot and the 4 enhanced predictions for this node.
+
+        Keeps original behavior/keys:
+        - returns/records relative paths under: {"snapshot": <rel>, "enhanced": {lab: <rel>, ...}}
+
+        Adds (non-breaking):
+        - "snapshot_abs":  absolute path to snapshot
+        - "enhanced_abs":  {lab: absolute path} for each enhanced image
+        """
+        import os
+
+        if not self.run_dir:
+            try:
+                raise RuntimeError("PlanRunExporter.begin() was not called before node_created()")
+            except Exception as e:
+                try:
+                    self.log_event("node_media_attached_error", node_id=int(node_id), err=str(e))
+                except Exception:
+                    pass
+            return {"snapshot": None, "enhanced": {}}
+
+        node_id = int(node_id)
+        rels: dict[str, Any] = {"snapshot": None, "enhanced": {}}
+
+        run_root = os.path.abspath(self.run_dir)  # ensure absolute base
+
+        # 1) snapshot (relative, plus absolute companion)
+        if snapshot_img is not None:
+            rel_snap = self._save_image_named(f"node_{node_id:05d}", "created_view", snapshot_img)
+            rels["snapshot"] = rel_snap
+            # NEW: absolute path (keeps relative key unchanged)
+            rels["snapshot_abs"] = os.path.join(run_root, rel_snap) if rel_snap else None
+
+        # 2) enhanced (accept list[img] or dict[label->img])
+        labels_default = ["L", "R", "LL", "RR"]
+        if enhanced_pred_imgs:
+            if isinstance(enhanced_pred_imgs, dict):
+                items = enhanced_pred_imgs.items()
+            else:
+                items = zip(labels_default, list(enhanced_pred_imgs))
+            for lab, im in items:
+                rel_p = self._save_image_named(f"node_{node_id:05d}", f"pred_{lab}", im)
+                rels["enhanced"][str(lab)] = rel_p
+
+        # NEW: absolute companions for enhanced (non-breaking addition)
+        rels["enhanced_abs"] = {
+            str(lab): os.path.join(run_root, rel_p)
+            for lab, rel_p in rels["enhanced"].items()
+            if rel_p
+        }
+
+        # Record into plan.json exactly as before (now with extra *_abs keys present)
+        self.plan.setdefault("nodes_media", {})
+        self.plan["nodes_media"][str(node_id)] = rels
+
+        self._maybe_flush(force=True)
+        self.log_event("node_media_attached", node_id=node_id, media=rels)
+        return rels
+
+
+
+    def log_event(self, kind: str, **kw) -> None:
+        evt = {"t": time.time(), "type": kind}
+        evt.update(kw)
+        self.events.append(evt)
+        self._maybe_flush()
+
+    def node_reached(self, node_id: int, pose: tuple[float,float,float] | None,
+                     get_fov_image_fn=None) -> None:
+        info = {"node_id": int(node_id)}
+        if pose:
+            x,y,th = pose
+            info["pose"] = [float(x), float(y), float(th)]
+        # Save FoV if we can
+        img_rel = None
+        if callable(get_fov_image_fn):
+            try:
+                img = get_fov_image_fn()
+                img_rel = self._save_image(node_id, img)
+            except Exception as e:
+                info["fov_error"] = f"{e}"
+        if img_rel:
+            info["fov_image"] = img_rel
+        self.log_event("node_reached", **info)
+
+    # ---- internals -----------------------------------------------------------
+    def _snapshot_nodes(self, mg) -> dict[str, dict]:
+        try:
+            emap = mg.experience_map
+            out: dict[str, dict] = {}
+            for e in getattr(emap, "exps", []):
+                nid = int(e.id)
+                x = getattr(e, "x", None); y = getattr(e, "y", None)
+                if x is None or y is None:
+                    try:
+                        xx, yy, dd = emap.get_pose(nid)
+                        x, y = float(xx), float(yy)
+                        pose = [float(xx), float(yy), float(dd)]
+                    except Exception:
+                        pose = None
+                else:
+                    pose = None
+                node = {
+                    "id": nid,
+                    "x": float(x) if x is not None else None,
+                    "y": float(y) if y is not None else None,
+                }
+                if pose is not None:
+                    node["pose"] = pose
+                for k in ("place_kind", "room_color", "confidence"):
+                    if hasattr(e, k):
+                        node[k] = getattr(e, k)
+
+                # NEW: surface media paths if present on Experience
+                if hasattr(e, "media_snapshot_path"):
+                    node["snapshot_abs"] = str(getattr(e, "media_snapshot_path"))
+                if hasattr(e, "media_enhanced_preds_paths"):
+                    node["enhanced_preds_abs"] = list(map(str, getattr(e, "media_enhanced_preds_paths")))
+
+                out[str(nid)] = node
+            return out
+        except Exception:
+            return {}
+
+
+    def _save_image(self, node_id: int, img) -> str | None:
+        # Accept numpy (H,W,3) uint8, PIL.Image, or torch.Tensor [H,W,3] / [3,H,W]
+        path = os.path.join(self.run_dir, "images", f"node_{int(node_id):05d}.png")
+        try:
+            from PIL import Image
+            import numpy as np
+            try:
+                import torch
+                if "torch" in str(type(img)):
+                    arr = img.detach().cpu().numpy()
+                    if arr.ndim == 3 and arr.shape[0] in (1,3):
+                        arr = arr.transpose(1,2,0)
+                    arr = (arr * 255.0).clip(0,255).astype('uint8') if arr.dtype != np.uint8 else arr
+                    Image.fromarray(arr).save(path)
+                    rel = os.path.relpath(path, self.run_dir)
+                    self._maybe_flush(force=True)
+                    return rel
+            except Exception:
+                pass
+            if isinstance(img, Image.Image):
+                img.save(path)
+            else:
+                arr = np.asarray(img)
+                if arr.dtype != np.uint8:
+                    arr = (arr * 255.0).clip(0,255).astype('uint8')
+                Image.fromarray(arr).save(path)
+            rel = os.path.relpath(path, self.run_dir)
+            self._maybe_flush(force=True)
+            return rel
+        except Exception:
+            return None
+
+    def _flush_json(self) -> None:
+        if not self.run_dir:
+            return
+        try:
+            self.plan["events"] = self.events
+            with open(os.path.join(self.run_dir, "plan.json"), "w", encoding="utf-8") as f:
+                json.dump(self.plan, f, indent=2)
+            self._last_flush = time.time()
+        except Exception:
+            pass
+    
+
+    def _maybe_flush(self, force: bool = False) -> None:
+        if force or (time.time() - self._last_flush) > 1.0:
+            self._flush_json()
+
+
+
 
 class NavigationSystem:
     def __init__(self, memory_graph, get_current_pose_func, planner: WMPlanner | None = None  ):
@@ -50,9 +490,47 @@ class NavigationSystem:
         self._evade_injected = False
         self._evade_ticks_since_recalc = 0
         self._evade_recalc_every = 4  
+        self._mode_entry_counts = {"NAVIGATE": 0, "TASK_SOLVING": 0}
+        self._mode_session_idx = 0
+
+
+        self.plan_export = PlanRunExporter(root=getattr(self, "plan_export_root", "runs/plan_exports"))
+        self._export_last_token_idx = -1  # for safe node-arrival detection
+
+
+        self.task_runs_completed = 0        # count of completed TASK_SOLVING runs
+        self.task_mutation_armed = False    # one-shot latch for the outer loop
+
+        # --- post-finish hold (ticks we will not replan) ---
+        self.plan_finished_hold_ticks = int(getattr(self, "plan_finished_hold_ticks", 2))
+        self._post_finish_hold = 0
+
+        self._need_replan_on_enter = False
+
+        self._visit_counts = defaultdict(int)   # id -> visits
+        self.goal_visit_hard_limit = getattr(self, "goal_visit_hard_limit", 2)
+        # --- session & partial-path bookkeeping ---
+        self._last_mode = None                 # to detect re-entry into NAVIGATE
+        self._nav_session_id = 0
+        self._partial_attempts = defaultdict(int)  # key: (u,v) → retries
+        self.partial_retries_before_replan = 6     # configurable
+        self.max_partial_len = 8                   # configurable small partial detours
+        self._last_edge = None
+        # ─── NEW: “phantom” final-push state ───
+        self._phantom_goal_pose: tuple[int,int,int] | None = None  # (x,y,θ) in grid coords
+        self._phantom_active: bool = False
+
+        # knobs (tweakable, safe defaults)
+        self.phantom_cell_grid = 4                # NxN zoning grid
+        self.phantom_max_goal_cell_cheby = 1      # only consider empty/sparse cells Chebyshev-adjacent to GOAL’s cell
+        self.phantom_min_gap_dist = 6.0           # reject phantom if centroid is too close to known nodes
+        self.phantom_partial_len = 6              # cap pushed partial A* length
+        self._phantom_attempts = 0
+        self.phantom_retries_before_finish = getattr(self, "phantom_retries_before_finish", 6)
+
 
         self._pose_hist: deque[tuple[float,float]] = deque(maxlen=8)
-        
+      
     def get_available_nodes_with_confidence(self, min_confidence=0.5):
         """Get nodes that are viable for navigation"""
         viable_nodes = []
@@ -91,7 +569,400 @@ class NavigationSystem:
                 
         self.navigation_flags.clear()  # Clear flags if everything is okay
         return True
+    def _ensure_portal_store(self):
+        if not hasattr(self, "_closed_portals") or self._closed_portals is None:
+            # Each item: dict(mid=(x,y), dir=(dx,dy), half_len=float, half_w=float)
+            self._closed_portals = []
+
+    def _register_portal_closure(self, u, v, dbg=print):
+        """
+        Called when edge (u,v) proved impassable. Uses node poses only.
+        Blacklists *all* edges whose midpoints & directions match the same portal strip.
+        Also records a portal descriptor so inferred links get filtered later.
+        """
+        mg = self.memory_graph
+        emap = mg.experience_map
+
+        # Geometry of failed edge
+        (ax,ay), (bx,by), mid_uv, dir_uv = _edge_features(emap, u, v)
+        import math
+        L = math.hypot(dir_uv[0], dir_uv[1]) + 1e-9
+        dir_uv = (dir_uv[0]/L, dir_uv[1]/L)            # unit direction
+        # Tunables (no map metadata required)
+        ang_tol_deg   = float(getattr(self, "portal_angle_tol_deg", 25.0))
+        half_len_pad  = float(getattr(self, "portal_half_len_pad", 1.0))   # how far along the doorway
+        half_w        = float(getattr(self, "portal_half_width", 1.2))     # doorway lateral half-width
+        half_len      = (0.5*L) + half_len_pad
+
+        # Persist the portal descriptor for future filtering (inferred links)
+        self._ensure_portal_store()
+        self._closed_portals.append({
+            "mid": mid_uv, "dir": dir_uv, "half_len": half_len, "half_w": half_w
+        })
+
+        # Helper: does edge (a,b) lie in the same portal strip?
+        def edge_hits_portal(a,b):
+            (pax,pay),(pbx,pby), mid_ab, dir_ab = _edge_features(emap, a, b)
+            # angular match
+            if _angdiff(dir_uv, dir_ab) > ang_tol_deg:
+                return False
+            # project midpoint difference onto portal frame
+            dx, dy = (mid_ab[0]-mid_uv[0], mid_ab[1]-mid_uv[1])
+            # longitudinal along dir_uv, lateral across it
+            # perp = rotate90(dir_uv)
+            perp = (-dir_uv[1], dir_uv[0])
+            lon = abs(dx*dir_uv[0] + dy*dir_uv[1])
+            lat = abs(dx*perp[0]   + dy*perp[1])
+            return (lon <= half_len) and (lat <= half_w)
+
+        # Collect all existing edges (both directions) and sever the ones that hit the same portal
+        if not hasattr(self, "link_blacklist") or self.link_blacklist is None:
+            self.link_blacklist = set()
+        canon = lambda a,b: frozenset((a,b))
+        severed = 0
+
+        # Iterate all known links in the memory graph
+        exps = getattr(emap, "exps", [])
+        for e in exps:
+            for lnk in getattr(e, "links", []):
+                tgt = getattr(lnk, "target", None)
+                vid = getattr(tgt, "id", None) if tgt is not None else getattr(lnk, "target_id", None)
+                if vid is None: 
+                    continue
+                if edge_hits_portal(e.id, vid):
+                    # drop confidence on both directions if present
+                    l = self._find_link(e.id, vid)
+                    if l is not None: setattr(l, "confidence", 0)
+                    l = self._find_link(vid, e.id)
+                    if l is not None: setattr(l, "confidence", 0)
+                    # and permanently blacklist the pair
+                    self.link_blacklist.add(canon(e.id, vid))
+                    severed += 1
+
+        if getattr(self, "debug_universal_navigation", False):
+            dbg(f"[portal] closed around ({u},{v}) → severed {severed} links; "
+                f"portal mid={mid_uv} half_len={half_len:.2f} half_w={half_w:.2f} ang_tol={ang_tol_deg}°")
+
+
+    def _heading_from_vector(self, dx: float, dy: float) -> int:
+        """Grid heading 0:E,1:N,2:W,3:S from (dx,dy)."""
+        if abs(dx) >= abs(dy):
+            return 0 if dx > 0 else 2
+        else:
+            return 1 if dy > 0 else 3
+    def _predict_phantom_pose_using_zones(self, exps, start_id: int, goal_id: int,
+                                      graph: dict[int, list[int]] | None = None,
+                                      debug: bool = False) -> tuple[int,int,int] | None:
+        """
+        Phantom targeter (goal-agnostic) aligned with _pcfg_select_goal_node_scored:
+
+        1) Build the same 4×4 grid and compute interest per cell:
+        interest = 0.5*deficit_vs_median + 0.35*scarcity + 0.15*frontier
+        2) Pick the single best cell by interest (optionally tie-broken by outwardness).
+        3) Infer a global lattice (step + phase) from node deltas and place candidates
+        at lattice intersections *inside that cell*; pick the one with the largest min-gap
+        to existing nodes (>= phantom_min_gap_dist).
+        4) If lattice fails, fallback to cell centroid (min-gap guarded).
+        5) Heading = direction (E/N/W/S) toward the emptiest neighboring cell around the chosen cell.
+        """
+        import math
+        from collections import Counter
+
+        # --- basic grid helpers ---
+        Nx, Ny, bbox, step_x, step_y, cell_of, centroid, counts, _ = self._zone_grid(exps)
+        min_x, max_x, min_y, max_y = bbox
+
+        def _xy(e):
+            return float(getattr(e, "x_m", getattr(e, "x", 0.0))), float(getattr(e, "y_m", getattr(e, "y", 0.0)))
+
+        nodes = [(int(e.id), *_xy(e)) for e in exps]
+        if len(nodes) < 4 or step_x <= 0 or step_y <= 0:
+            if debug:
+                print("[PHANTOM] insufficient nodes or degenerate steps → None")
+            return None
+
+        id2xy = {nid: (x, y) for nid, x, y in nodes}
+
+        # --- interest terms (same blend as _pcfg_select_goal_node_scored) ---
+        flat = [counts[i][j] for i in range(Nx) for j in range(Ny)]
+        nonzero = [c for c in flat if c > 0]
+        # scarcity
+        scarcity_cell = [[1.0 / (1.0 + counts[i][j]) for j in range(Ny)] for i in range(Nx)]
+        # deficit vs median(nonzero)
+        med_nz = (sorted(nonzero)[len(nonzero)//2] if nonzero else 0)
+        med_nz = max(med_nz, 1)
+        deficit_cell = [[max(0.0, (med_nz - counts[i][j]) / med_nz) for j in range(Ny)] for i in range(Nx)]
+        # frontier = fraction of EMPTY neighbors in 3×3 ring
+        empty = {(i, j) for i in range(Nx) for j in range(Ny) if counts[i][j] == 0}
+        def frontier_frac(ix, iy):
+            tot = 0; emp = 0
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx == 0 and dy == 0: continue
+                    x2, y2 = ix + dx, iy + dy
+                    if 0 <= x2 < Nx and 0 <= y2 < Ny:
+                        tot += 1
+                        if (x2, y2) in empty: emp += 1
+            return (emp / tot) if tot > 0 else 0.0
+        frontier_cell = [[frontier_frac(i, j) for j in range(Ny)] for i in range(Nx)]
+
+        a_def, a_scar, a_front = 0.5, 0.35, 0.15
+        interest_cell = [[
+            a_def   * deficit_cell[i][j] +
+            a_scar  * scarcity_cell[i][j] +
+            a_front * frontier_cell[i][j]
+        for j in range(Ny)] for i in range(Nx)]
+
+        # --- choose best cell by interest (tie-break by outwardness) ---
+        def outward(ix, iy):
+            edge = min(ix, Nx-1-ix, iy, Ny-1-iy)
+            rng  = max(Nx, Ny)
+            return 1.0 - (edge / max(rng/2.0, 1.0))
+
+        all_cells = [(ix, iy) for ix in range(Nx) for iy in range(Ny)]
+        # Prefer empty/sparse implicitly via interest; tie-break with outward
+        all_cells.sort(key=lambda ij: (interest_cell[ij[0]][ij[1]], outward(ij[0], ij[1])), reverse=True)
+        best_ix, best_iy = all_cells[0]
+        cx, cy = centroid(best_ix, best_iy)
+
+        if debug:
+            print(f"[PHANTOM] grid={Nx}x{Ny} step=({step_x:.2f},{step_y:.2f}) bbox=({min_x:.2f},{min_y:.2f})→({max_x:.2f},{max_y:.2f})")
+            print(f"[PHANTOM] chosen cell=({best_ix},{best_iy}) interest={interest_cell[best_ix][best_iy]:.3f} "
+                f"deficit={deficit_cell[best_ix][best_iy]:.3f} scarcity={scarcity_cell[best_ix][best_iy]:.3f} "
+                f"frontier={frontier_cell[best_ix][best_iy]:.3f} outward={outward(best_ix,best_iy):.3f}")
+
+        # --- infer lattice (step + phase) from global node deltas ---
+        def infer_steps_and_phase():
+            xs = []; ys = []
+            def push_pair(u, v):
+                x1, y1 = id2xy[u]; x2, y2 = id2xy[v]
+                dx = int(round(x2 - x1)); dy = int(round(y2 - y1))
+                if dx: xs.append(abs(dx))
+                if dy: ys.append(abs(dy))
+
+            if graph:
+                for u, nbs in graph.items():
+                    for v in nbs:
+                        push_pair(u, v)
+            if not xs and not ys:
+                # kNN deltas (3 nearest)
+                pts = list(id2xy.items())
+                for i, (ui, (x1, y1)) in enumerate(pts):
+                    neigh = sorted(((math.hypot(x1 - x2, y1 - y2), uj)
+                                    for uj, (x2, y2) in pts if uj != ui))[:3]
+                    for _, uj in neigh:
+                        push_pair(ui, uj)
+
+            def mode_or_default(arr, default_val):
+                if not arr: return default_val
+                c = Counter(arr)
+                v, _ = c.most_common(1)[0]
+                return int(max(1, min(6, v)))  # clamp to [1,6] cells by default
+
+            dx_mode = mode_or_default(xs, default_val=max(1, int(round(step_x))))
+            dy_mode = mode_or_default(ys, default_val=max(1, int(round(step_y))))
+
+            # Phase via histogram on (coord mod step)
+            def phase(values, step):
+                if step <= 0: return 0
+                bins = Counter(int(round(v % step)) for v in values)
+                return max(bins.items(), key=lambda kv: kv[1])[0] if bins else 0
+
+            xs_all = [x for _, x, _ in nodes]
+            ys_all = [y for _, _, y in nodes]
+            px = phase(xs_all, dx_mode)
+            py = phase(ys_all, dy_mode)
+            return dx_mode, dy_mode, px, py
+
+        dx_mode, dy_mode, phase_x, phase_y = infer_steps_and_phase()
+        if debug:
+            print(f"[PHANTOM] inferred lattice: step=({dx_mode},{dy_mode}) phase=({phase_x},{phase_y})")
+
+        # --- generate lattice intersections inside the chosen cell ---
+        # cell bounds:
+        x0 = min_x + best_ix * step_x
+        x1 = x0 + step_x
+        y0 = min_y + best_iy * step_y
+        y1 = y0 + step_y
+
+        def lattice_points_in_cell():
+            pts = []
+            if dx_mode > 0 and dy_mode > 0:
+                # search k,l such that x=k*dx+phase_x in [x0,x1], y=l*dy+phase_y in [y0,y1]
+                k_min = int(math.floor((x0 - phase_x) / dx_mode)) - 1
+                k_max = int(math.ceil ( (x1 - phase_x) / dx_mode)) + 1
+                l_min = int(math.floor((y0 - phase_y) / dy_mode)) - 1
+                l_max = int(math.ceil ( (y1 - phase_y) / dy_mode)) + 1
+                for k in range(k_min, k_max + 1):
+                    lx = k * dx_mode + phase_x
+                    if lx < x0 - 1e-6 or lx > x1 + 1e-6: continue
+                    for l in range(l_min, l_max + 1):
+                        ly = l * dy_mode + phase_y
+                        if ly < y0 - 1e-6 or ly > y1 + 1e-6: continue
+                        pts.append((int(round(lx)), int(round(ly))))
+            return pts
+
+        cand_pts = lattice_points_in_cell()
+
+        # Always consider the exact cell centroid as a fallback candidate
+        cx_i, cy_i = int(round(cx)), int(round(cy))
+        if (cx_i, cy_i) not in cand_pts:
+            cand_pts.append((cx_i, cy_i))
+
+        # --- score candidates by gap-to-known (max-min-distance) + centeredness ---
+        # --- score candidates by gap-to-known (max-min-distance) + centeredness ---
+        # Dynamic min_gap: cap by a fraction of the cell size so dense maps still allow a phantom
+        base_gap   = float(getattr(self, "phantom_min_gap_dist", 5.0))
+        gap_frac   = float(getattr(self, "phantom_gap_as_fraction_of_cell", 0.60))  # new knob
+        cell_scale = max(step_x, step_y, 1.0)
+        min_gap    = min(base_gap, gap_frac * cell_scale)
+
+        def gap_to_known(px, py):
+            if not nodes: return float('inf')
+            return min(math.hypot(px - x, py - y) for _, x, y in nodes)
+        # normalize helpers
+        norm_gap = max(step_x, step_y, 1.0)
+        def score_point(px, py):
+            g = gap_to_known(px, py)
+            center_bias = 1.0 / (1.0 + math.hypot(px - cx, py - cy))
+            # prioritize min-gap first, then center bias
+            return (g / norm_gap, center_bias)
+
+        scored_pts = []
+        for (px, py) in cand_pts:
+            g = gap_to_known(px, py)
+            if g >= min_gap:
+                sc = score_point(px, py)
+                scored_pts.append((sc, px, py))
+
+        if not scored_pts:
+            if debug:
+                print(f"[PHANTOM] no lattice candidate meets min_gap={min_gap:.2f}; trying centroid/relax…")
+            g = gap_to_known(cx_i, cy_i)
+
+            # Relaxed acceptance
+            relax = float(getattr(self, "phantom_gap_relax_factor", 0.60))
+            if g >= relax * min_gap:
+                chosen = (cx_i, cy_i)
+            else:
+                # Nudge the centroid toward the emptiest neighbor cell
+                nudge = float(getattr(self, "phantom_nudge_frac", 0.33)) * cell_scale
+                # best_dir already points to emptiest neighbor
+                dx = [ nudge, 0.0, -nudge, 0.0 ][best_dir]   # E,N,W,S
+                dy = [ 0.0,  nudge, 0.0, -nudge][best_dir]
+                nx, ny = int(round(cx + dx)), int(round(cy + dy))
+                chosen = (nx, ny)
+
+        else:
+            scored_pts.sort(reverse=True)  # max gap, then center bias
+            _, px, py = scored_pts[0]
+            chosen = (px, py)
+        if debug and scored_pts:
+            top = scored_pts[:3]
+            print(f"[PHANTOM] top candidates by (gap/norm, center_bias): {[(p[1], p[2], p[0][0], round(p[0][1],3)) for p in top]}")
+
+        # --- heading: toward emptiest neighbor (E=0,N=1,W=2,S=3)
+        def neighbor_emptiness(ix, iy):
+            def empt(i, j):
+                if 0 <= i < Nx and 0 <= j < Ny:
+                    # higher = emptier
+                    return 1.0 / (1.0 + counts[i][j])
+                return 0.0
+            return {
+                0: empt(ix + 1, iy),  # E
+                1: empt(ix, iy + 1),  # N
+                2: empt(ix - 1, iy),  # W
+                3: empt(ix, iy - 1),  # S
+            }
+
+        neigh = neighbor_emptiness(best_ix, best_iy)
+        best_dir = max(neigh.items(), key=lambda kv: kv[1])[0]
+        # If chosen cell is crowded, and there is an empty neighbor cell, bias heading toward that empty cell
+        if counts[best_ix][best_iy] > 0:
+            neigh = {  # E,N,W,S
+                (best_ix+1, best_iy),
+                (best_ix, best_iy+1),
+                (best_ix-1, best_iy),
+                (best_ix, best_iy-1),
+            }
+            empty_neighbors = [(i,j) for (i,j) in neigh if 0 <= i < Nx and 0 <= j < Ny and counts[i][j] == 0]
+            if empty_neighbors:
+                # nudge heading toward emptiest neighbor (already computed as best_dir)
+                pass  # heading already points to emptiest; this keeps behavior deterministic
+        if debug:
+            print(f"[PHANTOM] candidates={len(cand_pts)} kept={len(scored_pts)} "
+                f"min_gap={min_gap:.2f} chosen=({chosen[0]},{chosen[1]}) "
+                f"heading={best_dir} (E=0,N=1,W=2,S=3) "
+                f"neighbor_emptiness={neigh}")
+
+        return (int(chosen[0]), int(chosen[1]), int(best_dir))
+
     
+    def _zone_grid(self, exps, Nx: int | None = None, Ny: int | None = None):
+        """Build a simple Nx×Ny grid over node bbox and return helpers."""
+        import math
+        Nx = Nx or int(getattr(self, "phantom_cell_grid", 4))
+        Ny = Ny or Nx
+        xs = [float(getattr(e, "x_m", getattr(e, "x", 0.0))) for e in exps]
+        ys = [float(getattr(e, "y_m", getattr(e, "y", 0.0))) for e in exps]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        step_x = (max_x - min_x) / max(Nx, 1) or 1.0
+        step_y = (max_y - min_y) / max(Ny, 1) or 1.0
+
+        def cell_of(x, y):
+            ix = min(Nx-1, max(0, int((x - min_x) / step_x))) if step_x > 0 else 0
+            iy = min(Ny-1, max(0, int((y - min_y) / step_y))) if step_y > 0 else 0
+            return ix, iy
+
+        def centroid(ix, iy):
+            return (min_x + (ix + 0.5) * step_x, min_y + (iy + 0.5) * step_y)
+
+        counts = [[0 for _ in range(Ny)] for _ in range(Nx)]
+        by_cell = {}
+        for e in exps:
+            x = float(getattr(e, "x_m", getattr(e, "x", 0.0)))
+            y = float(getattr(e, "y_m", getattr(e, "y", 0.0)))
+            ij = cell_of(x, y)
+            counts[ij[0]][ij[1]] += 1
+            by_cell.setdefault(ij, []).append(e.id)
+
+        return Nx, Ny, (min_x, max_x, min_y, max_y), step_x, step_y, cell_of, centroid, counts, by_cell
+
+    def _astar_to_pose_partial(self, wm, belief, start: "State",
+                            pose_xyz: tuple[int,int,int],
+                            debug: bool = False,
+                            max_partial_len: int | None = None):
+        """Partial A* to an arbitrary grid pose (x,y,θ) — used for phantom pushes."""
+        if max_partial_len is None:
+            max_partial_len = int(getattr(self, "phantom_partial_len", 6))
+        gx, gy, gd = pose_xyz
+        goal = State(int(round(gx)), int(round(gy)), int(gd))
+        try:
+            ret = self.planner.astar_prims(wm, belief, start, goal, verbose=debug, allow_partial=True)
+            if isinstance(ret, tuple) and len(ret) == 2 and isinstance(ret[1], dict):
+                path, meta = ret
+            else:
+                path, meta = ret, {'reached_goal': True, 'best_dist': None}
+        except TypeError:
+            # planner without partial support
+            path = self.planner.astar_prims(wm, belief, start, goal, verbose=debug)
+            meta = {'reached_goal': True, 'best_dist': None}
+
+        # normalize and cap
+        import torch
+        if path is None or (torch.is_tensor(path) and path.numel() == 0) or (hasattr(path, "__len__") and len(path) == 0):
+            return [], {'reached_goal': False, 'best_dist': None}
+        try:
+            if hasattr(path, "shape") and path.shape[0] > max_partial_len:
+                path = path[:max_partial_len]
+            elif hasattr(path, "__len__") and len(path) > max_partial_len:
+                path = path[:max_partial_len]
+        except Exception:
+            pass
+        return path, meta
+
+
     def _weighted_prod_choice(self, prods):
         if random.random() < 0.8:                 # ε = 0.2 exploration
             return max(prods, key=lambda p: p.prob())
@@ -122,21 +993,63 @@ class NavigationSystem:
             return ms
         # Fallback – you can replace this if your env feeds a mission string elsewhere
         return "go to red room"
+    def emit_stall_turn(self, *, for_executor: bool = False, preferred: str | None = None):
+        """
+        Emit a single left/right turn.
 
-    def _parse_color_from_mission(self, mission: str | None) -> str | None:
+        - If for_executor=True: DO NOT bump _issue_seq → navigation_grade() will return 0.0.
+        Use this when you must output something to avoid crashing an outer loop.
+        - If for_executor=False: behaves like the internal stall (counts for grade).
+
+        Returns: ( [onehot], 1, label_str )
         """
-        Extract a MiniGrid color token from free text. Returns UPPERCASE or None.
-        """
-        if not mission:
-            return None
-        # canonical MiniGrid palette (+ a few aliases)
-        canon = {
-            "RED":"RED", "GREEN":"GREEN", "BLUE":"BLUE",
-            "YELLOW":"YELLOW", "PURPLE":"PURPLE", "GREY":"GREY", "GRAY":"GREY",
-            "BROWN":"BROWN", "ORANGE":"ORANGE"
-        }
-        m = re.search(r"\b(red|green|blue|yellow|purple|grey|gray|brown|orange)\b", mission, re.I)
-        return canon.get(m.group(0).upper(), None) if m else None
+        import random
+        turn = preferred if preferred in ("left", "right") else random.choice(["left", "right"])
+        self._last_served_prim = turn
+
+        # Only count for grading if we are *intentionally* stalling inside navigation.
+        if not for_executor:
+            self._issue_seq = int(getattr(self, "_issue_seq", 0)) + 1
+
+        # Baseline bookkeeping (same as the inner helper)
+        hist = getattr(self, "_pose_hist", ())
+        self._issue_baseline_hist_len = len(hist)
+        if len(hist) > 0:
+            self._issue_baseline_pose = hist[-1]
+            self._issue_baseline_valid = True
+        else:
+            cur = self.get_current_pose()
+            if cur is not None:
+                self._issue_baseline_pose = (float(cur[0]), float(cur[1]), float(cur[2]))
+                self._issue_baseline_valid = True
+            else:
+                self._issue_baseline_valid = False
+
+        # Optional: tag it; not required, but useful for debugging
+        if for_executor:
+            self.navigation_flags['synthetic_action'] = True
+
+        fb = [self.to_onehot_list(turn)]  # e.g., [0,1,0] for 'right'
+        return fb, 1, turn
+
+    def _record_node_visit(self, node_id: int) -> None:
+        """Bumps visit count on the exp object (if available) and in a local map."""
+        try:
+            self._visit_counts[node_id] += 1
+            # also write onto Experience object if the field exists/should exist
+            emap = self.memory_graph.experience_map
+            for e in getattr(emap, "exps", []):
+                if getattr(e, "id", None) == node_id:
+                    setattr(e, "visit_count", int(getattr(e, "visit_count", 0)) + 1)
+                    break
+        except Exception:
+            pass
+
+    def _visits(self, node_id: int) -> int:
+        try:
+            return int(self._visit_counts.get(node_id, 0))
+        except Exception:
+            return 0
 
     # ---------------------------------------------------------------------
     # Task-specific PCFG (target room by COLOR)
@@ -170,32 +1083,60 @@ class NavigationSystem:
             exps=exps,
             start_id=start,
             blacklist=self.link_blacklist,
-            infer_link_max_dist=float(getattr(self, "infer_link_max_dist", 3.4)),
+            infer_link_max_dist=float(getattr(self, "infer_link_max_dist", 12.4)),
             debug=debug
         )
         self.graph_used_for_pcfg = graph
         if debug:
             print("[TASK PCFG] adjacency:", {k: sorted(v) for k, v in graph.items()})
 
-        # ---------- D) candidate goals by color ----------
+        # ---------- D) candidate goals by color (task logic) ----------
         target_color = str(mission_color).upper().strip()
-        cand_ids = []
-        for e in exps:
-            if getattr(e, "place_kind", None) == "ROOM":
-                c = getattr(e, "room_color", None)
-                if c is not None and str(c).upper() == target_color:
-                    cand_ids.append(e.id)
+        # initial candidates for the requested color
+        cand_ids = [
+            e.id for e in exps
+            if getattr(e, "place_kind", None) == "ROOM"
+            and getattr(e, "room_color", None) is not None
+            and str(getattr(e, "room_color")).upper() == target_color
+        ]
+
+        # If our CURRENT node is already that color, exclude it so we "choose another one".
+        if start in cand_ids:
+            cand_ids = [nid for nid in cand_ids if nid != start]
+
+        # If no usable nodes of the requested color, pick a RANDOM different color present in the map.
+        if not cand_ids:
+            other_colors = sorted({
+                str(getattr(e, "room_color")).upper()
+                for e in exps
+                if getattr(e, "place_kind", None) == "ROOM"
+                and getattr(e, "room_color", None) is not None
+                and str(getattr(e, "room_color")).upper() != target_color
+            })
+            if other_colors:
+                rng = getattr(self, "_rng", None)
+                fallback_color = (rng.choice(other_colors) if rng else random.choice(other_colors))
+                if debug:
+                    print(f"[TASK PCFG] No usable {target_color}; switching to random fallback color={fallback_color}")
+                target_color = fallback_color
+                cand_ids = [
+                    e.id for e in exps
+                    if getattr(e, "place_kind", None) == "ROOM"
+                    and getattr(e, "room_color", None) is not None
+                    and str(getattr(e, "room_color")).upper() == target_color
+                    and e.id != start  # still avoid selecting current node
+                ]
 
         if debug:
-            print(f"[TASK PCFG] mission_color={target_color}  candidates={sorted(cand_ids)}")
+            print(f"[TASK PCFG] target_color={target_color} usable_candidates={sorted(cand_ids)} (start={start})")
 
-        # Fallback to your normal heuristic if no color candidates exist
+        # If still none, fall back to default PCFG (keeps behavior consistent with base builder)
         if not cand_ids:
             if debug:
-                print("[TASK PCFG] No color-matching nodes; falling back to build_pcfg_from_memory().")
+                print("[TASK PCFG] No usable color candidates; falling back to build_pcfg_from_memory().")
             return self.build_pcfg_from_memory(debug=debug)
 
-        # ---------- E) choose nearest reachable candidate ----------
+        # ---------- E) choose FARTHEST reachable candidate ----------
         def _bfs_all_dists(adj: dict[int, list[int]], src: int) -> dict[int, int]:
             d = {src: 0}
             q = deque([src])
@@ -211,11 +1152,9 @@ class NavigationSystem:
         reachable = [(nid, dists[nid]) for nid in cand_ids if nid in dists]
         if not reachable:
             if debug:
-                print("[TASK PCFG] Color nodes exist but none reachable; falling back to default PCFG.")
+                print("[TASK PCFG] Color candidates exist but none reachable; falling back to default PCFG.")
             return self.build_pcfg_from_memory(debug=debug)
-
-        # pick the nearest (break ties by larger id to be deterministic)
-        goal = min(reachable, key=lambda kv: (kv[1], -kv[0]))[0]
+        goal = max(reachable, key=lambda kv: (kv[1], kv[0]))[0]
         self.goal_node_id = goal
         if debug:
             print(f"[TASK PCFG] chosen goal node={goal}")
@@ -294,6 +1233,25 @@ class NavigationSystem:
 
         return PCFG.fromstring(grammar_src)
 
+    def _is_empty_seq(self, seq) -> bool:
+        """True if seq is None, empty list/tuple, or a tensor with numel()==0."""
+        try:
+            import torch
+            if seq is None:
+                return True
+            if torch.is_tensor(seq):
+                return int(seq.numel()) == 0
+            try:
+                return len(seq) == 0
+            except Exception:
+                return False
+        except Exception:
+            # If torch import fails or anything odd, be conservative.
+            try:
+                return len(seq) == 0
+            except Exception:
+                return True
+
     def _pcfg_shortest_path(self, graph: dict[int, list[int]], start: int, goal: int):
         """Return one shortest path [start,...,goal] in edge-count metric, or None."""
         if start == goal:
@@ -356,7 +1314,7 @@ class NavigationSystem:
             start_id=start,
             blacklist=self.link_blacklist,
             # Heuristic default for MiniGrid-like spacing (~3.0 units per grid)
-            infer_link_max_dist=float(getattr(self, "infer_link_max_dist", 3.4)),
+            infer_link_max_dist=float(getattr(self, "infer_link_max_dist", 9.4)),
             debug=debug
         )
 
@@ -367,10 +1325,12 @@ class NavigationSystem:
             print("[PCFG DEBUG] adjacency (post-confidence+inferred):", {k: sorted(v) for k,v in graph.items()})
 
         # ---------- D) choose GOAL deterministically via sparse-zone heuristic -----
-        goal = self._pcfg_select_goal_node_via_zones(
-            exps=exps, start_id=start, graph=graph, debug=debug
-        )
+        goal = self._pcfg_select_goal_node_scored(exps=exps, start_id=start, graph=graph, debug=debug)
+        print("WE SELECTED VIA SCORE")
+        if goal is None:
+            goal = self._pcfg_select_goal_node_via_zones(exps=exps, start_id=start, graph=graph, debug=debug)
         self.goal_node_id = goal
+        
 
         # If still None for any reason, fallback to farthest reachable node
         if goal is None:
@@ -383,6 +1343,26 @@ class NavigationSystem:
             else:
                 goal = start
             self.goal_node_id = goal
+        if goal is not None: 
+            # ─── NEW: derive a phantom push near the chosen GOAL (NAVIGATE-only) ───
+            try:
+                print("[PCFG DEBUG] phantom WE ARE CREATING A PHANTOM")
+    
+                print("[PCFG DEBUG] phantom WE ARE  CREATING A PHANTOM")
+                self._phantom_goal_pose = self._predict_phantom_pose_using_zones(
+                    exps=exps, start_id=start, goal_id=goal, graph=graph, debug=debug
+                )
+                self._phantom_active = False
+                if debug and self._phantom_goal_pose is not None:
+                    print(f"[PCFG DEBUG] phantom_goal_pose={self._phantom_goal_pose} (derived from zone gap near GOAL)")
+                """else:
+                    print("[PCFG DEBUG] phantom WE ARE NOT CREATING A PHANTOM")
+                    self._phantom_goal_pose = None
+                    self._phantom_active = False"""
+            except Exception as e:
+                if debug: print(f"[PCFG DEBUG] phantom derivation failed: {e}")
+                self._phantom_goal_pose = None
+                self._phantom_active = False
 
         # As an additional safeguard, if no path exists to 'goal', fallback.
         if not self._pcfg_is_reachable(graph, start, goal):
@@ -497,6 +1477,189 @@ class NavigationSystem:
     # ──────────────────────────────────────────────────────────────────────────────
     # Helper methods (paste inside the same class)
     # ──────────────────────────────────────────────────────────────────────────────
+    def ensure_plan_for_current_mode(self, mission: str | None = None, debug: bool = True) -> bool:
+        """
+        If we're in a nav-like mode (NAVIGATE or TASK_SOLVING) and have no plan (or on enter),
+        build the right PCFG and tokenize it. Returns True iff we now have something to execute.
+        """
+        mode = str(getattr(self, "current_mode", "NAVIGATE"))
+        nav_like = mode in ("NAVIGATE", "TASK_SOLVING")
+
+        if not nav_like:
+            return False
+
+        need = bool(
+            getattr(self, "_need_replan_on_enter", False) or
+            (float(getattr(self, "plan_progress", -1.0)) < 0.0) or
+            (len(getattr(self, "full_plan_tokens", [])) == 0)
+        )
+        if not need:
+            return True
+
+        # Pick the correct PCFG builder
+        if mode == "TASK_SOLVING":
+            print("[TASK]are we entering? ")
+            if mission is None:
+                mission = self.task_solve_mission()
+            color = self._parse_color_from_mission(mission)
+            if not color:
+                if debug:
+                    print(f"[ensure_plan] TASK_SOLVING: could not parse color from {mission!r} → default PCFG")
+                grammar = self.build_pcfg_from_memory(debug=debug)
+            else:
+                grammar = self.build_task_pcfg_from_memory(color, debug=debug)
+        else:
+            grammar = self.build_pcfg_from_memory(debug=debug)
+
+        self.generate_plan_with_pcfg(grammar, debug=debug)
+        self._need_replan_on_enter = False
+
+        if debug:
+            print(f"[ensure_plan] mode={mode} tokens={self.full_plan_tokens} "
+                f"target={self.target_node_id} phantom={self._phantom_goal_pose}")
+        return bool(self.full_plan_tokens) or (self._phantom_goal_pose is not None)
+
+    def _safe_log_mode_event(self, kind: str, **kw):
+        pe = getattr(self, "plan_export", None)
+        if pe is None:
+            return
+        try:
+            pe.log_event(kind, **kw)
+        except Exception:
+            pass
+
+    def _on_mode_transition(self, new_mode: str, debug=True) -> None:
+        
+        prev = getattr(self, "_last_mode", None)
+        if debug:
+            print(f"[mode] {prev} → {new_mode} | has_plan={len(getattr(self,'full_plan_tokens',[]))>0} "
+                f"tok={getattr(self,'token_idx',0)}/{len(getattr(self,'full_plan_tokens',[]))} "
+                f"prog={float(getattr(self,'plan_progress',-1.0)):.3f}")
+        if prev == new_mode:
+            return
+
+        NAV_MODES = {"NAVIGATE", "TASK_SOLVING"}
+        leaving_nav  = (prev in NAV_MODES) and (new_mode not in NAV_MODES)
+        entering_nav = (new_mode in NAV_MODES) and (prev not in NAV_MODES)
+        switching_nav_kind = (prev in NAV_MODES) and (new_mode in NAV_MODES) and (prev != new_mode)
+
+        # NEW: treat NAVIGATE and TASK_SOLVING as equivalent for plan continuity
+        nav_swap_equiv = switching_nav_kind and getattr(self, "treat_nav_modes_as_equivalent", True)
+
+
+        
+        # ---- Leaving any nav-like mode (unchanged) ----
+        if leaving_nav:
+            recently_finished = self.navigation_flags.get("plan_complete", False) or \
+                                (float(getattr(self, "plan_progress", -1.0)) >= 1.0)
+            if recently_finished:
+                self._suppress_replan_on_enter = True
+                self._suppress_replan_ticks = int(getattr(self, "plan_finished_hold_ticks", 2))
+                self._reset_token_prims(); self.prim_idx = 0
+                self._evade_injected = False; self._evade_ticks_since_recalc = 0
+            else:
+                self.full_plan_tokens = []
+                self.token_idx = 0
+                self.plan_progress = -1.0
+                self._reset_token_prims()
+                self.prim_idx = 0
+                self._phantom_goal_pose = None
+                self._phantom_active = False
+                self._phantom_attempts = 0
+
+        # ---- Entering any nav-like mode ----
+        # Reset volatile low-level state on ANY nav entry OR nav-kind swap (old behavior)
+        if entering_nav or switching_nav_kind:
+            self._reset_token_prims()
+            self.prim_idx = 0
+            self._evade_injected = False
+            self._evade_ticks_since_recalc = 0
+
+        if entering_nav:
+            
+            finished = self.navigation_flags.get("plan_complete", False) or \
+                    (float(getattr(self, "plan_progress", -1.0)) >= 1.0)
+            self._safe_log_mode_event(
+                "mode_enter_nav",
+                prev=str(prev), new=str(new_mode),
+                finished_on_entry=bool(finished),
+                prog=float(getattr(self, "plan_progress", -1.0))
+            )
+            if finished:
+                self._post_finish_hold = 0
+                self._suppress_replan_on_enter = False
+                self._suppress_replan_ticks = 0
+                self.navigation_flags.pop("plan_complete", None)
+                self.full_plan_tokens = []
+                self.token_idx = 0
+                self.plan_progress = -1.0
+                self._phantom_goal_pose = None
+                self._phantom_active = False
+                self._phantom_attempts = 0
+                self._need_replan_on_enter = True
+            else:
+                if getattr(self, "_suppress_replan_on_enter", False) and getattr(self, "_suppress_replan_ticks", 0) > 0:
+                    self._suppress_replan_ticks -= 1
+                    if self._suppress_replan_ticks <= 0:
+                        self._suppress_replan_on_enter = False
+                    self._need_replan_on_enter = False
+                else:
+                    self._need_replan_on_enter = True
+
+        # ---- NAV↔TASK swap behavior ----
+        if nav_swap_equiv:
+            # Unified finished check
+            prog = float(getattr(self, "plan_progress", -1.0))
+            has_plan = len(getattr(self, "full_plan_tokens", [])) > 0
+            finished_tokens = has_plan and (getattr(self, "token_idx", 0) >= len(self.full_plan_tokens))
+            finished_flag = bool(self.navigation_flags.get("plan_complete", False))
+            finished = finished_flag or finished_tokens or (0.0 <= prog >= 1.0)
+            preserved = (has_plan and not finished and (0.0 <= prog < 1.0))
+            if preserved:
+                self._need_replan_on_enter = False
+                if debug:
+                    print(f"[mode] NAV swap preserve plan: {prev}->{new_mode} "
+                        f"tok={self.token_idx}/{len(self.full_plan_tokens)} prog={prog:.3f}")
+
+            if has_plan and not finished and (0.0 <= prog < 1.0):
+                # UNFINISHED plan → PRESERVE (this is the only “equivalence” change)
+                self._need_replan_on_enter = False
+                if debug:
+                    print(f"[mode] NAV swap preserve plan: {prev}->{new_mode} "
+                        f"tok={self.token_idx}/{len(self.full_plan_tokens)} prog={prog:.3f}")
+            else:
+                # FINISHED or NO PLAN → match OLD behavior: BLANK and replan
+                self.full_plan_tokens = []
+                self.token_idx = 0
+                self.plan_progress = -1.0
+                self._phantom_goal_pose = None
+                self._phantom_active = False
+                self._phantom_attempts = 0
+                self._need_replan_on_enter = True
+
+            self._safe_log_mode_event(
+                "mode_swap_nav_family",
+                prev=str(prev), new=str(new_mode),
+                preserved=bool(preserved),
+                tok=int(getattr(self, "token_idx", 0)),
+                n_tokens=int(len(getattr(self, "full_plan_tokens", []))),
+                prog=float(getattr(self, "plan_progress", -1.0))
+            )
+
+        elif switching_nav_kind and not entering_nav:
+            # Original behavior for non-equivalent nav kinds
+            self._suppress_replan_on_enter = False
+            self._suppress_replan_ticks = 0
+            if self.navigation_flags.get("plan_complete", False) or float(getattr(self, "plan_progress", -1.0)) >= 1.0:
+                self.full_plan_tokens = []
+                self.token_idx = 0
+                self.plan_progress = -1.0
+            self._need_replan_on_enter = True
+
+        self._last_mode = new_mode
+
+
+
 
     def _pcfg_is_reachable(self, graph: dict[int, list[int]], start: int, goal: int) -> bool:
         if start == goal:
@@ -548,7 +1711,7 @@ class NavigationSystem:
         # Read toggles with safe defaults
         treat_all = bool(getattr(self, "pcfg_treat_all_links_confident", False))
         no_infer  = bool(getattr(self, "pcfg_disable_inferred_links", False))
-        ign_bl    = bool(getattr(self, "pcfg_ignore_blacklist", True))
+        ign_bl    = bool(getattr(self, "pcfg_ignore_blacklist", False))
 
         graph = {e.id: [] for e in exps}
         def canon(u,v): return frozenset((u,v))
@@ -571,16 +1734,21 @@ class NavigationSystem:
                 pair = canon(e.id, v)
                 orig_conf = int(getattr(lnk, "confidence", 1))
                 conf = 1 if treat_all else orig_conf
-
                 if conf == 1 and (ign_bl or pair not in blacklist):
-                    graph[e.id].append(v)
+                    if not getattr(self, "pcfg_ignore_portal_closures", False) and self._edge_hits_any_closed_portal(e.id, v):
+                        dropped += 1  # treat as dropped by geometry
+                    else:
+                        graph[e.id].append(v)
                 else:
-                    # Only mutate blacklist when we *aren't* in "treat_all" and *aren't* ignoring blacklist
-                    if (orig_conf == 0) and (not treat_all) and (not ign_bl):
-                        if pair not in blacklist:
-                            blacklist.add(pair)
-                            added_black += 1
-                    dropped += 1
+                    if conf == 1 and (ign_bl or pair not in blacklist):
+                        graph[e.id].append(v)
+                    else:
+                        # Only mutate blacklist when we *aren't* in "treat_all" and *aren't* ignoring blacklist
+                        if (orig_conf == 0) and (not treat_all) and (not ign_bl):
+                            if pair not in blacklist:
+                                blacklist.add(pair)
+                                added_black += 1
+                        dropped += 1
         # (2) Proximity-inferred links (optional) — **use only (x,y) coordinates**
         if not no_infer:
             emap = self.memory_graph.experience_map
@@ -663,20 +1831,43 @@ class NavigationSystem:
                             inferred_pairs.add(pair)
 
             # Add inferred edges (undirected → add both directions)
+            # Add inferred edges (undirected → add both directions) with portal-closure check
+            kept_inferred_pairs = set()
             for pair in inferred_pairs:
+                if (not ign_bl) and (pair in blacklist):
+                    continue
                 u, v = tuple(pair)
+
+                # safety: still respect blacklist if we're not ignoring it
+                if (not ign_bl) and (canon(u, v) in blacklist):
+                    continue
+
+                # NEW: drop any inferred edge that crosses a closed portal
+                if not getattr(self, "pcfg_ignore_portal_closures", False) and self._edge_hits_any_closed_portal(u, v):
+                    continue
+
                 graph[u].append(v)
                 graph[v].append(u)
+                kept_inferred_pairs.add(pair)
 
-            added_inferred = len(inferred_pairs)
+            added_inferred = len(kept_inferred_pairs)
 
+            # ── expose only the kept inferred pairs for exporters/visualization
+            try:
+                self._pcfg_inferred_pairs = sorted(list(kept_inferred_pairs))
+            except Exception:
+                self._pcfg_inferred_pairs = []
+
+            # optional: keep the "longest" debug using the kept set
             if debug or dbg_infer:
-                # Show a few of the longest inferred edges to catch outliers
                 longest = sorted(
                     [(math.hypot(pts[u][0]-pts[v][0], pts[u][1]-pts[v][1]), u, v)
-                    for (u, v) in [tuple(p) for p in inferred_pairs]],
+                    for (u, v) in [tuple(p) for p in kept_inferred_pairs]],
                     reverse=True
                 )[:5]
+                if longest:
+                    print("[PCFG DEBUG] inferred (longest first) [dist,u,v]:", longest)
+
                 if longest:
                     print("[PCFG DEBUG] inferred (longest first) [dist,u,v]:", longest)
                 print(f"[PCFG DEBUG] infer_mode={infer_mode} k={k_neighbors} mutual={mutual_only} "
@@ -692,160 +1883,555 @@ class NavigationSystem:
 
         return graph
 
+    def _pcfg_select_goal_node_scored(self, exps, start_id: int, graph: dict[int, list[int]], debug: bool=False):
+        """
+        Endgame-friendly goal scoring.
+        Keeps 'distance kill' if you want it, but fixes crowding and
+        augments interest with graph-degree frontier and kNN isolation.
+        """
+        import math, numpy as np
+
+        # --- Pull nodes (robust xy) ---
+        nodes = [(int(e.id),
+                float(getattr(e, "x_m", getattr(e, "x", 0.0))),
+                float(getattr(e, "y_m", getattr(e, "y", 0.0))))
+                for e in exps]
+        if len(nodes) < 4:
+            return None
+
+        xs = [x for _, x, _ in nodes]; ys = [y for _, _, y in nodes]
+        min_x, max_x = min(xs), max(xs);  min_y, max_y = min(ys), max(ys)
+        if not all(map(math.isfinite, (min_x, max_x, min_y, max_y))):
+            return None
+        if (max_x - min_x) < 1e-9 or (max_y - min_y) < 1e-9:
+            return None
+
+        # --- Coarse grid for coverage/crowding, like before (4x4) ---
+        Nx = 4; Ny = 4
+        step_x = (max_x - min_x) / Nx;  step_y = (max_y - min_y) / Ny
+        def cell_of(x, y):
+            ix = min(Nx-1, max(0, int((x - min_x) / max(step_x, 1e-9))))
+            iy = min(Ny-1, max(0, int((y - min_y) / max(step_y, 1e-9))))
+            return ix, iy
+
+        counts = [[0 for _ in range(Ny)] for _ in range(Nx)]
+        by_cell = {}
+        for nid, x, y in nodes:
+            ij = cell_of(x, y)
+            counts[ij[0]][ij[1]] += 1
+            by_cell.setdefault(ij, []).append(nid)
+
+        # --- Coverage metrics (fill_frac, imbalance) ---
+        flat = [counts[i][j] for i in range(Nx) for j in range(Ny)]
+        nonzero = [c for c in flat if c > 0]
+        nonempty_cells = sum(1 for c in flat if c > 0)
+        fill_frac = nonempty_cells / max(len(flat), 1)
+
+        def _gini(arr):
+            n = len(arr); s = sum(arr)
+            if n == 0 or s == 0: return 0.0
+            arr_sorted = sorted(arr)
+            cum = sum((i+1)*v for i, v in enumerate(arr_sorted))
+            return (2.0*cum)/(n*s) - (n+1)/n
+
+        imbalance = _gini(flat)
+
+        # --- Per-cell interest ingredients (coarse grid) ---
+        # 1) scarcity
+        scarcity_cell = [[1.0/(1.0 + counts[i][j]) for j in range(Ny)] for i in range(Nx)]
+        # 2) deficit vs median of NONZERO cells
+        med_nz = max((sorted(nonzero)[len(nonzero)//2] if nonzero else 0), 1)
+        deficit_cell = [[max(0.0, (med_nz - counts[i][j]) / med_nz) for j in range(Ny)] for i in range(Nx)]
+        # 3) coarse frontier: fraction of empty neighbors in 3×3 ring
+        empty = {(i,j) for i in range(Nx) for j in range(Ny) if counts[i][j] == 0}
+        def frontier_frac(ix, iy):
+            tot = emp = 0
+            for dx in (-1,0,1):
+                for dy in (-1,0,1):
+                    if dx == 0 and dy == 0: continue
+                    x2, y2 = ix+dx, iy+dy
+                    if 0 <= x2 < Nx and 0 <= y2 < Ny:
+                        tot += 1
+                        if (x2, y2) in empty: emp += 1
+            return (emp/tot) if tot > 0 else 0.0
+        frontier_cell = [[frontier_frac(i, j) for j in range(Ny)] for i in range(Nx)]
+        # --- Border awareness & interiorness ---
+        cx, cy = float(np.mean(xs)), float(np.mean(ys))
+        map_rad = 0.5 * math.hypot(max_x - min_x, max_y - min_y)
+
+        def border_ring(ix, iy, Nx, Ny):
+            # 1.0 for outer ring, 0.5 for second ring, 0 inside
+            bx = 1.0 if ix in (0, Nx-1) else (0.5 if ix in (1, Nx-2) else 0.0)
+            by = 1.0 if iy in (0, Ny-1) else (0.5 if iy in (1, Ny-2) else 0.0)
+            return max(bx, by)
+
+        beta_border = float(getattr(self, "nav_w_border_dampen", 0.35 if fill_frac >= 0.75 else 0.20))
+        gamma_interior = float(getattr(self, "nav_w_interior_pull", 0.25 if fill_frac >= 0.75 else 0.10))
+
+        # --- Graph-degree frontier & kNN isolation (per-node) ---
+        id_set = {nid for nid, _, _ in nodes}
+        deg = {nid: len([v for v in graph.get(nid, ()) if v in id_set]) for nid,_,_ in nodes}
+        deg_max = max(deg.values()) if deg else 1
+        # normalize so leaves (deg=0/1) ≈1.0, hubs ≈0.0
+        def deg_frontier_of(nid):
+            return 1.0 - min(1.0, deg[nid] / max(1.0, deg_max))
+
+        pts = {nid: (x, y) for nid, x, y in nodes}
+        iso_k = int(getattr(self, "nav_iso_k", 2))
+        iso_vals = {}
+        for nid, (xi, yi) in pts.items():
+            dists = [math.hypot(xi - xj, yi - yj)
+                    for mj, (xj, yj) in pts.items() if mj != nid]
+            dists.sort()
+            if len(dists) == 0:
+                iso_vals[nid] = 0.0
+            else:
+                m = np.mean(dists[:min(iso_k, len(dists))])
+                iso_vals[nid] = m
+        iso_med = float(np.median(list(iso_vals.values()) or [0.0])) or 1.0
+        def iso_norm_of(nid):
+            # >1 ⇒ very isolated; clip to [0,1] against median for robustness
+            return float(np.clip(iso_vals[nid] / max(iso_med, 1e-6), 0.0, 1.0))
+
+        # --- Interest mix (tilt weights in endgame) ---
+        if fill_frac >= float(getattr(self, "nav_endgame_fill_frac", 0.75)):
+            a_def, a_scar, a_front = 0.25, 0.25, 0.50  # push to frontier late
+            b_deg  = float(getattr(self, "nav_w_deg_frontier", 0.25))
+            b_iso  = float(getattr(self, "nav_w_iso",          0.25))
+        else:
+            a_def, a_scar, a_front = 0.50, 0.35, 0.15
+            b_deg  = float(getattr(self, "nav_w_deg_frontier", 0.10))
+            b_iso  = float(getattr(self, "nav_w_iso",          0.10))
+
+        # --- BFS (still needed for ties / early stage) ---
+        dists = self._pcfg_bfs_all_dists(graph, start_id)
+
+        # --- Base weights ---
+        w_interest = float(getattr(self, "nav_goal_w_interest", 1.5))
+        w_dist     = float(getattr(self, "nav_goal_w_dist",     0.35))
+        w_visit    = float(getattr(self, "nav_goal_w_visit",    0.65))
+
+        # distance scaling (you want hard kill late, keep it)
+        a_fill = float(getattr(self, "nav_goal_dist_decay_fill", 1.0))
+        a_imb  = float(getattr(self, "nav_goal_dist_decay_imb",  0.6))
+        floor  = float(getattr(self, "nav_goal_w_dist_floor",    0.05))
+        s = 1.0 - (a_fill * fill_frac + a_imb * imbalance)
+        s = max(floor / max(w_dist, 1e-6), min(1.0, s))
+        if fill_frac >= float(getattr(self, "nav_endgame_fill_frac", 0.75)) and \
+        bool(getattr(self, "nav_endgame_kill_dist", True)):
+            s = 0.0
+        w_dist_eff = w_dist * max(0.0, s)
+
+        # visit lookup
+        id2exp = {int(e.id): e for e in exps}
+
+        # crowding (percentiles) on the coarse grid
+        q50 = float(np.quantile(flat, 0.50)) if flat else 0.0
+        q90 = float(np.quantile(flat, 0.90)) if flat else 1.0
+        den = max(q90 - q50, 1.0)
+        w_crowd = float(getattr(self, "nav_goal_w_crowd", 0.35))
+        if fill_frac >= 0.75:
+            w_crowd = float(getattr(self, "nav_goal_w_crowd_endgame", 0.6))
+
+        # --- Score candidates ---
+        hard_limit = int(getattr(self, "goal_visit_hard_limit", 2))
+        scored = []
+        for nid, x, y in nodes:
+            if nid == start_id:        continue
+            if nid not in dists:       continue
+
+            # respect hard visit cut if you truly want it
+            v_seen = int(getattr(self, "_visit_counts", {}).get(nid, 0))
+            v_exp  = int(getattr(id2exp.get(nid, object()), "visit_count", 0))
+            v = max(v_seen, v_exp)
+            if v >= hard_limit:        continue
+
+            ix, iy = cell_of(x, y)
+
+            # cell-level interest
+            base_cell_interest = (
+                a_def   * deficit_cell[ix][iy] +
+                a_scar  * scarcity_cell[ix][iy] +
+                a_front * frontier_cell[ix][iy]
+            )
+
+            # node-level augmentations
+            deg_front = deg_frontier_of(nid)    # [0..1], high = leaf/bridge
+            iso_norm  = iso_norm_of(nid)        # [0..1], high = isolated in (x,y)
+            # Border dampening only when the coarse cell is NOT a frontier (we don't want to mute real frontiers)
+            ring = border_ring(ix, iy, Nx, Ny)
+            front_local = frontier_cell[ix][iy]  # ∈ [0,1]
+            border_dampen = beta_border * ring * (1.0 - front_local)
+
+            # Interior pull (only a gentle tilt; 1 at center → more weight to interior isolation)
+            r_norm = math.hypot(x - cx, y - cy) / max(map_rad, 1e-6)      # 0 center … 1 hull
+            interiorness = float(np.clip(1.0 - r_norm, 0.0, 1.0))
+
+            # Apply to node-level signals
+            deg_front_eff = deg_front * (1.0 - border_dampen)
+            
+            iso_eff = iso_norm * (1.0 - border_dampen) * (1.0 + gamma_interior * interiorness)
+
+            # Combine with cell interest
+            s_interest = (1.0 - (b_deg + b_iso)) * base_cell_interest + b_deg * deg_front_eff + b_iso * iso_eff
+            s_interest = float(np.clip(s_interest, 0.0, 1.0))
+
+            # crowd penalty (percentile-normalized)
+            c = counts[ix][iy]
+            crowd_norm = 0.0 if c <= q50 else (c - q50) / den
+
+            hops = float(dists[nid])
+            s_visit = math.log1p(float(v))
+            if fill_frac >= 0.75:
+                w_crowd = float(getattr(self, "nav_goal_w_crowd_endgame", 0.7))  # was 0.6
+
+            score = (w_interest * s_interest) - (w_dist_eff * hops) - (w_visit * s_visit) - (w_crowd * crowd_norm)
+
+            # tie-break: prefer lower crowd, then fewer hops (even if distance is killed, small bias),
+            # then higher id for determinism
+            if debug:
+                def dbg_row(nid, sc):
+                    print(f" nid={nid:>3}  score={sc:.3f}  s_int={s_interest:.3f}  "
+                        f"degF={deg_front_eff:.2f} iso={iso_eff:.2f}  "
+                        f"crowd={crowd_norm:.2f}  hops={hops:.0f}  visits={v}")
+            scored.append((score, -crowd_norm, -hops, -nid, nid))
+
+        if not scored:
+            if debug: print("[PCFG SCORE] no scored candidates; returning None")
+            return None
+
+        scored.sort(reverse=True)
+        best = scored[0][-1]
+        if debug:
+            top5 = [(nid, f"{sc:.3f}", f"crowd={-cr:.2f}", f"hops={-hp}") for (sc, cr, hp, _nidneg, nid) in scored[:5]]
+            print(f"[PCFG SCORE] fill_frac={fill_frac:.2f}  imbalance(Gini)={imbalance:.2f}  w_dist_eff={w_dist_eff:.3f}")
+            print(f"[PCFG SCORE] picked goal={best}  top5={top5}")
+        return best
+
+
+
 
     def _pcfg_select_goal_node_via_zones(
         self,
         exps,
         start_id: int,
-        graph: dict[int, list[int]],
-        debug: bool = False
+        graph: dict[int, list[int]] | None,
+        debug: bool = False,
     ) -> int | None:
         """
-        Choose a GOAL node by:
-        1) Form bounding box of all nodes.
-        2) Partition into a 3x3 grid of zones.
-        3) Find the zone(s) with the fewest nodes (sparsest).
-        4) Choose the node closest to the centroid of the sparsest zone
-            (deterministic tie-breaker by node id).
-        Fallbacks:
-        - If too few nodes (<4) or degenerate bbox, return None.
+        Frontier-biased goal selection:
+        1) 4×4 (or dynamic) partition of node bbox.
+        2) Prefer EMPTY cells; else bottom-quartile sparse cells.
+        3) Score candidate cells by emptiness, distance from start, and corner bias.
+        4) From top cell(s), pick nodes that are (a) near the cell centroid,
+            (b) locally sparse (big kNN radius), (c) outward (near bbox edge),
+            (d) far in BFS hops (if graph provided).
+        Returns best node id or None.
         """
-        nodes = [(e.id, float(getattr(e, "x_m", getattr(e, "x", 0.0))), float(getattr(e, "y_m", getattr(e, "y", 0.0)))) for e in exps]
-        if len(nodes) < 4:
-            
+
+        if not exps or len(exps) < 4:
             return None
 
-        xs = [x for _, x, _ in nodes]
-        ys = [y for _, _, y in nodes]
+        # Pull nodes as (id, x, y, kind)
+        def _xy(e):
+            return float(getattr(e, "x_m", getattr(e, "x", 0.0))), float(getattr(e, "y_m", getattr(e, "y", 0.0)))
+        nodes = [(int(e.id), *_xy(e), str(getattr(e, "place_kind", ""))) for e in exps]
+
+        # Start pose
+        try:
+            sx, sy, _ = getattr(self.memory_graph.experience_map, "get_pose")(start_id)
+        except Exception:
+            # Fallback: coordinates of the start node
+            sx, sy = next(((x, y) for nid, x, y, _ in nodes if nid == start_id), (nodes[0][1], nodes[0][2]))
+
+        xs = [x for _, x, _, _ in nodes]
+        ys = [y for _, _, y, _ in nodes]
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
-
         if not (math.isfinite(min_x) and math.isfinite(max_x) and math.isfinite(min_y) and math.isfinite(max_y)):
             return None
         if abs(max_x - min_x) < 1e-6 or abs(max_y - min_y) < 1e-6:
             return None
 
-        # 3x3 grid partition
-        Nx = 4
-        Ny = 4
+        # Grid size: keep 4×4 by default; you can make it dynamic if you like.
+        Nx = Ny = 4
         step_x = (max_x - min_x) / Nx
         step_y = (max_y - min_y) / Ny
 
-        # Assign nodes to cells
+        def cell_of(x, y):
+            ix = min(Nx - 1, int((x - min_x) / max(step_x, 1e-9)))
+            iy = min(Ny - 1, int((y - min_y) / max(step_y, 1e-9)))
+            return ix, iy
+
         cell_counts = [[0 for _ in range(Ny)] for _ in range(Nx)]
-        for _, x, y in nodes:
-            ix = min(Nx-1, int((x - min_x) / step_x))
-            iy = min(Ny-1, int((y - min_y) / step_y))
+        for _, x, y, _ in nodes:
+            ix, iy = cell_of(x, y)
             cell_counts[ix][iy] += 1
 
-        # Find sparsest cells (min count)
-        min_count = min(c for col in cell_counts for c in col)
-        sparsest = [(ix, iy) for ix in range(Nx) for iy in range(Ny) if cell_counts[ix][iy] == min_count]
+        # Empty cells first, else bottom-quartile sparse
+        all_cells = [(ix, iy) for ix in range(Nx) for iy in range(Ny)]
+        empties = [(ix, iy) for (ix, iy) in all_cells if cell_counts[ix][iy] == 0]
+        counts_flat = sorted(c for col in cell_counts for c in col)
+        q1 = counts_flat[len(counts_flat) // 4] if counts_flat else 0
+        sparse = [(ix, iy) for (ix, iy) in all_cells if 0 < cell_counts[ix][iy] <= q1]
+        cand_cells = empties if len(empties) > 0 else sparse
+        if not cand_cells:
+            # Degenerate fallback: farthest node by BFS then Euclid
+            if graph:
+                dists = self._pcfg_bfs_all_dists(graph, start_id) or {}
+                if dists:
+                    return max(dists.items(), key=lambda kv: (kv[1], kv[0]))[0]
+            # Pure Euclid fallback
+            return max(nodes, key=lambda t: (math.hypot(t[1] - sx, t[2] - sy), -t[0]))[0]
 
-        # Prefer sparsest cell that is farthest from the *start* node position (centroid distance)
-        # Get start coordinates
-        sx, sy, _ = getattr(self.memory_graph.experience_map, "get_pose")(start_id)
-        def cell_centroid(ix, iy):
-            cx = min_x + (ix + 0.5) * step_x
-            cy = min_y + (iy + 0.5) * step_y
-            return cx, cy
+        def centroid(ix, iy):
+            return min_x + (ix + 0.5) * step_x, min_y + (iy + 0.5) * step_y
 
-        sparsest_sorted = sorted(
-            sparsest,
-            key=lambda ij: (
-                # choose the cell whose centroid is *farthest* from start (to expand frontier)
-                -math.hypot(cell_centroid(*ij)[0]-sx, cell_centroid(*ij)[1]-sy),
-                ij[0], ij[1]
-            )
-        )
-        best_cell = sparsest_sorted[0] if sparsest_sorted else None
-        if best_cell is None:
-            return None
-        cx, cy = cell_centroid(*best_cell)
+        # Cell scoring: emptiness (1.0 for empty), far from start, corner/outside bias
+        max_count = max([max(col) for col in cell_counts]) or 1
+        # normalize distance range
+        dists_centroids = []
+        for c in cand_cells:
+            cx, cy = centroid(*c)
+            dists_centroids.append(math.hypot(cx - sx, cy - sy))
+        dmin = min(dists_centroids) if dists_centroids else 0.0
+        dmax = max(dists_centroids) if dists_centroids else 1.0
 
-        # Choose actual node: nearest to that centroid
+        def cell_score(ix, iy):
+            cx, cy = centroid(ix, iy)
+            dist = math.hypot(cx - sx, cy - sy)
+            far = 0.0 if dmax <= dmin else (dist - dmin) / (dmax - dmin)
+            empty_bonus = 1.0 if cell_counts[ix][iy] == 0 else 1.0 - (cell_counts[ix][iy] / max_count)
+            corner_bonus = 1.0 if (ix in (0, Nx - 1) and iy in (0, Ny - 1)) else (0.5 if (ix in (0, Nx - 1) or iy in (0, Ny - 1)) else 0.0)
+            # weights: tweakable
+            return 0.5 * empty_bonus + 0.3 * far + 0.2 * corner_bonus
+
+        cand_cells.sort(key=lambda ij: cell_score(*ij), reverse=True)
+        best_cell = cand_cells[0]
+        cx, cy = centroid(*best_cell)
+        radius = 0.75 * max(step_x, step_y)  # consider nodes near the empty/sparse cell
+
+        # Precompute kNN distances (k=3) for local sparsity
+        coords = [(nid, x, y) for (nid, x, y, _) in nodes]
+        def kNN_radius(nid, x, y, k=3):
+            ds = []
+            for (mid, mx, my) in coords:
+                if mid == nid: 
+                    continue
+                ds.append((mx - x) ** 2 + (my - y) ** 2)
+            if len(ds) == 0:
+                return 0.0
+            ds.sort()
+            k = min(k, len(ds))
+            # mean of k nearest as a "sparsity" proxy
+            return sum(ds[:k]) / k
+
+        # Optional BFS (graph can be None)
+        bfs_d = {}
+        if graph:
+            try:
+                bfs_d = self._pcfg_bfs_all_dists(graph, start_id) or {}
+            except Exception:
+                bfs_d = {}
+        max_bfs = max(bfs_d.values()) if bfs_d else 1
+
+        # Candidate nodes: those within radius of the target cell centroid (or top-10 nearest)
+        cands = []
+        near = []
+        for nid, x, y, kind in nodes:
+            d2c = (x - cx) ** 2 + (y - cy) ** 2
+            near.append((d2c, nid, x, y, kind))
+        near.sort()
+        for tup in near:
+            d2c, nid, x, y, kind = tup
+            if len(cands) < 10 or math.sqrt(d2c) <= radius:
+                cands.append((nid, x, y, kind, d2c))
+            else:
+                break
+        if not cands:
+            # Shouldn't happen, but be safe
+            cands = [(nid, x, y, kind, (x - cx) ** 2 + (y - cy) ** 2) for (nid, x, y, kind) in nodes]
+
+        # Score nodes: outwardness + local sparsity + BFS hops + closeness to target cell
+        def outwardness(x, y):
+            # smaller edge distance => more outward
+            edge_d = min(x - min_x, max_x - x, y - min_y, max_y - y)
+            rng = max(max_x - min_x, max_y - min_y) or 1.0
+            return 1.0 - max(0.0, min(1.0, edge_d / (0.5 * rng)))  # in [0,1], 1=more outward
+
         best_node = None
-        best_d = float("inf")
-        for nid, x, y in nodes:
-            d = (x - cx)**2 + (y - cy)**2
-            if d < best_d or (d == best_d and (best_node is None or nid < best_node)):
-                best_d = d
+        best_score = -1e9
+        for nid, x, y, kind, d2c in cands:
+            s_out = outwardness(x, y)
+            s_knn = kNN_radius(nid, x, y, k=3)  # bigger = sparser
+            s_knn_norm = s_knn
+            s_bfs = (bfs_d.get(nid, 0) / max_bfs) if bfs_d else 0.0
+            s_close = 1.0 / (1.0 + d2c)  # stay near the empty/sparse cell
+
+            # weights (tune to taste) — DOOR term removed
+            score = (0.30 * s_out) + (0.25 * s_knn_norm) + (0.15 * s_bfs) + (0.10 * s_close)
+
+            if nid == start_id and len(nodes) > 1:
+                score -= 1.0
+
+            if score > best_score or (score == best_score and (best_node is None or nid < best_node)):
+                best_score = score
                 best_node = nid
 
-        # Make sure goal is not the current start unless trivial map; if it is, pick farthest node instead
-        if best_node == start_id and len(nodes) > 1:
-            dists = self._pcfg_bfs_all_dists(graph, start_id)
-            if dists:
-                best_node = max(dists.items(), key=lambda kv: (kv[1], kv[0]))[0]
-
-        # Finally, avoid unreachable pick (caller still double-checks)
+        if best_node is None and bfs_d:
+            
+            best_node = max(bfs_d.items(), key=lambda kv: (kv[1], kv[0]))[0]
+            print("[NODE SELECTION]fallback",best_node)
         return best_node
+
+    def _flush_pending_node_media(self):
+        try:
+            pend = getattr(self, "_pending_node_media", None)
+            if not pend:
+                return
+            for nid, snap, enhanced in pend:
+                try:
+                    self.plan_export.node_created(
+                        node_id=int(nid),
+                        snapshot_img=snap if snap is not None else None,
+                        enhanced_pred_imgs=enhanced if (enhanced and len(enhanced) > 0) else None,
+                    )
+                except Exception as e:
+                    try:
+                        self.plan_export.log_event("node_media_flush_error", node_id=int(nid), err=str(e))
+                    except Exception:
+                        pass
+            self._pending_node_media = []
+        except Exception:
+            pass
     def generate_plan_with_pcfg(self, grammar: PCFG, debug: bool = True) -> list[tuple[int, int]]:
         """
-        Probabilistic sampler that respects the PCFG production weights.
-
-        1. Recursively expand from start symbol 'NAVPLAN'
-        2. Collect terminal tokens ('STEP_u_v')
-        3. Tokenise into edge tuples, reset indices and progress counters
+        Deterministic: choose the SHORTEST PATH_* production (fewest STEP edges) and tokenize it.
+        This respects the grammar structure you build:
+        NAVPLAN -> PATH_goal [1.0]
+        PATH_goal -> STEP_u_v STEP_v_w ...  (multiple alternatives)
+        We ignore any 'STEP_u_u' warmup/self-edge when counting cost.
         """
+        from nltk.grammar import Nonterminal
 
-        agenda = [Nonterminal("NAVPLAN")]
-        sentence: list[str] = []
-
-        if debug:
-            print("\n[DBG] Starting PCFG expansion from 'NAVPLAN'")
-            print(f"[DBG] Initial agenda: {agenda}")
-
-        # --- 1. stochastic top-down expansion -------------
-        while agenda:
-            sym = agenda.pop()
-
-            if debug:
-                print(f"[DBG] Popped symbol: {sym}")
-
+        def _is_step_sym(sym) -> bool:
             if isinstance(sym, Nonterminal):
-                prods = grammar.productions(lhs=sym)
-                if not prods:
-                    raise ValueError(f"No production for {sym}")
-                prod = self._weighted_prod_choice(prods)
-                rhs = list(reversed(prod.rhs()))  # push in reverse for L-to-R
-                agenda.extend(rhs)
+                return str(sym.symbol()).startswith("STEP_")
+            return isinstance(sym, str) and sym.startswith("STEP_")
 
-                if debug:
-                    print(f"[DBG] Expanded {sym} using: {prod}")
-                    print(f"[DBG] New agenda: {agenda}")
-            else:
-                sentence.append(str(sym))
-                if debug:
-                    print(f"[DBG] Added terminal: {sym}")
+        def _tok_of(sym) -> str | None:
+            if isinstance(sym, Nonterminal):
+                return str(sym.symbol()) if str(sym.symbol()).startswith("STEP_") else None
+            return sym if isinstance(sym, str) and sym.startswith("STEP_") else None
 
-            # safety guard
-            if len(sentence) > 200:
-                raise RuntimeError("PCFG expansion runaway (>200 terminals)")
+        def _edge_of(tok: str) -> tuple[int, int] | None:
+            # tok: "STEP_u_v"
+            try:
+                _, a, b = tok.split("_")
+                return int(a), int(b)
+            except Exception:
+                return None
 
-        plan_str = " ".join(sentence)
+        def _path_cost(prod) -> int:
+            # Count only real edges (ignore STEP_u_u warmups)
+            cost = 0
+            for sym in prod.rhs():
+                tok = _tok_of(sym)
+                if tok:
+                    e = _edge_of(tok)
+                    if e is not None and e[0] != e[1]:
+                        cost += 1
+            return cost
+
+        # --- 1) Find the PATH_* nonterminal from NAVPLAN (should be exactly one) ---
+        nav_nt = Nonterminal("NAVPLAN")
+        nav_prods = grammar.productions(lhs=nav_nt)
+        if not nav_prods:
+            raise ValueError("PCFG has no NAVPLAN productions.")
+
+        # Pick the highest-prob (your builder makes this 1.0 anyway)
+        nav_best = max(nav_prods, key=lambda p: p.prob())
+
+        # Extract PATH_* symbol on RHS
+        path_nts = [sym for sym in nav_best.rhs()
+                    if isinstance(sym, Nonterminal) and str(sym.symbol()).startswith("PATH_")]
+        if not path_nts:
+            # Fallback: look for any PATH_* LHS in the whole grammar
+            all_path_lhss = [p.lhs() for p in grammar.productions()
+                            if str(p.lhs()).startswith("PATH_")]
+            if not all_path_lhss:
+                raise ValueError("PCFG has no PATH_* nonterminals.")
+            path_nt = all_path_lhss[0]
+        else:
+            path_nt = path_nts[0]
+
+        # --- 2) Among PATH_goal alternatives, choose the shortest (fewest edges) ---
+        path_prods = grammar.productions(lhs=path_nt)
+        if not path_prods:
+            raise ValueError(f"No productions for {path_nt} in PCFG.")
+
+        # Tie-break by fewer total RHS symbols for determinism, then by textual rhs
+        best_prod = min(
+            path_prods,
+            key=lambda p: (_path_cost(p), len(p.rhs()), " ".join(str(s) for s in p.rhs()))
+        )
+
+        # --- 3) Tokenize the chosen RHS into [(u,v), ...] ---
+        edges: list[tuple[int, int]] = []
+        for sym in best_prod.rhs():
+            tok = _tok_of(sym)
+            if not tok:
+                continue
+            e = _edge_of(tok)
+            if e is None:
+                continue
+            u, v = e
+            if u == v:
+                # Ignore self-edge warmups in the executable token list
+                continue
+            edges.append((u, v))
+
         if debug:
-            print(f"[DBG] Final sentence: {plan_str}")
+            step_names = [f"STEP_{u}_{v}" for (u, v) in edges]
+            print(f"[PCFG FASTEST] chosen {path_nt} with {len(edges)} edges")
+            print(f"[PCFG FASTEST] steps: {' '.join(step_names)}")
 
-        # --- 2. tokenise STEP_u_v → (u,v) ----------------
-        self.full_plan_tokens = self._tokenize_plan(plan_str)
+        # --- 4) Bookkeeping identical to your previous function ---
+        self.full_plan_tokens = edges
+        # ── Exporter: begin run with full plan snapshot
+        try:
+            mg = self.memory_graph
+            graph = getattr(self, "graph_used_for_pcfg", {}) or {}
+            inferred = getattr(self, "_pcfg_inferred_pairs", [])
+            start_id = mg.get_current_exp_id() if hasattr(mg, "get_current_exp_id") else None
+            self.plan_export.begin(
+                mode=str(getattr(self, "current_mode", "NAVIGATE")),
+                mg=mg, graph=graph, inferred_pairs=inferred,
+                tokens=self.full_plan_tokens,
+                goal_id=getattr(self, "goal_node_id", None),
+                start_id=start_id,
+                mode_session_idx=int(getattr(self, "_mode_session_idx", 1)),  # ← NEW
+            )
+            # NEW: drain any early-captured media now that run_dir exists
+            self._flush_pending_node_media()
+
+        except Exception as _e:
+            if debug: print(f"[export] begin_run failed: {_e}")
+
         self.token_idx = self.prim_idx = 0
-        self._reset_token_prims() 
+        self._reset_token_prims()
         self.plan_progress = 0.0
 
-        if debug:
-            print(f"[DBG] Tokenized plan: {self.full_plan_tokens}")
-
-        # --- 3. store final target node ID ---------------
         if self.full_plan_tokens:
             _, self.target_node_id = self.full_plan_tokens[-1]
         else:
             self.target_node_id = None
 
         if debug:
-            print(f"[DBG] Target node ID: {self.target_node_id}")
+            print(f"[PCFG FASTEST] Target node ID: {self.target_node_id}")
 
         return self.full_plan_tokens
+
         
     def _tokenize_plan(self, full_plan: str) -> list[tuple[int, int]]:
         """Convert 'STEP_9_8 STEP_8_5 …' → [(9,8), (8,5), …]."""
@@ -855,287 +2441,310 @@ class NavigationSystem:
             if t.startswith('STEP_')
         ]
     
-    def _load_edge_primitives(self, wm, belief, debug: bool = False):
-        """
-        Ensure `self.token_prims` is (re)filled for the *current* edge
-        identified by `self.token_idx`.
-
-        Policy:
-        • If plan done → clear and return.
-        • If primitives already queued → leave them (do NOT reload).
-        • If EMPTY:
-            A) If already at *target* v → LEAVE EMPTY and return
-                (caller will skip the edge — avoids start==goal A*).
-            B) If at *source* u → fetch edge path via get_primitives(u,v).
-            C) Else → inject a detour A* from real pose to v.
-        """
-        import torch
-
-        # 0) Plan finished?
-        if self.token_idx >= len(self.full_plan_tokens):
-            self.token_prims = []
-            return
-
-        # 1) Already have something queued? leave it alone.
-        seq = getattr(self, "token_prims", [])
-        if seq is not None:
-            if torch.is_tensor(seq):
-                if seq.numel() > 0:
-                    return
-            else:
-                if len(seq) > 0:
-                    return
-
-        # 2) We only get here if token_prims is EMPTY
-        u, v = self.full_plan_tokens[self.token_idx]
-        if debug:
-            print(f"[_load_edge_prims] need prims for edge {u}->{v}  at_token={self.token_idx}")
-
-        # === SHORT-CIRCUIT: already at the TARGET node v? ===
-        # Leave token_prims empty and let step_plan() advance the edge.
-        if self._at_node_exact(v):
-            if debug:
-                print(f"[_load_edge_prims] already at target v={v} → leave empty (caller will skip)")
-            self.token_prims = []
-            return
-
-        # A) Are we physically at the *source* node u?
-        if self._at_node_exact(u):
-            if debug: print(f"[_load_edge_prims] docked at u={u} → get_primitives(u,v)")
-            prims = self.get_primitives(u, v, wm, belief)
-            # normalize; allow empty
-            if torch.is_tensor(prims):
-                self.token_prims = [] if prims.numel() == 0 else prims
-                if debug and prims.numel() == 0:
-                    print("[_load_edge_prims] get_primitives returned EMPTY tensor")
-            else:
-                self.token_prims = prims if prims else []
-                if debug and not prims:
-                    print("[_load_edge_prims] get_primitives returned EMPTY list")
-            return
-
-        # B) Not at source node → inject detour from *real pose* to target v.
-        pose = self.get_current_pose()
-        if pose is None:
-            if debug: print("[_load_edge_prims] no current pose! cannot detour → empty")
-            self.token_prims = []
-            return
-
-        sx, sy, sd = pose
-        gx, gy, gd = self.memory_graph.experience_map.get_pose(v)
-
-        # Extra guard: if start==goal (pose drift/timing), leave empty and let caller skip.
-        if int(round(sx)) == int(round(gx)) and int(round(sy)) == int(round(gy)) and int(round(sd)) == int(round(gd)):
-            if debug:
-                print(f"[_load_edge_prims] start==goal ({sx},{sy},{sd}) → leave empty (caller will skip)")
-            self.token_prims = []
-            return
-
-        start = State(int(round(sx)), int(round(sy)), int(sd))
-        goal  = State(int(round(gx)), int(round(gy)), int(gd))
-        if debug: print(f"[_load_edge_prims] computing detour A* start={start} goal={goal}")
-
-        detour = self._astar_to_node(wm, belief, start, v, debug=debug)
-        if detour is None:
-            detour = []
-        empty = (torch.is_tensor(detour) and detour.numel() == 0) or (not torch.is_tensor(detour) and len(detour) == 0)
-
-        if empty:
-            if debug: print("[_load_edge_prims] detour A* FAILED → empty")
-            self.token_prims = []
-        else:
-            if debug:
-                ln = detour.shape[0] if torch.is_tensor(detour) else len(detour)
-                print(f"[_load_edge_prims] detour injected, len={ln}")
-            self.token_prims = detour
 
 
+    def _finish_plan(self, debug=False):
+        # mark finished in a way universal_navigation can reliably detect
+        print("we are finishing the plan")
+        self.plan_progress = 1.0
+        self.navigation_flags['plan_complete'] = True
+
+        # post-finish hold: give outer controller a couple of ticks to consume the flag
+        self._post_finish_hold = int(getattr(self, "plan_finished_hold_ticks", 2))
+
+        # drop volatile low-level state
+        self._reset_token_prims()
+        self.prim_idx = 0
+        self._evade_injected = False
+        # clear per-edge/partial bookkeeping so a future plan starts clean
+        self._partial_attempts.clear()
+        self._edge_key = None
+        self._edge_evades = 0
+        # ---- NEW: arm once when a TASK_SOLVING run finishes ----
+        try:
+            if str(getattr(self, "current_mode", "")) == "TASK_SOLVING":
+                # first completion only; change to > =0 if you want to arm every time
+                if (not self.task_mutation_armed) and (int(getattr(self, "task_runs_completed", 0)) == 0):
+                    self.task_runs_completed = 1
+                    self.task_mutation_armed = True
+                    # mirror to flags in case you prefer polling flags
+                    self.navigation_flags["task_mutation_armed"] = True
+                    if debug: print("[TASK] armed task_mutation (first completion)")
+        except Exception:
+            pass
+
+    def consume_task_mutation_armed(self) -> bool:
+        armed = bool(self.task_mutation_armed or self.navigation_flags.get("task_mutation_armed", False))
+        if armed:
+            self.task_mutation_armed = False
+            self.navigation_flags.pop("task_mutation_armed", None)
+        return armed
+    def _plan_finished_now(self) -> bool:
+        """True if this tick the plan is finished and we should NOT replan or emit fallback turns."""
+        if getattr(self, "_phantom_active", False):
+            return False
+        if self.navigation_flags.get("plan_complete", False):
+            return True
+        try:
+            return float(self.plan_progress) >= 1.0
+        except Exception:
+            return False
     def step_plan(self, wm, belief, debug: bool = True):
         """
-        Emit *one* primitive towards executing the current plan.
-
-        Cases:
-        1) Normal edge primitives (we are at u; cached link path known).
-        2) Detour primitives (we injected an A* seq to v).
-        3) If empty/unreachable, try forced detour; else mark plan_progress=-1.0.
-        Returns: ([primitive_payload], 1) or ([], 0) on failure/done.
+        Realtime executor: compute A* fresh EACH STEP and emit exactly ONE primitive.
         """
         import torch
+        
+        # ── Exporter: detect node arrival when token_idx advanced since last call
+        try:
+            if int(getattr(self, "token_idx", 0)) > int(getattr(self, "_export_last_token_idx", -1)):
+                k = int(self.token_idx)
+                if k > 0 and k <= len(getattr(self, "full_plan_tokens", [])):
+                    _, v = self.full_plan_tokens[k - 1]
+                    pose = self.get_current_pose() if callable(getattr(self, "get_current_pose", None)) else None
+                    get_fov = getattr(self, "get_fov_image", None)  # user sets: nav_system.get_fov_image = lambda: <H×W×3 uint8>
+                    self.plan_export.node_reached(v, pose, get_fov)
+            self._export_last_token_idx = int(self.token_idx)
+        except Exception as _e:
+            if debug: print(f"[export] node_reached hook err: {_e}")
 
-        # --- helpers that are SAFE for tensors or lists -----------------------
-        def _plen(seq):
-            if seq is None: return 0
-            if torch.is_tensor(seq): return int(seq.shape[0])
-            try: return len(seq)
-            except Exception: return 0
+        # ---------- helpers ----------
+        def _is_empty(seq) -> bool:
+            try:
+                if seq is None: return True
+                if torch.is_tensor(seq): return int(seq.numel()) == 0
+                return len(seq) == 0
+            except Exception:
+                return True
 
-        def _pempty(seq):
-            if seq is None: return True
-            if torch.is_tensor(seq): return seq.numel() == 0
-            try: return len(seq) == 0
-            except Exception: return True
+        def _first_prim(path):
+            """Return (onehot:list[3], label:str) for the FIRST primitive in `path`."""
+            if _is_empty(path):
+                return None, None
+            step0 = path[0] if not torch.is_tensor(path) else (path[0] if path.ndim >= 1 else None)
+            if step0 is None:
+                return None, None
 
-        # ----------------------------------------------------------------------
-        # 0) no plan or finished?
-        # ----------------------------------------------------------------------
-        if self.token_idx >= len(self.full_plan_tokens):
-            if debug: print("[step_plan] plan complete or empty")
-            self.plan_progress = 1.1 if self.full_plan_tokens else -1.0
-            self.navigation_flags['plan_complete'] = True 
-            return [], 0
+            if torch.is_tensor(step0):
+                v = step0.reshape(-1)
+                if v.numel() != 3: return None, None
+                idx = int(v.argmax().item())
+                return v.cpu().tolist(), ("forward", "right", "left")[idx]
 
-        # ----------------------------------------------------------------------
-        # 1) ensure we have primitives for *current* edge
-        # ----------------------------------------------------------------------
-        self._load_edge_primitives(wm, belief, debug=debug)
+            if isinstance(step0, (list, tuple)) and len(step0) == 3:
+                try:
+                    import numpy as _np
+                    idx = int(_np.argmax(step0))
+                except Exception:
+                    idx = max(range(3), key=lambda i: step0[i])
+                return list(step0), ("forward", "right", "left")[idx]
 
-        # If still empty → decide whether to skip edge (maybe we are at v) or detour/fail
-        while True:
-            if not _pempty(self.token_prims):
-                break  # good; we have something to emit
+            if isinstance(step0, str) and step0 in ("forward", "left", "right"):
+                return self.to_onehot_list(step0), step0
 
-            # nothing loaded: are we already at this edge’s *target* node?
-            u, v = self.full_plan_tokens[self.token_idx]
-            if self._at_node_exact(v):
-                if debug: print(f"[step_plan] already at target node {v} → advance edge")
-                self.token_idx += 1
-                if self.token_idx >= len(self.full_plan_tokens):
-                    self.plan_progress = 1.1
-                    self.navigation_flags['plan_complete'] = True 
-                    return [], 0
-                self._load_edge_primitives(wm, belief, debug=debug)
-                continue
+            return None, None
 
-            # not at v & still empty → try forced detour to v
-            if debug: print("[step_plan] empty but not at target → force detour inject")
+        def _plan_to_node(tgt_id):
             pose = self.get_current_pose()
             if pose is None:
-                if debug: print("[step_plan] no pose; cannot detour → fail")
-                self.plan_progress = -1.0
-                return [], 0
+                if debug: print("[step_plan_rt] no current pose")
+                return [], {"reached_goal": False, "best_dist": None}
+            start = self._pose_to_state(pose)
+            path, meta = self._astar_to_node_partial(
+                wm, belief, start, tgt_id, debug=debug,
+                max_partial_len=getattr(self, "max_partial_len", 8)
+            )
+            # normalize
+            if path is None or (torch.is_tensor(path) and path.numel() == 0) or (hasattr(path, "__len__") and len(path) == 0):
+                path = []
+            return path, (meta if isinstance(meta, dict) else {"reached_goal": True, "best_dist": None})
 
-            sx, sy, sd = pose
-            gx, gy, gd = self.memory_graph.experience_map.get_pose(v)
-            start = State(int(round(sx)), int(round(sy)), int(sd))
-            goal  = State(int(round(gx)), int(round(gy)), int(gd))
+        def _plan_to_pose(goal_pose_xyz):
+            pose = self.get_current_pose()
+            if pose is None:
+                if debug: print("[step_plan_rt] no current pose for phantom")
+                return [], {"reached_goal": False, "best_dist": None}
+            start = self._pose_to_state(pose)
+            path, meta = self._astar_to_pose_partial(
+                wm, belief, start, goal_pose_xyz, debug=debug,
+                max_partial_len=int(getattr(self, "phantom_partial_len", 6))
+            )
+            if path is None or (torch.is_tensor(path) and path.numel() == 0) or (hasattr(path, "__len__") and len(path) == 0):
+                path = []
+            return path, (meta if isinstance(meta, dict) else {"reached_goal": True, "best_dist": None})
 
-            # guard: if start==goal (timing/rounding), let the while-loop recheck skip
-            if (start.x, start.y, start.d) == (goal.x, goal.y, goal.d):
-                if debug: print("[step_plan] start==goal; recheck skip on next loop")
-                # leave token_prims empty and loop to the _at_node_exact(v) path
+        def _finish_done():
+            self._finish_plan(debug=debug)
+            return [], 0
+
+        # ---------- skip edges whose v we are already at ----------
+        while self.token_idx < len(self.full_plan_tokens):
+            u, v = self.full_plan_tokens[self.token_idx]
+            if self._at_node_exact(v):
+                if debug: print(f"[step_plan_rt] at target v={v} → record+advance")
+                self._record_node_visit(v)
+                self.token_idx += 1
                 continue
-
-            detour = self.planner.astar_prims(wm, belief, start, goal, verbose=debug)
-            if detour is None:
-                detour = []
-
-            if (torch.is_tensor(detour) and detour.numel() == 0) or \
-            (not torch.is_tensor(detour) and len(detour) == 0):
-                if debug: print("[step_plan] forced detour FAILED → abort plan")
-                self.plan_progress = -1.0
-                return [], 0
-
-            if debug:
-                ln = detour.shape[0] if torch.is_tensor(detour) else len(detour)
-                print(f"[step_plan] forced detour injected len={ln}")
-            self.token_prims = detour
-            self.prim_idx = 0
-            self._evade_injected = True
             break
 
-        # ----------------------------------------------------------------------
-        # 2) serve ONE primitive from token_prims
-        # ----------------------------------------------------------------------
-        raw_prim = self.token_prims[self.prim_idx]
-        self.prim_idx += 1
+        # ---------- phantom when no more edges ----------
+        if self.token_idx >= len(self.full_plan_tokens):
+            if self._phantom_goal_pose is not None:
+                path, meta = _plan_to_pose(self._phantom_goal_pose)
+                try:
+                    self.plan_export.log_event(
+                        "phantom_step",
+                        reached=bool(meta.get('reached_goal', True)),
+                        path_len=(int(path.shape[0]) if hasattr(path, "shape") else (len(path) if hasattr(path,"__len__") else 0))
+                    )
+                except Exception: pass
+                # >>> add: track phantom partial retries
+                if not meta.get('reached_goal', True):
+                    self._phantom_attempts = int(getattr(self, "_phantom_attempts", 0)) + 1
+                else:
+                    self._phantom_attempts = 0
+                
+                if self._phantom_attempts >= int(getattr(self, "phantom_retries_before_finish", 6)):
+                    if debug: print("[step_plan_rt] phantom retries exhausted → finish")
+                    try: self.plan_export.log_event("phantom_finish", reason="retries_exhausted")
+                    except Exception: pass
+                    self._phantom_goal_pose = None
+                    self._phantom_active = False
+                    self._phantom_attempts = 0
+                    return _finish_done()
+                if _is_empty(path):
+                    if debug: print("[step_plan_rt] phantom empty → finish")
+                    try: self.plan_export.log_event("phantom_finish", reason="empty_path")
+                    except Exception: pass
+                    self._phantom_goal_pose = None
+                    self._phantom_active = False
+                    return _finish_done()
 
-        # normalize to string + payload
-        if torch.is_tensor(raw_prim):
-            idx = int(raw_prim.argmax().item())
-            prim_str = ("forward", "right", "left")[idx]
-            prim_out = raw_prim.cpu().tolist()
-        elif isinstance(raw_prim, (list, tuple)):
+                prim_out, prim_lab = _first_prim(path)
+                if prim_out is None:
+                    if debug: print("[step_plan_rt] phantom decode fail → finish")
+                    self._phantom_goal_pose = None
+                    self._phantom_active = False
+                    return _finish_done()
+
+                # grading bookkeeping
+                self._phantom_active = True
+                self._issue_seq = int(getattr(self, "_issue_seq", 0)) + 1
+                hist = getattr(self, "_pose_hist", ())
+                self._issue_baseline_hist_len = len(hist)
+                cur = self.get_current_pose()
+                if cur is not None:
+                    self._issue_baseline_pose = (float(cur[0]), float(cur[1]), float(cur[2]))
+                    self._issue_baseline_valid = True
+                else:
+                    self._issue_baseline_valid = False
+                self._last_served_prim = prim_lab
+
+                # IMPORTANT: while phantom is active, treat plan as "not yet finished"
+                # so upstream won't prematurely short-circuit.
+                self.navigation_flags.pop('plan_complete', None)
+                self.plan_progress = min(0.99, self.token_idx / max(len(self.full_plan_tokens), 1))
+                try:
+                    get_fov = getattr(self, "get_fov_image", None)
+                    img = get_fov() if callable(get_fov) else None
+                    pose = self.get_current_pose() if callable(getattr(self, "get_current_pose", None)) else None
+                    self.plan_export.step_obs(edge=None, token_idx=int(getattr(self, "token_idx", -1)),
+                                              pose=pose, action=prim_lab, image=img)
+                except Exception as _e:
+                    if debug: print(f"[export] step_obs (phantom) err: {_e}")
+
+                return [prim_out], 1
+
+            if debug: print("[step_plan_rt] plan finished (no tokens, no phantom)")
+            return _finish_done()
+
+        # ---------- realtime A* to current edge target v ----------
+        u, v = self.full_plan_tokens[self.token_idx]
+        path, meta = _plan_to_node(v)
+
+        if _is_empty(path):
+            if debug: print(f"[step_plan_rt] EMPTY A* to v={v} → request replan")
             try:
-                import numpy as _np
-                idx = int(_np.argmax(raw_prim))
-                prim_str = ("forward", "right", "left")[idx]
-            except Exception:
-                prim_str = str(raw_prim)
-            prim_out = list(raw_prim)
-        elif isinstance(raw_prim, str):
-            prim_str = raw_prim
-            prim_out = raw_prim
-        else:
-            prim_str = str(raw_prim)
-            prim_out = raw_prim
-        # normalize to string + payload
-        if torch.is_tensor(raw_prim):
-            idx = int(raw_prim.argmax().item())
-            prim_str = ("forward", "right", "left")[idx]
-            prim_out = raw_prim.cpu().tolist()
-        elif isinstance(raw_prim, (list, tuple)):
+                key = (u, v)
+                cur_attempts = int(getattr(self, "_partial_attempts", {}).get(key, 0)) + 1
+                self.plan_export.log_event("astar_empty", edge=[int(u), int(v)], attempts=cur_attempts)
+            except Exception: pass
+            self.plan_progress = -1.0
+            key = (u, v)
+            self._partial_attempts[key] += 1
+
+            if self._partial_attempts[key] >= int(getattr(self, "partial_retries_before_replan", 8)):
+                self.navigation_flags['replan_request'] = True
+                self.navigation_flags['replan_bad_node'] = v
+                try:
+                    self.plan_export.log_event("replan_request_armed",
+                        reason="empty_path", edge=[int(u), int(v)],
+                        attempts=int(self._partial_attempts[key]))
+                except Exception: pass
+                self._partial_attempts[key] = 0
+            return [], 0
+
+        # partial accounting
+        key = (u, v)
+        if not meta.get('reached_goal', True):
+            self._partial_attempts[key] += 1
+            if debug: print(f"[step_plan_rt] partial towards v={v} attempts={self._partial_attempts[key]}")
             try:
-                import numpy as _np
-                idx = int(_np.argmax(raw_prim))
-                prim_str = ("forward", "right", "left")[idx]
-            except Exception:
-                prim_str = str(raw_prim)
-            prim_out = list(raw_prim)
-        elif isinstance(raw_prim, str):
-            prim_str = raw_prim
-            prim_out = raw_prim
+                self.plan_export.log_event("partial_attempt",
+                    edge=[int(u), int(v)],
+                    attempts=int(self._partial_attempts[key]),
+                    best_dist=float(meta.get('best_dist', -1.0)) if isinstance(meta, dict) else None
+                )
+            except Exception: pass
+            if self._partial_attempts[key] >= int(getattr(self, "partial_retries_before_replan", 3)):
+                if debug: print("[step_plan_rt] partial limit → request replan")
+                self.navigation_flags['replan_request'] = True
+                self.navigation_flags['replan_bad_node'] = v
+                try:
+                    self.plan_export.log_event("replan_request_armed",
+                        reason="partial_limit", edge=[int(u), int(v)],
+                        attempts=int(self._partial_attempts[key]))
+                except Exception: pass
+                
+                self._partial_attempts[key] = 0
         else:
-            prim_str = str(raw_prim)
-            prim_out = raw_prim
+            try: self._partial_attempts.pop(key, None)
+            except Exception: pass
 
-        self._last_served_prim = prim_str
+        prim_out, prim_lab = _first_prim(path)
+        
+        if prim_out is None:
+            if debug: print("[step_plan_rt] first-prim decode failed")
+            self.plan_progress = -1.0
+            return [], 0
 
-        # === ISSUE ACCOUNTING (so navigation_grade can see progress) ===
+        # grading bookkeeping
         self._issue_seq = int(getattr(self, "_issue_seq", 0)) + 1
-        # capture a baseline pose and the pose_hist length at issue time
         hist = getattr(self, "_pose_hist", ())
         self._issue_baseline_hist_len = len(hist)
-        if len(hist) > 0:
-            self._issue_baseline_pose = hist[-1]
+        cur = self.get_current_pose()
+        if cur is not None:
+            self._issue_baseline_pose = (float(cur[0]), float(cur[1]), float(cur[2]))
             self._issue_baseline_valid = True
         else:
-            # fallback if pose_hist empty: use current pose if available
-            cur = self.get_current_pose()
-            if cur is not None:
-                self._issue_baseline_pose = (float(cur[0]), float(cur[1]), float(cur[2]))
-                self._issue_baseline_valid = True
-            else:
-                self._issue_baseline_valid = False
-        self._last_served_prim = prim_str
+            self._issue_baseline_valid = False
+        self._last_served_prim = prim_lab
 
-        # ----------------------------------------------------------------------
-        # 3) finished this primitive sequence?
-        # ----------------------------------------------------------------------
-        if self.prim_idx >= _plen(self.token_prims):
-            if getattr(self, "_evade_injected", False):
-                if debug: print("[step_plan] detour drained; will re-evaluate edge next tick")
-                self.token_prims = []   # leave empty; skip/advance handled next call
-                self.prim_idx = 0
-                self._evade_injected = False
-            else:
-                # completed planned edge path
-                self.token_idx += 1
-                self.token_prims = []
-                self.prim_idx = 0
-
-        # ----------------------------------------------------------------------
-        # 4) recompute progress scalar (0..1; don't mark -1 here)
-        # ----------------------------------------------------------------------
-        done_edges = self.token_idx
-        fraction = (self.prim_idx / max(_plen(self.token_prims), 1)) if not _pempty(self.token_prims) else 0
-        self.plan_progress = (done_edges + fraction) / max(len(self.full_plan_tokens), 1)
-
-        if debug:
-            print(f"[step_plan] edge={done_edges}/{len(self.full_plan_tokens)} "
-                f"prim={self.prim_idx}/{_plen(self.token_prims)} "
-                f"progress={self.plan_progress:.3f}")
-
+        self.plan_progress = self.token_idx / max(len(self.full_plan_tokens), 1)
+        # ── EXPORT: per-step FoV for current edge (u→v)
+        try:
+            get_fov = getattr(self, "get_fov_image", None)
+            img = get_fov() if callable(get_fov) else None
+            pose = self.get_current_pose() if callable(getattr(self, "get_current_pose", None)) else None
+            ek = (u, v)
+            self._edge_key = ek  # keep around for detour-injected logs, if you use it elsewhere
+            self.plan_export.step_obs(edge=ek, token_idx=int(getattr(self, "token_idx", -1)),
+                                      pose=pose, action=prim_lab, image=img)
+        except Exception as _e:
+            if debug: print(f"[export] step_obs err: {_e}")
         return [prim_out], 1
+
+
 
 
 
@@ -1153,17 +2762,7 @@ class NavigationSystem:
     def progress_scalar(self) -> float:
         """-1 no plan, 0-1 executing, 1.1 finished."""
         return self.plan_progress
-    def task_solve_mission(self) -> str | None:
-        """
-        Return the mission string, e.g., "go to red room".
-        First tries an attribute you can set externally (self.task_mission),
-        then a generic fallback.
-        """
-        ms = getattr(self, "task_mission", None)
-        if isinstance(ms, str) and ms.strip():
-            return ms
-        # Fallback – you can replace this if your env feeds a mission string elsewhere
-        return "go to red room"
+    
     def _parse_color_from_mission(self, mission: str | None) -> str | None:
         """
         Extract a MiniGrid color token from free text. Returns UPPERCASE or None.
@@ -1211,7 +2810,27 @@ class NavigationSystem:
             if u2 == v:
                 return w
         return None
-
+    def _edge_hits_any_closed_portal(self, a, b) -> bool:
+        self._ensure_portal_store()
+        if not self._closed_portals:
+            return False
+        emap = self.memory_graph.experience_map
+        (_, _), (_, _), mid_ab, dir_ab = _edge_features(emap, a, b)
+        import math
+        # normalize once
+        d = math.hypot(dir_ab[0], dir_ab[1]) + 1e-9
+        dir_ab = (dir_ab[0]/d, dir_ab[1]/d)
+        for P in self._closed_portals:
+            ang = _angdiff(P["dir"], dir_ab)
+            if ang > float(getattr(self, "portal_angle_tol_deg", 25.0)):
+                continue
+            dx, dy = (mid_ab[0]-P["mid"][0], mid_ab[1]-P["mid"][1])
+            perp = (-P["dir"][1], P["dir"][0])
+            lon = abs(dx*P["dir"][0] + dy*P["dir"][1])
+            lat = abs(dx*perp[0]   + dy*perp[1])
+            if (lon <= P["half_len"]) and (lat <= P["half_w"]):
+                return True
+        return False
     def _heading_from_to(self, from_id: int, to_id: int | None) -> int | None:
         """
         Grid heading 0:E,1:N,2:W,3:S from pose deltas (x,y only).
@@ -1251,290 +2870,285 @@ class NavigationSystem:
             print(f"[_astar_to_node] v={v} start={start} goal={goal} (stored_gd={gd_stored}, next={self._next_hop_after(v)})")
         return self.planner.astar_prims(wm, belief, start, goal, verbose=debug)
 
-    def universal_navigation(self, submode: str, wm, belief) -> tuple[list[str], int]:
-        dbg = getattr(self, "debug_universal_navigation", False)
-        def _log(msg: str) -> None:
-            if dbg:
-                print(msg)
+    def _astar_to_node_partial(self, wm, belief, start: "State", v: int,
+                           debug: bool = False,
+                           max_partial_len: int | None = None):
+        if max_partial_len is None:
+            max_partial_len = getattr(self, "max_partial_len", 8)
 
-        cur_pose = self.get_current_pose()
-        _log(f"[universal_navigation] submode={submode} pose={cur_pose} "
-            f"tok={self.token_idx}/{len(self.full_plan_tokens)} "
-            f"prim_idx={self.prim_idx} prog={self.plan_progress:.3f}")
+        # Goal as State
+        gx, gy, gd = self.memory_graph.experience_map.get_pose(v)
+        goal_state = State(int(round(gx)), int(round(gy)), int(gd))
 
-        # detour bookkeeping
-        if not hasattr(self, "_evade_injected"):           self._evade_injected = False
-        if not hasattr(self, "_evade_ticks_since_recalc"): self._evade_ticks_since_recalc = 0
-        if not hasattr(self, "_evade_recalc_every"):
-            import random; self._evade_recalc_every = random.randint(3, 5)
+        try:
+            # Ask planner for partials without extra kwargs
+            ret = self.planner.astar_prims(
+                wm, belief, start, goal_state,
+                verbose=debug,
+                allow_partial=True
+            )
+            if isinstance(ret, tuple) and len(ret) == 2 and isinstance(ret[1], dict):
+                path, meta = ret
+            else:
+                path, meta = ret, {'reached_goal': True, 'best_dist': None}
+        except TypeError:
+            print("no FULL PARTIAL")
+            # Planner doesn't support allow_partial yet → legacy full path
+            path = self.planner.astar_prims(wm, belief, start, goal_state, verbose=debug)
+            meta = {'reached_goal': True, 'best_dist': None}
 
-        # helpers
-        def _is_empty_path(path) -> bool:
-            if path is None: return True
-            if hasattr(path, "numel"):
-                try: return path.numel() == 0
-                except Exception: pass
-            try: return len(path) == 0
-            except Exception: return False
+        # Normalize empties and cap partial length on the caller side
+        try:
+            import torch
+            if path is None:
+                path = []
+            if torch.is_tensor(path) and path.numel() == 0:
+                path = []
+        except Exception:
+            if path is None:
+                path = []
 
-        def _prims_pending() -> bool:
-            seq = getattr(self, "token_prims", [])
-            if seq is None: return False
+        # If planner returned a partial and capping is desired, slice here
+        if not meta.get('reached_goal', True):
             try:
-                import torch
-                if torch.is_tensor(seq):
-                    return self.prim_idx < int(seq.shape[0])
+                # tensor [T,3]
+                if hasattr(path, "shape") and len(path.shape) == 2 and path.shape[0] > max_partial_len:
+                    path = path[:max_partial_len]
+                # list
+                elif hasattr(path, "__len__") and len(path) > max_partial_len:
+                    path = path[:max_partial_len]
             except Exception:
                 pass
-            try:
-                return self.prim_idx < len(seq)
-            except Exception:
-                return False
 
-        def _fallback_turn() -> tuple[list[str], int]:
+        return path, meta
+
+    def _highlevel_replan_from_here(self, penalize_pair, penalize_node, dbg=print) -> bool:
+        """Extracted so we can call consistently from several places."""
+        prev_tokens = list(getattr(self, "full_plan_tokens", []))
+        try:
+            print("[blacklist] do we even have penalize pair?",penalize_pair)
+            if penalize_pair is not None:
+                u, v = int(penalize_pair[0]), int(penalize_pair[1])
+                # blacklist both directions
+                link = self._find_link(u, v)
+                if link is not None: link.confidence = 0
+                
+                if not hasattr(self, "link_blacklist") or self.link_blacklist is None:
+                    self.link_blacklist = set()
+                print("are we actually blackilisting?",u,v,int(penalize_pair[0]), int(penalize_pair[1]))
+                self.link_blacklist.add(frozenset({u, v}))
+                
+                self._register_portal_closure(u, v, dbg=dbg)
+        except Exception as e:
+            dbg(f"[rt] warn: link penalty failed: {e}")
+
+        try:
+            dbg("[rt] High-level REPLAN via PCFG…")
+            mode = str(getattr(self, "current_mode", "NAVIGATE"))
+            if mode == "TASK_SOLVING":
+                # Let the mode-aware ensure pick the right PCFG (task color vs default)
+                ok_before = len(self.full_plan_tokens) > 0
+                self.ensure_plan_for_current_mode(debug=getattr(self, "debug_universal_navigation", False))
+                ok = len(self.full_plan_tokens) > 0 or (self._phantom_goal_pose is not None)
+            else:
+                grammar = self.build_pcfg_from_memory(debug=getattr(self, "debug_universal_navigation", False))
+                self.generate_plan_with_pcfg(grammar, debug=getattr(self, "debug_universal_navigation", False))
+                ok = len(self.full_plan_tokens) > 0 or (self._phantom_goal_pose is not None)
+
+            # Reset low-level flags regardless:
+            self.navigation_flags.pop('replan_request', None)
+            self.navigation_flags.pop('replan_bad_node', None)
+            self.navigation_flags.pop('stalled_motion', None)
+            self.plan_progress = 0.0
+            
+            try:
+                prev = prev_tokens
+                new  = getattr(self, "full_plan_tokens", [])
+                self.plan_export.bump_plan_version(
+                    prev_tokens=prev,
+                    new_tokens=new,
+                    reason=reason or {"kind": "replan"},  # 'reason' dict you already built above
+                )
+            except Exception:
+                pass
+
+
+            try:
+                reason = {}
+                if penalize_pair is not None:
+                    reason["penalize_pair"] = [int(penalize_pair[0]), int(penalize_pair[1])]
+                if penalize_node is not None:
+                    reason["penalize_node"] = int(penalize_node)
+                self.plan_export.log_event(
+                    "replan",
+                    success=bool(ok),
+                    reason=reason,
+                    new_tokens=[list(map(int,t)) for t in getattr(self, "full_plan_tokens", [])],
+                )
+            except Exception:
+                pass
+
+            dbg(f"[rt] REPLAN mode={mode} success={ok} tokens={self.full_plan_tokens} phantom={self._phantom_goal_pose}")
+            return ok
+        except Exception as e:
+            dbg(f"[rt] High-level replan failed: {e}")
+            return False
+
+
+    def set_mode(self, new_mode: str):
+        self.current_mode = new_mode
+        self._on_mode_transition(new_mode)
+    def universal_navigation(self, submode: str, wm, belief) -> tuple[list[str], int]:
+        """
+        Controller policy:
+        1) Handle 'stalled_motion' / 'replan_request' up front.
+        2) Always try to emit exactly ONE primitive via step_plan() (serves phantom too).
+        3) If the plan is finished:
+            - respect the brief post-finish hold, but DO NOT emit a fake action
+            - then YIELD ([],0) so outer modes can switch.
+        4) If not finished and we couldn't emit, try ONE high-level replan.
+            If that still emits nothing and we aren't finished, last resort is a turn.
+            If the replan ends up finished, yield.
+        Key change: finished -> NEVER emit a fallback turn. Yield control cleanly.
+        """
+        dbg = getattr(self, "debug_universal_navigation", False)
+        def _log(msg: str):
+            if dbg: print(msg)
+
+        # --- helpers -----------------------------------------------------------
+        def _yield_noop() -> tuple[list[str], int]:
+            # Do NOT bump _issue_seq; this tells navigation_grade there is
+            # no new primitive and lets the outer controller switch modes.
+            _log("[navigate] yielding control ([],0)")
+            return [], 0
+        
+        def _stall_turn() -> tuple[list[str], int]:
+            # Only use when we explicitly want to stay in NAVIGATE while not finished.
             import random
             turn = random.choice(["right", "left"])
             self._last_served_prim = turn
+
+            # Issue accounting so navigation_grade sees a primitive (NOT used on finish)
+            self._issue_seq = int(getattr(self, "_issue_seq", 0)) + 1
+            hist = getattr(self, "_pose_hist", ())
+            self._issue_baseline_hist_len = len(hist)
+            if len(hist) > 0:
+                self._issue_baseline_pose = hist[-1]
+                self._issue_baseline_valid = True
+            else:
+                cur = self.get_current_pose()
+                if cur is not None:
+                    self._issue_baseline_pose = (float(cur[0]), float(cur[1]), float(cur[2]))
+                    self._issue_baseline_valid = True
+                else:
+                    self._issue_baseline_valid = False
+
             fb = [self.to_onehot_list(turn)]
-            _log(f"[navigate] STALL → issuing {fb}")
+            _log(f"[navigate] stall-turn → issuing {fb}")
             return fb, 1
 
-        def _current_target():
-            if self.token_idx < len(self.full_plan_tokens):
-                return self.full_plan_tokens[self.token_idx]
-            return None
+        # keep your transition hygiene
+        mode_here = str(getattr(self, "current_mode", "NAVIGATE"))
+        # Transition hygiene with the actual mode we are in
+        self._on_mode_transition(mode_here)
+        # Ensure there is a plan when entering any nav-like mode (NAVIGATE or TASK_SOLVING)
+        if mode_here in ("NAVIGATE", "TASK_SOLVING"):
+            if getattr(self, "_need_replan_on_enter", False):
+                # Only skip replan if we truly have an *active* (unfinished) plan
+                has_plan = len(self.full_plan_tokens) > 0
+                prog     = float(getattr(self, "plan_progress", -1.0))
+                finished = self.navigation_flags.get("plan_complete", False) or (prog >= 1.0)
 
-        def _plan_local_path_to_target(tgt_exp_id):
-            pose = self.get_current_pose()
-            if pose is None:
-                _log("[navigate] no current pose → cannot A*; returning EMPTY")
-                return []
-            start = self._pose_to_state(pose)
-            tgt_pose = self.memory_graph.experience_map.get_pose(tgt_exp_id)
-            goal  = self._pose_to_state(tgt_pose)
-            _log(f"[navigate] A* request start={start} goal={goal} (tgt={tgt_exp_id})")
-            try:
-                path = self._astar_to_node(wm, belief, start, tgt_exp_id, debug=dbg)
-                if _is_empty_path(path): _log("[navigate] A* result: EMPTY")
+                if has_plan and (0.0 <= prog < 1.0) and not finished:
+                    self._need_replan_on_enter = False
                 else:
-                    try: ln = len(path)
-                    except Exception: ln = "<tensor>"
-                    _log(f"[navigate] A* result: ok len={ln}")
-                return path
-            except Exception as e:
-                _log(f"[navigate] astar_prims error: {e}")
-                return []
+                    self.ensure_plan_for_current_mode(debug=dbg)
+            elif (float(getattr(self, "plan_progress", -1.0)) < 0.0 or
+                len(getattr(self, "full_plan_tokens", [])) == 0):
+                # Don’t replan if we *just* finished and the higher level hasn’t switched modes yet.
+                if not self.navigation_flags.get("plan_complete", False):
+                    self.ensure_plan_for_current_mode(debug=dbg)
+       
 
-        def _highlevel_replan_from_here(penalize_pair: tuple[int,int] | None = None,
-                                        penalize_node: int | None = None) -> bool:
-            if penalize_node is not None:
-                _log("[navigate] note: node-confidence penalties are deprecated; ignoring.")
-            try:
-                if penalize_pair is not None:
-                    u, v = int(penalize_pair[0]), int(penalize_pair[1])
-                    for a, b in ((u, v), (v, u)):
-                        link = self._find_link(a, b)
-                        if link is not None:
-                            link.confidence = 0
-                    if not hasattr(self, "link_blacklist") or self.link_blacklist is None:
-                        self.link_blacklist = set()
-                    self.link_blacklist.add(frozenset({u, v}))
-            except Exception as e:
-                _log(f"[navigate] warn: link penalty failed: {e}")
-
-            try:
-                _log("[navigate] High-level REPLAN via PCFG…")
-                grammar = self.build_pcfg_from_memory()
-                self.generate_plan_with_pcfg(grammar)
-                _log(f"[navigate] NEW full_plan_tokens={self.full_plan_tokens}")
-                # Reset low-level progress
-                self.token_prims = []
-                self.prim_idx = 0
-                self._evade_injected = False
-                self._evade_ticks_since_recalc = 0
-                ok = len(self.full_plan_tokens) > 0
-                _log(f"[navigate] REPLAN success={ok}")
-                return ok
-            except Exception as e:
-                _log(f"[navigate] High-level replan failed: {e}")
-                return False
-
-        # 0) If no plan at all, try one replan
-        if not self.full_plan_tokens or self.token_idx >= len(self.full_plan_tokens):
-            _log("[navigate] No usable plan tokens at entry.")
-            if _highlevel_replan_from_here():
-                _log("[navigate] Replan provided tokens; continuing.")
-            else:
-                _log("[navigate] Replan failed; falling back to stall-turn.")
-                return _fallback_turn()
-
-        # 1) Current edge + guarded reset
-        cur_edge = _current_target()
-        if cur_edge is None:
-            _log("[navigate] current_target() is None after (re)plan.")
-            return _fallback_turn()
-        src, tgt = cur_edge
-        if not hasattr(self, "_edge_key") or (src, tgt) != self._edge_key:
-            self._edge_key = (src, tgt)
-            self._edge_evades = 0
-            self.navigation_flags.pop('evade_request', None)
-            self.navigation_flags.pop('replan_request', None)
-            self.navigation_flags.pop('replan_bad_node', None)
-        _log(f"[navigate] current edge: src={src} -> tgt={tgt} key={getattr(self, '_edge_key', None)}")
-
-        # 1a) ### FAST PATH: if we already have primitives to execute, just step them
-        if _prims_pending():
-            _log("[navigate] prims pending → step_plan()")
-            prims, n = self.step_plan(wm, belief, debug=dbg)
-            if not prims or n == 0:
-                return _fallback_turn()
-            return prims, n
-
-        # 2) stalled motion escalates
+        _log(f"[universal_navigation_rt] submode={submode} pose={self.get_current_pose()} "
+            f"tok={self.token_idx}/{len(self.full_plan_tokens)} prog={self.plan_progress:.3f}")
+        
+        # --- 0) React to stalled/replan requests BEFORE trying to step ----------
         if self.navigation_flags.get('stalled_motion', False):
-            _log("[navigate] stalled_motion → escalate to REPLAN")
-            ok = _highlevel_replan_from_here(penalize_pair=(src, tgt), penalize_node=tgt)
+            _log("[rt] stalled_motion → REPLAN")
+            cur_edge = self.full_plan_tokens[self.token_idx] if self.token_idx < len(self.full_plan_tokens) else None
+            try:
+                cur_edge = self.full_plan_tokens[self.token_idx] if self.token_idx < len(self.full_plan_tokens) else None
+                self.plan_export.log_event("replan_requested", source="stalled_motion",
+                                        edge=(list(cur_edge) if cur_edge else None),
+                                        token_idx=int(self.token_idx))
+            except Exception: pass
+            ok = self._highlevel_replan_from_here(cur_edge, cur_edge[1] if cur_edge else None, dbg=_log)
             self.navigation_flags.pop('stalled_motion', None)
             if not ok:
-                return _fallback_turn()
-            cur_edge = _current_target()
-            if cur_edge is None:
-                return _fallback_turn()
-            src, tgt = cur_edge
-            if (src, tgt) != self._edge_key:
-                self._edge_key = (src, tgt)
-                self._edge_evades = 0
-                self.navigation_flags.pop('evade_request', None)
-                self.navigation_flags.pop('replan_request', None)
-                self.navigation_flags.pop('replan_bad_node', None)
+                # Do NOT emit a fake action; let higher layers handle the stall.
+                return _yield_noop()
 
-        # 3) explicit REPLAN request from grader
         if self.navigation_flags.get('replan_request', False):
-            bad_node = self.navigation_flags.get('replan_bad_node', tgt)
-            _log(f"[navigate] REPLAN requested; penalize node {bad_node} and pair ({src},{tgt})")
-            ok = _highlevel_replan_from_here(penalize_pair=(src, tgt), penalize_node=bad_node)
-            self.navigation_flags.pop('replan_request', None)
-            self.navigation_flags.pop('replan_bad_node', None)
-            self.navigation_flags.pop('evade_request', None)
+            bad_node = self.navigation_flags.get('replan_bad_node', None)
+            cur_edge = self.full_plan_tokens[self.token_idx] if self.token_idx < len(self.full_plan_tokens) else None
+            _log(f"[rt] replan_request → penalize {cur_edge} bad_node={bad_node}")
+            try:
+                cur_edge = self.full_plan_tokens[self.token_idx] if self.token_idx < len(self.full_plan_tokens) else None
+                bad_node = self.navigation_flags.get('replan_bad_node', None)
+                self.plan_export.log_event("replan_requested", source="partial_limit_or_empty",
+                                        edge=(list(cur_edge) if cur_edge else None),
+                                        bad_node=(int(bad_node) if bad_node is not None else None),
+                                        token_idx=int(self.token_idx))
+            except Exception: pass
+            ok = self._highlevel_replan_from_here(cur_edge, bad_node, dbg=_log)
             if not ok:
-                return _fallback_turn()
-            cur_edge = _current_target()
-            if cur_edge is None:
-                return _fallback_turn()
-            src, tgt = cur_edge
+                return _yield_noop()
 
-        # 4) EVade request → inject/refresh a local detour
-        if self.navigation_flags.get('evade_request', False) and not self._evade_injected:
-            _log("[navigate] EVADE requested → compute local A* detour to tgt")
-            if self._at_node_exact(tgt):
-                _log(f"[navigate] already at target node {tgt} → skip edge via step_plan")
-                prims, n = self.step_plan(wm, belief, debug=dbg)
-                self.navigation_flags.pop('evade_request', None)
-                if prims and n:
-                    return prims, n
-                cur_edge = _current_target()
-                if cur_edge is None:
-                    return _fallback_turn()
-                src, tgt = cur_edge
-
-            detour = _plan_local_path_to_target(tgt)
-            if _is_empty_path(detour):
-                _log("[navigate] EVADE A* empty → escalate to REPLAN")
-                ok = _highlevel_replan_from_here(penalize_pair=(src, tgt), penalize_node=tgt)
-                self.navigation_flags.pop('evade_request', None)
-                if not ok:
-                    return _fallback_turn()
-                cur_edge = _current_target()
-                if cur_edge is None:
-                    return _fallback_turn()
-                src, tgt = cur_edge
-            else:
-                try: ln = len(detour)
-                except Exception: ln = "<tensor>"
-                _log(f"[navigate] injecting detour len={ln}")
-                self.token_prims = detour
-                self.prim_idx = 0
-                self._evade_injected = True
-                self._evade_ticks_since_recalc = 0
-                import random; self._evade_recalc_every = random.randint(3, 5)
-                prims, n = self.step_plan(wm, belief, debug=dbg)
-                if not prims or n == 0:
-                    return _fallback_turn()
-                self.navigation_flags.pop('evade_request', None)
-                return prims, n
-
-        # 5) Active detour: keep stepping / refreshing
-        if self._evade_injected:
-            self._evade_ticks_since_recalc += 1
-            _log(f"[navigate] stepping detour; ticks={self._evade_ticks_since_recalc}/{self._evade_recalc_every}")
-
-            if self._at_node_exact(tgt):
-                _log(f"[navigate] reached target node {tgt} → resume main plan")
-                self._evade_injected = False
-                self.token_prims = []
-                self.prim_idx = 0
-                prims, n = self.step_plan(wm, belief, debug=dbg)
-                if not prims or n == 0:
-                    return _fallback_turn()
-                return prims, n
-
-            if self._evade_ticks_since_recalc >= self._evade_recalc_every:
-                _log("[navigate] periodic A* refresh due")
-                self._evade_ticks_since_recalc = 0
-                import random; self._evade_recalc_every = random.randint(3, 5)
-                detour = _plan_local_path_to_target(tgt)
-                if not _is_empty_path(detour):
-                    self.token_prims = detour
-                    self.prim_idx = 0
-
-            prims, n = self.step_plan(wm, belief, debug=dbg)
-            if not prims or n == 0:
-                return _fallback_turn()
+        # --- 1) Try to emit ONE primitive (step_plan serves phantom too) -------
+        prims, n = self.step_plan(wm, belief, debug=dbg)
+        if prims and n:
             return prims, n
 
-        # 6) No detour active → compute fresh local path (only if NO prims pending)
-        _log("[navigate] no active detour → compute local path to tgt")
-        if self._at_node_exact(tgt):
-            _log(f"[navigate] already at target node {tgt} → skip edge via step_plan")
+        # --- 2) If nothing emitted, check if we're finished/handing off -------
+        finished = bool(self.navigation_flags.get('plan_complete', False)) or \
+                (float(getattr(self, "plan_progress", -1.0)) >= 1.0)
+
+        if finished:
+            # Phantom would have been served already by step_plan.
+            # Respect a brief post-finish hold (for any grading consumers),
+            # but do NOT emit fake actions; then yield control.
+            if getattr(self, "_post_finish_hold", 0) > 0:
+                self._post_finish_hold -= 1
+                return _yield_noop()
+            _log("[rt] plan finished & hold expired → yield control")
+            try: self.plan_export.log_event("plan_finished_yield")
+            except Exception: pass
+            return _yield_noop()
+
+        # --- 3) Not finished, no prims → attempt ONE high-level replan --------
+        _log("[rt] no prims and not finished → attempt one REPLAN")
+        ok = self._highlevel_replan_from_here(None, None, dbg=_log)
+        if ok:
             prims, n = self.step_plan(wm, belief, debug=dbg)
             if prims and n:
                 return prims, n
-            cur_edge = _current_target()
-            if cur_edge is None:
-                return _fallback_turn()
-            src, tgt = cur_edge
 
-        detour = _plan_local_path_to_target(tgt)
-        if _is_empty_path(detour):
-            _log("[navigate] A* to current target FAILED → penalize and REPLAN")
-            ok = _highlevel_replan_from_here(penalize_pair=(src, tgt), penalize_node=tgt)
-            if not ok:
-                return _fallback_turn()
-            cur_edge = _current_target()
-            if cur_edge is None:
-                return _fallback_turn()
-            src, tgt = cur_edge
-            detour = _plan_local_path_to_target(tgt)
-            if _is_empty_path(detour):
-                _log("[navigate] Local path still empty after REPLAN → fallback turn")
-                return _fallback_turn()
+            # Re-check finished after replan
+            finished = bool(self.navigation_flags.get('plan_complete', False)) or \
+                    (float(getattr(self, "plan_progress", -1.0)) >= 1.0)
+            if finished:
+                if getattr(self, "_post_finish_hold", 0) > 0:
+                    self._post_finish_hold -= 1
+                    return _yield_noop()
+                _log("[rt] finished after replan & hold expired → yield control")
+                return _yield_noop()
 
-        try: ln = len(detour)
-        except Exception: ln = "<tensor>"
-        _log(f"[navigate] injecting local path len={ln}")
-        self.token_prims = detour
-        self.prim_idx = 0
-        self._evade_injected = True
-        self._evade_ticks_since_recalc = 0
-        import random; self._evade_recalc_every = random.randint(3, 5)
-
-        prims, n = self.step_plan(wm, belief, debug=dbg)
-        if not prims or n == 0:
-            return _fallback_turn()
-        return prims, n
-
-
-
+        # --- 4) Last resort while not finished: a single stall turn -----------
+        try:
+            self.plan_export.log_event("stall_turn", reason="last_resort", token_idx=int(getattr(self, "token_idx", -1)))
+        except Exception: pass
+        return _stall_turn()
 
     # ---- small helper to safely format ints in logs (avoids NameError if you paste into class scope) ----
     def _safe_int(self,x):
@@ -1543,9 +3157,6 @@ class NavigationSystem:
         except Exception:
             return x
 
-
-    
-    
     def _crash_node_confidence(self, node_id):
         """Reduce confidence of a problematic node"""
         emap = self.memory_graph.experience_map
@@ -1585,18 +3196,25 @@ class NavigationSystem:
                 print("[GRADE]", *args)
 
         mode = getattr(self, 'current_mode', 'NAVIGATE')
-        if mode != 'NAVIGATE':
+        if mode not in ('NAVIGATE', 'TASK_SOLVING'):
             if hasattr(self, "_edge_evades"): self._edge_evades = 0
             self.navigation_flags.pop('evade_request', None)
             self.navigation_flags.pop('replan_request', None)
             self.navigation_flags.pop('replan_bad_node', None)
-            _log("mode != NAVIGATE → 0.0")
+            _log("mode not in NAV_MODES → 0.0")
             return 0.0
 
         if self.token_idx >= len(self.full_plan_tokens):
-            _log(f"no tokens to grade: token_idx={self.token_idx} len={len(self.full_plan_tokens)} → -1.0")
-            return -1.0
-
+            if getattr(self, "_phantom_active", False):
+                # Keep grading as if plan is active
+                pass
+            else:
+                _log(f"no tokens to grade: token_idx={self.token_idx} len={len(self.full_plan_tokens)} → -1.0")
+                return -1.0
+    
+        if self.navigation_flags.pop('synthetic_action', False):
+            _log("synthetic external action → 0.0")
+            return 0.0
         # NEW: sequence-based progress (ignore prim_idx churn)
         issue_seq = int(getattr(self, "_issue_seq", 0))
         prev_seq  = int(getattr(self, "_prev_issue_seq", -1))

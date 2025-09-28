@@ -76,6 +76,8 @@ class MemoryGraph(object):
         self.local_position = kwargs.get('local_position', None)
         self.ghost_node_process = kwargs.get('ghost_node', False)
         self.odometry_key = odom
+        self._odom_bootstrapped = False
+
        
         if odom == "odom":
             self.odom = Odometry()
@@ -130,12 +132,18 @@ class MemoryGraph(object):
         print("wtf is happening here",self.observation,observations[self.odometry_key])
         print("DO WE HAVE POSE?", observations["pose"])
         action_ob = observations[self.odometry_key]
+        pose_obs = observations.get("pose", None)
+        print(f"[TRIAGE][OBS] raw obs pose = {pose_obs}")
+        # Seed odometry exactly once at episode start so the first step isn’t dropped
+        #if not self._odom_bootstrapped and pose_obs is not None and hasattr(self.odom, "bootstrap"):
+            #self.odom.bootstrap(pose_obs)
+            #self._odom_bootstrapped = True
         pose_ob   = observations.get("pose", None)  # (x, y, th), th can be {0..3} or radians
 
         # New call signature accepts pose_ob; if odom != "minigrid", extra arg is ignored (or you can gate on hasattr)
         try:
             vtrans, vrot = self.odom(action_ob, dt, pose_ob)
-            print("vtrans, vrot from odom with pose", vtrans, vrot)
+            print("vtrans, vrot from odom with pose", action_ob, vtrans, vrot)
         except TypeError:
             # For older odometry classes that only accept (action, dt)
             vtrans, vrot = self.odom(action_ob, dt)
@@ -166,6 +174,8 @@ class MemoryGraph(object):
         #_,accum_delta_x, accum_delta_y  = self.experience_map.accumulated_delta_location(vtrans,vrot)
         #delta_exp = self.experience_map.get_delta_exp(0,0,accum_delta_x, accum_delta_y)
         print(f"[DEBUG] odometry → vtrans={vtrans:.6f}, vrot={vrot:.6f}, odom pose=({x:.2f}, {y:.2f}, {th:.2f})")
+        print(f"[TRIAGE][ODOM] vtrans={vtrans:.3f}, vrot={vrot:.3f}, odom_state={self.odom.odometry}")
+
 
         
         rotation_only = abs(vtrans) < 1e-4 and abs(vrot) > 0
@@ -218,6 +228,14 @@ class MemoryGraph(object):
         # update experience map
         self.experience_map(view_cell, vtrans, vrot,
                             x_pc, y_pc, th_pc, adjust_map, local_pose, view_cell_copy)
+        
+        gp = self.experience_map.get_global_position()
+        print(f"[TRIAGE][GP] global_position_after_EM = {gp}")
+        if pose_obs is not None:
+            dx = gp[0] - pose_obs[0]
+            dy = gp[1] - pose_obs[1]
+            dth = ((gp[2] - pose_obs[2] + np.pi) % (2*np.pi)) - np.pi
+            print(f"[TRIAGE][DIFF] GP - OBS = (dx={dx:.3f}, dy={dy:.3f}, dth={dth:.3f})")
         if self.experience_map.current_exp is not None:
             self.view_cells.update_prev_cell(self.experience_map.current_exp.view_cell)
         #TEST
